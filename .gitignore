@@ -1,0 +1,21 @@
+.DS_Store
+.obsidian/workspace*.json
+
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# Local development history, runtime data and credentials
+.claude/
+docs/contexto/
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+credentials*.json

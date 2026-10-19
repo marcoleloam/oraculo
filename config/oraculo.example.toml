@@ -1,0 +1,37 @@
+schema_version = 1
+projects_root = "~/projects/work"
+vault_root = "~/Obsidian/Oraculo"
+state_dir = "~/Library/Application Support/Oraculo"
+t3_mcp_url = "https://t3.example.invalid/mcp"
+max_executors = 1
+poll_active_seconds = 15
+poll_idle_seconds = 60
+proactive_interval_seconds = 1800
+max_dispatch_attempts = 3
+max_correction_rounds = 2
+quota_backoff_seconds = 1800
+additional_spend_allowed = false
+
+[providers.codex]
+instance_id = "codex"
+auth_kind = "existing_subscription"
+billing_verified = false
+models = []
+
+[providers.claude]
+instance_id = "claudeAgent"
+auth_kind = "existing_subscription"
+billing_verified = false
+models = []
+
+[providers.grok]
+instance_id = "grok"
+auth_kind = "existing_subscription"
+billing_verified = false
+models = []
+
+[memory]
+max_batch_pages = 20
+max_proposal_bytes = 2097152
+review_retention_days = 30
+canonical_gc = false

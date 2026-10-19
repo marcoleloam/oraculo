@@ -1,0 +1,9 @@
+.obsidian/
+reviews/
+.staging/
+.oraculo/
+.trash/
+.DS_Store
+*.tmp
+*.swp
+*~
