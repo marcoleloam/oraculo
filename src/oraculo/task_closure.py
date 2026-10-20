@@ -11,7 +11,6 @@ from pathlib import Path
 from oraculo.protocol import content_hash
 from oraculo.settlement import Settlements, verify_pull_requests
 from oraculo.state import StateError
-from oraculo.t3.client import T3Client
 
 
 class TaskClosure:
@@ -130,7 +129,7 @@ class TaskClosure:
             # A terminal result is not proof of successful current execution.
             # Recheck the original run, current thread and all visible descendants
             # before the irreversible merge, including for native delegations.
-            await self._execution_gate(task)
+            await self.engine._execution_gate(task)
 
         def before_merge():
             self.store.update(
@@ -197,12 +196,12 @@ class TaskClosure:
         )
         if not self.engine._saved(saved):
             raise StateError("final_memory_write_unconfirmed")
-        client, binding, snapshot = await self._execution_gate(task)
+        client, binding, snapshot = await self.engine._execution_gate(task)
         thread_id = binding["thread_id"]
         await self._pull_request_gate(client, task)
         # PR inspection may overlap a new message or run. Re-read execution
         # before requesting settlement; the host offers no atomic cross-API lock.
-        _, _, fresh = await self._execution_gate(task)
+        _, _, fresh = await self.engine._execution_gate(task)
         if any(
             fresh["thread"][key] != snapshot["thread"][key]
             for key in ("updatedAt", "itemCount")
@@ -244,18 +243,6 @@ class TaskClosure:
             },
             settled=True,
         )
-
-    async def _execution_gate(self, task):
-        client = T3Client("http://127.0.0.1/mcp")
-        client.call = self.host.call
-        binding = {
-            "thread_id": task["child"]["childThreadId"],
-            "project_id": task["project"]["project_id"],
-            "run_id": task["child"]["childRunId"],
-        }
-        snapshot = await client.settlement_snapshot(binding["thread_id"])
-        Settlements.remote_gate(binding, snapshot)
-        return client, binding, snapshot
 
     async def _pull_request_gate(self, client, task):
         pr = task["merge_receipt"]

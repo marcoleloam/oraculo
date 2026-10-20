@@ -116,7 +116,11 @@ O próprio executor só submete esse relatório: não pode certificar o término
 seu turno ainda ativo. No modo nativo, a notificação T3 acorda a origem, cujo
 adapter chama `resume`. No top-level, o daemon reconcilia o run original e os
 filhos e finaliza o relatório submetido. Ausência de relatório, validação falha,
-run cancelado, perguntas ou continuações pendentes impedem publicação. Um run
+run cancelado, perguntas ou continuações pendentes impedem publicação. Antes de
+certificar sucesso e salvar a memória de conclusão, o adapter verifica o run
+original, o estado atual e os descendentes. Falha, cancelamento ou interrupção
+de um descendente impede essa certificação; resultados falhos do próprio executor
+continuam podendo ser registrados como falha ou parada. Um run
 posterior nunca substitui sucesso do run original. `finish` confirma SHA do
 checkout limpo, mantém trabalho separado da gravação e só libera PR após recibo
 canônico `confirmed`/commit. Falhas de memória ficam visíveis e são retomáveis.
@@ -143,11 +147,16 @@ PRs por repo/head/base antes de criar e novamente depois, inclusive fechados.
 Outros hosts retornam bloqueio `publication_host_unsupported`; Azure não é uma
 integração implementada por este módulo.
 
-A intenção de emissão é gravada imediatamente antes de `gh pr create`. Falha em
+Antes de uma nova emissão, a execução é verificada novamente: sucesso salvo
+anteriormente não basta se surgiu trabalho pendente ou falho. A intenção de
+emissão é gravada imediatamente antes de `gh pr create`. Falha em
 precheck permite correção/retry. Depois de emissão incerta, o modo
 `reconcile_only` nunca cria outro PR. Um PR ainda invisível exige observação ou
 resolução explícita; não autoriza retry cego. O recibo é reconsultado mesmo após
-falha de linking/memória, e vinculado tanto ao executor quanto à origem no T3.
+falha de linking/memória. Após uma emissão incerta, a consulta pode preservar
+o recibo de um PR existente mesmo se a execução mudou, sem emitir novamente;
+a tarefa permanece bloqueada e não certifica publicação pronta com prova antiga.
+Com execução válida, o PR é vinculado tanto ao executor quanto à origem no T3.
 Uma atualização idempotente da memória registra URL/SHA/base/estado em outro ciclo
 imutável, preservando o relatório e recibo anteriores.
 

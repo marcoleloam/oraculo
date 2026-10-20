@@ -147,8 +147,16 @@ class Host:
             return {"projects": copy.deepcopy(self.projects), "nextCursor": None}
         if name == "t3_thread_read":
             thread = copy.deepcopy(self.threads[args["threadId"]])
+            thread.setdefault("pendingRequestCount", 0)
+            thread.setdefault("archived", False)
+            thread.setdefault("settled", False)
+            thread.setdefault("updatedAt", "2026-01-01T00:00:00Z")
+            thread.setdefault("itemCount", 2)
             return {
                 "thread": thread,
+                "items": [],
+                "hasMore": False,
+                "nextPosition": None,
                 "recentRuns": [
                     {
                         "runId": thread["latestRunId"],

@@ -14,7 +14,9 @@ from pathlib import Path
 
 from oraculo.projects import resolve_project
 from oraculo.protocol import canonical_json, content_hash
+from oraculo.settlement import Settlements
 from oraculo.state import StateError
+from oraculo.t3.client import T3Client
 from oraculo.task_store import TaskStore
 
 
@@ -678,6 +680,19 @@ class ManagedTasks:
         )
         self.store.state.set_meta(key, {"sha256": digest, "receipt": receipt})
 
+    async def _execution_gate(self, task):
+        """Require successful original/current execution and verified descendants."""
+        client = T3Client("http://127.0.0.1/mcp")
+        client.call = self.host.call
+        binding = {
+            "thread_id": task["child"]["childThreadId"],
+            "project_id": task["project"]["project_id"],
+            "run_id": task["child"]["childRunId"],
+        }
+        snapshot = await client.settlement_snapshot(binding["thread_id"])
+        Settlements.remote_gate(binding, snapshot)
+        return client, binding, snapshot
+
     async def _finish(self, task_id: str, report: dict, actor: dict):
         task = self.store.get(task_id)
         if actor["thread_id"] not in {
@@ -709,6 +724,9 @@ class ManagedTasks:
         ):
             raise StateError("passing_validation_evidence_required")
         if succeeded:
+            # Failed/stopped original runs still save their legitimate result.
+            # Only successful certification requires the complete execution gate.
+            await self._execution_gate(self.store.get(task_id))
             ws = workspace(task["child_workspace"]["path"])
             if ws["dirty"] or report.get("commit") != ws["head"]:
                 raise StateError("validated_commit_or_clean_workspace_required")
@@ -784,6 +802,8 @@ class ManagedTasks:
         ) != task["report"].get("commit"):
             raise StateError("publication_source_binding_mismatch")
         uncertain = bool(task.get("publication_attempted"))
+        if not uncertain:
+            await self._execution_gate(task)
         self.store.update(
             task_id,
             "pr_pending",
@@ -811,6 +831,10 @@ class ManagedTasks:
             publication=pr,
         )
         task = self.store.get(task_id)
+        # Lost responses may be reconciled read-only even after execution changed.
+        # Preserve the observed receipt, but never certify publication as ready
+        # using stale execution evidence. No retry above can re-emit the PR.
+        await self._execution_gate(task)
         for thread in dict.fromkeys(
             (
                 task["origin"]["thread_id"],
