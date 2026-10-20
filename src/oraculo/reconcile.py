@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from oraculo.state import State
-from oraculo.t3.contracts import execution_terminal
+from oraculo.state import State, StateError
+from oraculo.t3.contracts import ThreadRead, execution_terminal
 
 
 def _terminal_status(
@@ -53,6 +53,34 @@ class Remote(Protocol):
         client_request_id: str,
         reason: str | None = None,
     ) -> dict[str, Any]: ...
+
+
+class ReconciliationResults(list[dict[str, Any]]):
+    """Per-lease results, with the original single-executor mapping interface.
+
+    Serial callers may still index by a string or compare with a dict. Multiple
+    results deliberately have no implicit first-result mapping view.
+    """
+
+    def _legacy(self) -> dict[str, Any]:
+        if not self:
+            return {"state": "idle"}
+        if len(self) == 1:
+            return self[0]
+        raise TypeError("multiple leases: iterate reconciliation results")
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._legacy()[key]
+        return super().__getitem__(key)
+
+    def __eq__(self, other):
+        if isinstance(other, dict):
+            return len(self) <= 1 and self._legacy() == other
+        return super().__eq__(other)
+
+    def __ne__(self, other):
+        return not self == other
 
 
 class Reconciler:
@@ -112,10 +140,15 @@ class Reconciler:
         operations.report(operation_id, observed, verified=True)
         return matches[0]
 
-    async def reconcile(self) -> dict[str, Any]:
-        lease = self.state.lease()
-        if not lease:
-            return {"state": "idle"}
+    async def reconcile(self) -> list[dict[str, Any]]:
+        results = ReconciliationResults()
+        for lease in self.state.leases():
+            results.append(await self._reconcile_lease(lease))
+        return results
+
+    async def _reconcile_lease(self, lease: dict[str, Any]) -> dict[str, Any]:
+        if self.state.lease(lease["attempt_id"]) != lease:
+            return {"state": "uncertain", "reason": "lease_changed"}
         attempt = self.state.get_attempt(lease["attempt_id"])
         job = self.state.get_job(attempt["job_id"])
         objective = self.state.get_objective(job["objective_id"])
@@ -141,14 +174,22 @@ class Reconciler:
             snapshots = {
                 thread_id: await self.remote.read_thread(thread_id) for thread_id in ids
             }
+            for snapshot in snapshots.values():
+                ThreadRead.model_validate(snapshot)
             if any(
                 snapshot["thread"]["threadId"] != thread_id
                 for thread_id, snapshot in snapshots.items()
             ):
                 raise ValueError("execution thread identity mismatch")
+            if any(
+                snapshot["thread"].get("projectId", objective["project_id"])
+                != objective["project_id"]
+                for snapshot in snapshots.values()
+            ):
+                raise ValueError("execution project identity mismatch")
             # Remote reads yield control: cancellation or another reconciliation
             # may have changed the lease in the meantime.
-            if self.state.lease() != lease:
+            if self.state.lease(attempt["id"]) != lease:
                 return {"state": "uncertain", "reason": "lease_changed"}
             objective = self.state.get_objective(job["objective_id"])
             if objective["status"] == "cancel_requested":
@@ -198,6 +239,19 @@ class Reconciler:
                     attempt["id"], "terminal run without verified execution report"
                 )
                 return {"state": "uncertain", "reason": "missing_execution_report"}
+            if status == "succeeded":
+                from oraculo.plans import Plans
+
+                plans = Plans(self.state)
+                if plans.get(objective["id"]):
+                    try:
+                        plans.validate_report(attempt, report)
+                    except StateError as error:
+                        self.state.mark_uncertain(attempt["id"], str(error))
+                        return {
+                            "state": "uncertain",
+                            "reason": "invalid_execution_report",
+                        }
             evidence = report
             if root["thread"]["latestRunId"] != attempt["run_id"]:
                 evidence = {
@@ -228,5 +282,5 @@ class Reconciler:
             self.state.mark_uncertain(attempt["id"], type(error).__name__)
             return {"state": "uncertain", "reason": type(error).__name__}
 
-    async def tick(self) -> dict[str, Any]:
+    async def tick(self) -> list[dict[str, Any]]:
         return await self.reconcile()

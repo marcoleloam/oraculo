@@ -157,6 +157,7 @@ async def test_historical_stop_does_not_schedule_memory(running_service):
     state.claim_grant(grant["id"], grant["generation"], "child", "run")
     remote = Remote()
     remote.snapshots["child"] = restarted_executor()
+    remote.snapshots["child"]["thread"]["projectId"] = "alpha"
     assert await Reconciler(state, remote).reconcile() == {
         "state": "stopped",
         "released": True,

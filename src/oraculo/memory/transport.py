@@ -15,8 +15,6 @@ from oraculo.state import StateError
 from .schema import corpus, safe_path
 
 MAX_MESSAGE_UNITS = 120000
-# Leave room for the coordinator to add grant/identity to the child's brief.
-INLINE_MESSAGE_UNITS = 80000
 CHUNK_CHARACTERS = 4096
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 
@@ -157,21 +155,19 @@ class MemoryArtifacts:
         }
 
 
-def memory_message(body: dict, artifacts: MemoryArtifacts) -> tuple[str, dict | None]:
+def memory_message(body: dict, artifacts: MemoryArtifacts) -> tuple[str, dict]:
+    """Always hand off a reference; coordinators never retranscribe source bytes."""
     body = compact_memory_body(body)
+    reference = artifacts.create(body)
+    body = dict(
+        body,
+        payload={
+            "kind": "memory",
+            "memory_operation": body["context"]["operation"],
+        },
+        context=reference,
+    )
     message = canonical_json(body)
-    reference = None
-    if utf16_units(message) > INLINE_MESSAGE_UNITS:
-        reference = artifacts.create(body)
-        body = dict(
-            body,
-            payload={
-                "kind": "memory",
-                "memory_operation": body["context"]["operation"],
-            },
-            context=reference,
-        )
-        message = canonical_json(body)
     if utf16_units(message) > MAX_MESSAGE_UNITS:
         raise StateError("memory_dispatch_instructions_too_large")
     return message, reference

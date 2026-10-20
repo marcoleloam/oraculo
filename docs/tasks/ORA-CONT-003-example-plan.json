@@ -1,0 +1,18 @@
+{
+  "text": "Implementar uma alteração delimitada e revisar suas provas, sem publicação ou deploy",
+  "max_followups": 2,
+  "tasks": [
+    {
+      "id": "implementar", "kind": "implementation", "stage": "implementation",
+      "owner": "executor", "brief": "Substitua por requisito concreto, limites e comandos de teste antes de enviar.",
+      "sources": ["docs/requisito.md"], "write_paths": ["src/modulo", "tests/test_modulo.py"],
+      "depends_on": [], "criteria": [{"id": "comportamento", "description": "Comportamento e testes definidos no requisito passam"}]
+    },
+    {
+      "id": "revisar", "kind": "tests", "stage": "review", "owner": "revisor independente",
+      "brief": "Leia requisito e provas da dependência, revise código e critérios; reporte achados impeditivos como falha.",
+      "sources": ["docs/requisito.md"], "write_paths": [], "depends_on": ["implementar"],
+      "criteria": [{"id": "revisao", "description": "Critérios verificados e nenhum achado impeditivo pendente"}]
+    }
+  ]
+}

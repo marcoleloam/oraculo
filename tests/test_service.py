@@ -4,10 +4,17 @@ import sys
 
 import pytest
 from test_memory_schema import proposal
-from test_reconcile import Remote, snapshot
+from test_reconcile import Remote
+from test_reconcile import snapshot as unit_snapshot
 
 from oraculo.cli import make_envelope, request
 from oraculo.reconcile import Reconciler
+
+
+def snapshot(*args, **kwargs):
+    result = unit_snapshot(*args, **kwargs)
+    result["thread"]["projectId"] = "alpha"
+    return result
 
 
 async def command(service, kind, payload, *, origin=None, request_id=None):
@@ -567,6 +574,7 @@ async def test_cancel_before_claim_binds_child_without_authorizing(running_servi
     assert bound["state"] == "cancel_requested"
     assert service.state.get_attempt(attempt["id"])["thread_id"] == "child"
     remote = Remote()
+    remote.snapshots["child"] = snapshot("child", "run", "running")
     assert (await Reconciler(service.state, remote).reconcile())[
         "state"
     ] == "cancel_requested"
@@ -629,7 +637,14 @@ async def test_scoped_shared_promotion(
 
     service = running_service
     _, attempt = await reserve(
-        service, {"text": "promote learning", "kind": kind, "memory_scope": scope}
+        service,
+        {
+            "text": "promote learning",
+            "kind": kind,
+            "memory_scope": scope,
+            "memory_operation": "ingest",
+            "execution_evidence": {"learning": source},
+        },
     )
     assert (
         await command(

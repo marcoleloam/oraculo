@@ -11,7 +11,12 @@ import uuid
 from pathlib import Path
 
 from oraculo.config import Config, resources_root
-from oraculo.protocol import MAX_ENVELOPE_BYTES, canonical_json, parse_envelope
+from oraculo.protocol import (
+    MAX_ENVELOPE_BYTES,
+    canonical_json,
+    parse_envelope,
+    validate_memory_submission,
+)
 
 DEFAULT_CONFIG = Path.home() / ".config/oraculo/config.toml"
 
@@ -137,6 +142,14 @@ def parser() -> argparse.ArgumentParser:
     submit.add_argument("project")
     submit.add_argument("text")
     submit.add_argument("--kind", default="implementation")
+    plan = commands.add_parser("plan")
+    plan.add_argument("project")
+    plan.add_argument("--file", type=Path, required=True)
+    plan.add_argument("--key", required=True)
+    retry = commands.add_parser("retry")
+    retry.add_argument("project")
+    retry.add_argument("objective_id")
+    retry.add_argument("task_id")
     cancel = commands.add_parser("cancel")
     cancel.add_argument("project")
     cancel.add_argument("objective_id")
@@ -252,6 +265,21 @@ def main(argv: list[str] | None = None) -> int:
                         args.project,
                         {"text": args.text, "kind": args.kind},
                     )
+                elif args.command == "plan":
+                    envelope = make_envelope(
+                        "plan.submit",
+                        args.project,
+                        {
+                            "plan": json.loads(args.file.read_text()),
+                            "dedupe_key": args.key,
+                        },
+                    )
+                elif args.command == "retry":
+                    envelope = make_envelope(
+                        "task.retry",
+                        args.project,
+                        {"objective_id": args.objective_id, "task_id": args.task_id},
+                    )
                 elif args.command == "cancel":
                     envelope = make_envelope(
                         "objective.cancel",
@@ -332,6 +360,11 @@ def main(argv: list[str] | None = None) -> int:
                             "query": args.query,
                         },
                     )
+                if (
+                    isinstance(envelope, dict)
+                    and envelope.get("kind") == "objective.submit"
+                ):
+                    validate_memory_submission(envelope.get("payload"))
                 if args.command == "memory" and args.action == "read" and args.file:
                     if args.offset:
                         raise ValueError("--file exige leitura integral, sem --offset")

@@ -29,10 +29,12 @@ class MemoryConfig(StrictModel):
 class Config(StrictModel):
     schema_version: Literal[1] = 1
     projects_root: Path = Path.home() / "projects/work"
+    # None preserves root-based discovery; [] authorizes no project.
+    allowed_projects: list[Path] | None = None
     vault_root: Path = Path.home() / "Obsidian/Oraculo"
     state_dir: Path = Path.home() / "Library/Application Support/Oraculo"
     t3_mcp_url: str = "https://t3.example.invalid/mcp"
-    max_executors: Literal[1] = 1
+    max_executors: int = Field(default=1, ge=1, le=4)
     poll_active_seconds: int = Field(default=15, ge=1)
     poll_idle_seconds: int = Field(default=60, ge=1)
     proactive_interval_seconds: int = Field(default=1800, ge=1)
@@ -64,6 +66,17 @@ class Config(StrictModel):
     def expand_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser().resolve()
 
+    @field_validator("allowed_projects", mode="before")
+    @classmethod
+    def expand_allowed_projects(
+        cls, value: list[str | Path] | None
+    ) -> list[Path] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError("allowed_projects must be a list of project paths")
+        return [Path(path).expanduser().resolve() for path in value]
+
     @field_validator("t3_mcp_url")
     @classmethod
     def validate_url(cls, value: str) -> str:
@@ -78,6 +91,13 @@ class Config(StrictModel):
 
     @model_validator(mode="after")
     def separated_paths(self) -> Self:
+        for project in self.allowed_projects or []:
+            if project == self.projects_root or not project.is_relative_to(
+                self.projects_root
+            ):
+                raise ValueError(
+                    "allowed_projects must be strictly inside projects_root"
+                )
         for path in (self.vault_root, self.state_dir):
             if path == self.projects_root or path.is_relative_to(self.projects_root):
                 raise ValueError("vault and operational state must be outside projects")
@@ -97,8 +117,10 @@ class Config(StrictModel):
 
     def project_in_scope(self, path: str | Path) -> bool:
         candidate = Path(path).expanduser().resolve()
-        return candidate != self.projects_root and candidate.is_relative_to(
-            self.projects_root
+        return (
+            candidate != self.projects_root
+            and candidate.is_relative_to(self.projects_root)
+            and (self.allowed_projects is None or candidate in self.allowed_projects)
         )
 
     @classmethod

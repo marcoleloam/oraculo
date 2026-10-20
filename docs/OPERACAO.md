@@ -96,7 +96,7 @@ O bundle é copiado para staging privado e identificado por hash. Ingestão não
 
 ### Contexto grande e leitura autorizada
 
-O despacho de memória elimina cópias duplicadas do bundle e da evidência de execução. Até 80000 unidades UTF-16, o conteúdo pode seguir inline. Acima desse orçamento, o serviço preserva `payload` e `context` integrais em snapshot JSON canônico privado e envia uma referência com SHA-256. A mensagem final, incluindo as instruções, deve caber em 120000 unidades UTF-16. O snapshot aceita até 64 MiB; conteúdo acima desse limite é rejeitado explicitamente, sem truncamento silencioso.
+O despacho de memória elimina cópias duplicadas do bundle e da evidência de execução. Todo novo despacho de memória preserva `payload` e `context` integrais em snapshot JSON canônico privado e envia apenas a referência com SHA-256, inclusive para fontes pequenas e operações query/lint. Assim o coordenador não precisa retranscrever fontes literais. Despachos antigos já persistidos são mantidos para garantir identidade e retry; a atualização não os reescreve. A mensagem final, incluindo as instruções, deve caber em 120000 unidades UTF-16. O snapshot aceita até 64 MiB; conteúdo acima desse limite é rejeitado explicitamente, sem truncamento silencioso.
 
 O snapshot conserva o `base_commit`, os hashes e as fontes do momento da emissão. Não é substituído pela versão atual do vault durante retry ou restart. Seu manifesto permite apenas o projeto autorizado e `shared`; a referência não permite abrir caminhos arbitrários do filesystem. O coordenador encaminha a referência sem expandir novamente seu conteúdo no brief do filho.
 
@@ -209,3 +209,83 @@ Para validar continuidade com interfaces fechadas, siga [TESTES_AT020.md](TESTES
 Logs ficam em `~/Library/Logs/Oraculo`: `service.jsonl` com rotação, além de `stdout.log` e `stderr.log` do LaunchAgent. Estado SQLite, staging e recibos ficam fora do vault em `~/Library/Application Support/Oraculo`; o socket é local ao usuário. Não publique esse diretório como memória nem copie credenciais para logs.
 
 O Git local do vault versiona o conteúdo publicado e ignora configurações do Obsidian e revisões. Não use `git reset --hard` ou `git add -A` para reparar uma publicação. Git local e cópias no mesmo disco não protegem contra perda do disco. Para backup consistente do banco ativo, use a API de backup do SQLite; uma cópia isolada de `state.sqlite3` pode omitir transações no WAL. Pare o serviço antes de manutenção manual e preserve as revisões ainda não importadas. Nenhum backup remoto é configurado automaticamente.
+
+
+### Admissão explícita de memória (ORA-CONT-002)
+
+`submit PROJECT TEXT --kind memory` sem contrato de memória é rejeitado antes de
+criar objetivo/job. O texto livre não decide silenciosamente entre consulta e
+publicação. Use `memory ingest PROJECT --source FILE`, `memory query PROJECT
+--query TEXT` ou `memory lint PROJECT`. Em envelope `objective.submit`, declare
+`memory_operation: ingest|query|lint`; query exige pergunta não vazia e ingest
+exige `source_path` ou `execution_evidence` não vazio. O conteúdo informado deve
+ser integral e verificável; apontar para caminhos no texto não os anexa.
+
+`source_path` precisa pertencer à raiz registrada do projeto. Um worktree irmão
+não fica automaticamente autorizado como fonte de ingestão: envie uma cópia
+identificada dentro da raiz, ou um envelope estruturado com `execution_evidence`
+contendo fontes integrais, caminhos, commits e hashes. Não amplie o escopo para
+contornar essa regra. A validação é aplicada na CLI e na API de admissão; jobs
+legados já persistidos não são reescritos.
+
+## Planos executáveis (ORA-CONT-003)
+
+Para uma entrega com várias etapas, envie um JSON de plano usando:
+
+```sh
+oraculo plan PROJETO_T3 --file plano.json --key intencao-estavel
+oraculo status --project PROJETO_T3
+oraculo retry PROJETO_T3 OBJETIVO_ID TAREFA_ID
+oraculo cancel PROJETO_T3 OBJETIVO_ID
+```
+
+O arquivo contém `text`, `max_followups` (0–4) e `tasks` (1–32). Cada tarefa tem
+`id`, `kind` (perfil habilitado), `stage`, `owner`, `brief`, `sources`,
+`write_paths`, `depends_on` (IDs do mesmo plano) e `criteria` com `id`/`description`.
+Exemplo exercitável: [plano de exemplo](tasks/ORA-CONT-003-example-plan.json).
+Submissão é atômica; repetir a chave com o mesmo conteúdo recupera o plano,
+conteúdo diferente é rejeitado. Ciclos, dependências desconhecidas e IDs repetidos
+são rejeitados antes de enfileirar. A CLI `submit` legada continua disponível.
+
+O serviço despacha dependências prontas após reconciliar execução e efeitos;
+não exige “continue”. Cada tarefa usa um filho T3 próprio e preserva
+`taskId`/`threadId`/`runId`, com link no status. Revisão adicional é outra tarefa
+e outra delegação. Planos usam checkout compartilhado com propriedade declarada;
+contexto T3 separado não exige worktree separado. Worktrees legados continuam
+partindo do commit do pai e não recebem alterações não commitadas.
+
+`max_executors=1` continua sendo o padrão. Valores 2–4 permitem concorrência
+limitada apenas entre escopos independentes e destinos elegíveis na assinatura.
+`write_paths` são prefixos relativos: ausência ou `['*']` bloqueia todo o projeto,
+lista vazia é somente leitura. Declare artefatos de testes e todas as escritas;
+commits/índice Git compartilhado exigem `'*'`. Aliases de roots, symlinks,
+maiúsculas/minúsculas e normalização Unicode recebem exclusão conservadora;
+hardlinks explicitamente declarados usam identidade de arquivo. Não são enumerados
+hardlinks internos a árvores. Os agentes confiáveis precisam respeitar o escopo:
+leases não constituem sandbox. Memória mantém exclusão global do vault.
+
+`status.plans` informa tarefas prontas/ativas, responsável, dependências,
+critérios, provas, tentativas, links e bloqueios com motivo/ação. Os estágios
+implementation, validation, review, research, memory, publication, deployment e
+acceptance são independentes. `not_requested` não comprova que publicação/deploy
+ou aceite são dispensáveis. `delivery_contract_satisfied` comprova apenas os
+critérios declarados; um checkpoint de memória não encerra trabalho pendente.
+
+Todo relatório planejado de sucesso exige `evidence.criteria` com recibo único
+por critério: `id`, `status:'passed'` e `reference` verificável. Publicação/deploy
+exigem operação confirmada e o estágio correspondente autoriza o canal de
+operações. Falha pode receber até `max_correction_rounds` novas tentativas;
+`evidence.blocker` interrompe correção automática. Estado remoto incerto conserva
+o grant e impede duplicidade. Cancelamento impede sucessores e só termina depois
+de reconciliar todos os executores/efeitos. `task.retry` não contorna leases,
+operações incertas ou limites.
+
+`plan.extend` só é aceito de executor ativo, depende da tarefa de origem, mantém
+escopo contido e orçamento persistido. Não cria publicação, deploy, memória ou
+aceite automaticamente. Executor planejado não pode abrir objetivo/plano avulso
+para fugir desse limite.
+
+Use fontes por referência e recibos concisos. Um despacho novo que excede o
+limite T3 fica `blocked` com `task_dispatch_too_large`, sem envio/grant; cancele e
+reformule o plano. Uma outbox antiga incerta conserva os bytes/ID originais e exige
+reconciliação. Memória preserva o transporte integral por artefato da ORA-CONT-002.

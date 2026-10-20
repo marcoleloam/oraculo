@@ -1,5 +1,8 @@
 schema_version = 1
 projects_root = "~/projects/work"
+# Optional exact project allowlist. Omitted = all registered projects under root;
+# [] = no project. Paths are resolved; nested projects are not implicitly allowed.
+# allowed_projects = ["~/projects/work/projeto-a"]
 vault_root = "~/Obsidian/Oraculo"
 state_dir = "~/Library/Application Support/Oraculo"
 t3_mcp_url = "https://t3.example.invalid/mcp"

@@ -3,13 +3,20 @@
 import json
 
 import pytest
-from test_reconcile import Remote, snapshot
+from test_reconcile import Remote
+from test_reconcile import snapshot as unit_snapshot
 from test_service import DispatchLifecycleRemote
 
 from oraculo.memory.schema import digest
 from oraculo.protocol import canonical_json
 from oraculo.reconcile import Reconciler
 from oraculo.service import Service
+
+
+def snapshot(*args, **kwargs):
+    result = unit_snapshot(*args, **kwargs)
+    result["thread"]["projectId"] = "alpha"
+    return result
 
 
 def completed_work(service, result="Checks passed"):

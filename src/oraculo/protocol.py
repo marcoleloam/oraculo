@@ -14,6 +14,35 @@ class ProtocolError(ValueError):
     pass
 
 
+def validate_memory_submission(payload: dict[str, Any]) -> None:
+    """Require an explicit operation before memory work consumes a grant."""
+    if not isinstance(payload, dict) or payload.get("kind") != "memory":
+        return
+    operation = payload.get("memory_operation")
+    if not isinstance(operation, str) or operation not in {"ingest", "query", "lint"}:
+        raise ProtocolError(
+            "memory_operation_required: use 'memory ingest PROJECT --source FILE', "
+            "'memory query PROJECT --query TEXT' or 'memory lint PROJECT'; "
+            "structured requests must declare memory_operation"
+        )
+    if operation == "query" and (
+        not isinstance(payload.get("query"), str) or not payload["query"].strip()
+    ):
+        raise ProtocolError(
+            "memory_query_required: use 'memory query PROJECT --query TEXT'"
+        )
+    source = payload.get("source_path")
+    evidence = payload.get("execution_evidence")
+    if operation == "ingest" and not (
+        (isinstance(source, str) and source.strip())
+        or (isinstance(evidence, dict) and evidence)
+    ):
+        raise ProtocolError(
+            "memory_source_required: use 'memory ingest PROJECT --source FILE' "
+            "or supply nonempty execution_evidence in a structured request"
+        )
+
+
 class Origin(BaseModel):
     model_config = ConfigDict(extra="forbid")
     thread_id: str | None = None
@@ -28,6 +57,9 @@ class Envelope(BaseModel):
     kind: Literal[
         "objective.submit",
         "objective.cancel",
+        "plan.submit",
+        "plan.extend",
+        "task.retry",
         "status.get",
         "grant.acquire",
         "grant.claim",
