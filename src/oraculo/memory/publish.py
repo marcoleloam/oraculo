@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -51,10 +52,13 @@ def atomic_write(path: Path, content: bytes) -> None:
 
 
 class Publisher:
-    def __init__(self, vault: Path, state_dir: Path) -> None:
+    def __init__(
+        self, vault: Path, state_dir: Path, *, lock_timeout: float | None = None
+    ) -> None:
         self.vault = Path(vault).expanduser().absolute()
         self.state_dir = Path(state_dir).expanduser().absolute() / "memory"
         self.git = VaultGit(self.vault)
+        self.lock_timeout = lock_timeout
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.state_dir, 0o700)
         self.journals = self.state_dir / "journals"
@@ -64,7 +68,18 @@ class Publisher:
     @contextlib.contextmanager
     def locked(self) -> Iterator[None]:
         with (self.state_dir / "writer.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self.lock_timeout is None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + self.lock_timeout
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise MemoryError("memory_writer_busy") from None
+                        time.sleep(0.02)
             try:
                 yield
             finally:

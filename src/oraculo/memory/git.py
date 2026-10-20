@@ -9,6 +9,7 @@ from .schema import MemoryError, safe_path
 class VaultGit:
     def __init__(self, vault: Path) -> None:
         self.vault = Path(vault)
+        self.timeout: float | None = None
 
     def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -16,6 +17,7 @@ class VaultGit:
             capture_output=True,
             text=True,
             check=check,
+            timeout=self.timeout,
         )
 
     def initialize(self) -> None:

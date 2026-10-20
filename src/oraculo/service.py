@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from oraculo.config import Config, resources_root
+from oraculo.memory.bridge import MemoryBridge, artifact_context, public_cycle
 from oraculo.memory.context import Context
+from oraculo.memory.cycles import MemoryCycles
 from oraculo.memory.maintenance import Maintenance
 from oraculo.memory.publish import Publisher
 from oraculo.memory.review import ReviewManager
@@ -30,6 +32,8 @@ from oraculo.protocol import (
     validate_memory_submission,
 )
 from oraculo.routing import Router
+from oraculo.settlement import Settlements
+from oraculo.settlement_store import SettlementStore
 from oraculo.state import State, StateError
 
 
@@ -66,10 +70,26 @@ class Service:
     def __init__(self, config: Config, config_path: Path):
         self.config = config
         self.config_path = config_path
-        self.state = State(config.db_path, max_executors=config.max_executors)
+        self.state = State(
+            config.db_path,
+            max_executors=config.max_executors,
+            provider_limits={
+                p.instance_id: min(
+                    alias.max_executors
+                    for alias in config.providers.values()
+                    if alias.instance_id == p.instance_id
+                )
+                for p in config.providers.values()
+            },
+        )
         self.plans = Plans(self.state)
-        self.publisher = Publisher(config.vault_root, config.state_dir)
+        self.settlements = SettlementStore(self.state)
+        self.publisher = Publisher(config.vault_root, config.state_dir, lock_timeout=2)
+        self.publisher.git.timeout = 30
         self.reviews = ReviewManager(self.publisher)
+        self.memory_cycles = MemoryCycles(self.state, self.publisher)
+        self.memory_flush: asyncio.Task | None = None
+        self.managed_flush: asyncio.Task | None = None
         self.router = Router(config, self.state)
         self.catalog: dict = {}
         self.health = "starting"
@@ -121,6 +141,7 @@ class Service:
         ]
         identifiers = {o["id"] for o in objectives}
         jobs = [j for j in self.state.list_jobs() if j["objective_id"] in identifiers]
+        plans = [self.operational_plan(plan) for plan in plans]
         lease = self.state.lease()
         if lease:
             lease = dict(lease, attempt=self.state.get_attempt(lease["attempt_id"]))
@@ -135,7 +156,10 @@ class Service:
                 for o in objectives[-100:]
             ],
             "jobs": [
-                {k: j[k] for k in ("id", "objective_id", "kind", "state")}
+                dict(
+                    {k: j[k] for k in ("id", "objective_id", "kind", "state")},
+                    admission=self.admission(j),
+                )
                 for j in jobs[-200:]
             ],
             "executor": lease,
@@ -144,9 +168,77 @@ class Service:
                 for item in self.state.leases()
             ],
             "max_executors": self.config.max_executors,
+            "capacity": self.state.capacity(),
+            "provider_capacity": {
+                p.instance_id: self.state.provider_capacity(p.instance_id)
+                for p in self.config.providers.values()
+            },
             "plans": plans,
+            "settlements": self.settlements.list(project_id),
+            "memory_cycles": [
+                public_cycle(c) for c in self.memory_cycles.list(project_id)
+            ],
             "additional_spend_allowed": False,
         }
+
+    def operational_plan(self, plan: dict) -> dict:
+        plan["dag_ready"] = list(plan["ready"])
+        for task in plan["tasks"]:
+            task["admission"] = self.admission(self.state.get_job(task["job_id"]))
+        plan["ready"] = [
+            task["id"] for task in plan["tasks"] if task["admission"]["eligible"]
+        ]
+        if plan["dag_ready"] and not plan["ready"]:
+            plan["next_action"] = (
+                "Resolve admission blockers or wait for reconciliation"
+            )
+        if plan["concurrency"]["limited"]:
+            plan["next_action"] += (
+                "; requested parallelism exceeds effective capacity: "
+                f"{plan['concurrency']['effective']}"
+            )
+        return plan
+
+    def admission(self, job: dict) -> dict:
+        blockers = self.state.admission_blockers(job)
+        if job["state"] in {"queued", "quota_wait", "auth_required"}:
+            target = self.router.select(job["kind"], self.catalog)
+            if target is None:
+                blockers.append(
+                    {
+                        "reason": self.router.last_reason,
+                        "action": "Restore eligible subscription capacity; do not enable additional spend",
+                        "category": "provider",
+                        "providers": self.router.last_blockers,
+                    }
+                )
+        # Dispatch acceptance is separate from admission; expose its real receipt.
+        count = self.state.connection.execute(
+            "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
+        ).fetchone()[0]
+        key = self.dispatch_key(job["id"], count)
+        intents = [
+            dict(row)
+            for row in self.state.connection.execute(
+                "SELECT id,state FROM outbox WHERE id=? OR id LIKE ? ORDER BY id",
+                (key, key + ":retry:%"),
+            )
+        ]
+        dispatch = None
+        if intents and job["state"] == "queued":
+            latest = intents[-1]
+            dispatch = dict(
+                latest,
+                receipt=self.state.get_meta(f"dispatch_receipt:{latest['id']}", {}),
+                action="Await coordinator; replay only the same durable dispatch intent",
+            )
+        return {"eligible": not blockers, "blockers": blockers, "dispatch": dispatch}
+
+    def dispatch_key(self, job_id: str, attempt_count: int) -> str:
+        return self.state.get_meta(
+            f"dispatch_member:{job_id}:{attempt_count}",
+            f"dispatch:{job_id}:{attempt_count}",
+        )
 
     def target_options(self, provider: str, model: str) -> dict:
         entry = next(
@@ -175,12 +267,53 @@ class Service:
             result["fastMode"] = False
         return result
 
-    def local_command(self, envelope: Envelope) -> dict:
+    def local_command(
+        self, envelope: Envelope, prepared_cycle: dict | None = None
+    ) -> dict:
         p = envelope.payload
         kind = envelope.kind
         if kind == "status.get":
             return self.status(envelope.project_id)
+        if kind == "capacity.get":
+            return self.state.capacity()
+        if kind == "capacity.set":
+            if envelope.origin.thread_id or envelope.origin.run_id:
+                raise StateError("capacity_requires_local_operator")
+            return self.state.set_capacity(p["max_executors"])
         project = self.project(envelope.project_id)
+        if kind == "plan.configure":
+            if (envelope.origin.thread_id or envelope.origin.run_id) and (
+                envelope.origin.thread_id != project["coordinator_thread_id"]
+                or not envelope.origin.run_id
+            ):
+                raise StateError("plan_policy_requires_coordinator_or_local_operator")
+            objective = self.state.get_objective(p["objective_id"])
+            if not objective or objective["project_id"] != envelope.project_id:
+                raise StateError("objective_project_mismatch")
+            return self.operational_plan(
+                self.plans.configure(objective["id"], p["max_parallel"])
+            )
+        if kind == "settlement.status":
+            binding_id = p.get("binding_id")
+            if not binding_id:
+                return {"settlements": self.settlements.list(envelope.project_id)}
+            binding = self.settlements.get(binding_id)
+            if not binding or binding["project_id"] != envelope.project_id:
+                raise StateError("settlement_project_mismatch")
+            return {
+                "settlement": binding,
+                "events": self.settlements.events(binding_id),
+            }
+        if kind == "settlement.bind":
+            if envelope.origin.thread_id and (
+                envelope.origin.thread_id != project["coordinator_thread_id"]
+                and (
+                    envelope.origin.thread_id != p.get("thread_id")
+                    or envelope.origin.run_id != p.get("run_id")
+                )
+            ):
+                raise StateError("settlement_origin_mismatch")
+            return self.settlements.bind(envelope.project_id, p)
         if kind in {"plan.submit", "objective.submit"} and envelope.origin.thread_id:
             source = self.state._one(
                 "SELECT j.objective_id FROM attempts a JOIN jobs j ON j.id=a.job_id "
@@ -190,11 +323,13 @@ class Service:
             if source and self.plans.get(source["objective_id"]):
                 raise StateError("planned_executor_must_use_bounded_plan_extend")
         if kind == "plan.submit":
-            return self.plans.submit(
-                envelope.project_id,
-                p["plan"],
-                p.get("dedupe_key", envelope.request_id),
-                self.config.profiles,
+            return self.operational_plan(
+                self.plans.submit(
+                    envelope.project_id,
+                    p["plan"],
+                    p.get("dedupe_key", envelope.request_id),
+                    self.config.profiles,
+                )
             )
         if kind == "plan.extend":
             attempt = self.owner(envelope, executor=True)
@@ -240,7 +375,34 @@ class Service:
             objective = self.state.get_objective(p["objective_id"])
             if not objective or objective["project_id"] != envelope.project_id:
                 raise StateError("objective_project_mismatch")
-            return self.state.cancel_objective(objective["id"])
+            cancelled = self.state.cancel_objective(objective["id"])
+            for job in self.state.list_jobs(objective["id"]):
+                if job["kind"] == "memory" or self.state._one(
+                    "SELECT id FROM attempts WHERE job_id=?", (job["id"],)
+                ):
+                    continue
+                payload = json.loads(job["payload"])
+                cycle = self.memory_cycles.begin(
+                    objective["project_id"],
+                    f"job:{job['id']}:1",
+                    payload.get("task_spec", {}).get("brief", objective["text"]),
+                    {
+                        "entry": "managed",
+                        "objective_id": objective["id"],
+                        "job_id": job["id"],
+                        "attempt_number": 1,
+                    },
+                    skip_read_reason="cancelled_before_start",
+                )
+                self.memory_cycles.finish(
+                    cycle["id"],
+                    "stopped",
+                    {
+                        "summary": "Cancelled before executor admission",
+                        "limitations": ["No executor received this context"],
+                    },
+                )
+            return cancelled
         if kind == "grant.acquire":
             if (
                 envelope.origin.thread_id != project["coordinator_thread_id"]
@@ -257,6 +419,22 @@ class Service:
             target = self.router.select(job["kind"], self.catalog)
             if not target:
                 raise StateError("no_eligible_subscription_model")
+            if job["kind"] != "memory":
+                expected = (
+                    self.state.connection.execute(
+                        "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
+                    ).fetchone()[0]
+                    + 1
+                )
+                if (
+                    not prepared_cycle
+                    or prepared_cycle["identity"]["attempt_number"] != expected
+                    or prepared_cycle["work_status"] != "running"
+                ):
+                    return {
+                        "state": "busy",
+                        "reason": "memory_preparation_changed_retry",
+                    }
             attempt = self.state.acquire_grant(
                 job["id"],
                 target.instance_id,
@@ -266,7 +444,26 @@ class Service:
             )
             if not attempt:
                 return {"state": "busy"}
+            cycle_id = self.state.get_meta(
+                f"work_cycle:{job['id']}:{attempt['number']}"
+            )
+            cycle = self.memory_cycles.get(cycle_id) if cycle_id else None
+            if cycle:
+                self.memory_cycles.bind(cycle["id"], {"attempt_id": attempt["id"]})
+                self.state.set_meta(f"attempt_cycle:{attempt['id']}", cycle["id"])
+                reference = self.state.get_meta(
+                    f"work_memory_reference:{job['id']}:{attempt['number']}"
+                )
+                self.state.set_meta(
+                    f"memory_artifact:{job['id']}", reference["artifact"]
+                )
             return {
+                "memory": public_cycle(cycle) if cycle else None,
+                "context": self.state.get_meta(
+                    f"work_memory_reference:{job['id']}:{attempt['number']}"
+                )
+                if cycle
+                else None,
                 "state": "reserved",
                 "attempt": attempt,
                 "job": job,
@@ -306,13 +503,20 @@ class Service:
                     current and current["thread_id"] == envelope.origin.thread_id
                 ),
             )
-            return self.state.claim_grant(
+            bound = self.state.claim_grant(
                 p["attempt_id"],
                 p["generation"],
                 p["thread_id"],
                 p["run_id"],
                 p.get("task_id"),
             )
+            cycle_id = self.state.get_meta(f"attempt_cycle:{p['attempt_id']}")
+            if cycle_id:
+                self.memory_cycles.bind(
+                    cycle_id,
+                    {k: p[k] for k in ("thread_id", "run_id", "task_id") if p.get(k)},
+                )
+            return bound
         if kind == "execution.report":
             attempt = self.state.get_attempt(p["attempt_id"])
             if p.get("status") == "not_started":
@@ -612,7 +816,89 @@ class Service:
                 raise StateError("proposal_project_mismatch")
             return await asyncio.to_thread(self.publisher.publish, proposal)
 
+    async def memory_io(self, method: str, *args, **kwargs):
+        """Vault I/O cannot hold the event loop or use its SQLite connection."""
+
+        def work():
+            state = State(self.config.db_path, max_executors=self.config.max_executors)
+            try:
+                return getattr(MemoryCycles(state, self.publisher), method)(
+                    *args, **kwargs
+                )
+            finally:
+                state.close()
+
+        return await asyncio.to_thread(work)
+
+    async def direct_memory_command(self, envelope: Envelope) -> dict:
+        def work():
+            from types import SimpleNamespace
+
+            state = State(self.config.db_path, max_executors=self.config.max_executors)
+
+            def project(project_id):
+                item = state.get_project(project_id)
+                if (
+                    not item
+                    or item["status"] != "registered"
+                    or not self.config.project_in_scope(item["path"])
+                ):
+                    raise StateError("project_not_registered_or_outside_scope")
+                return item
+
+            try:
+                local = SimpleNamespace(
+                    config=self.config,
+                    state=state,
+                    project=project,
+                    memory_cycles=MemoryCycles(state, self.publisher),
+                )
+                return MemoryBridge(local).command(envelope)
+            finally:
+                state.close()
+
+        return await asyncio.to_thread(work)
+
     async def handle(self, envelope: Envelope) -> dict:
+        prepared_cycle = None
+        if envelope.kind.startswith("memory.cycle."):
+            # Cycle identities provide durable dedupe; reads must never use inbox cache.
+            data = await self.direct_memory_command(envelope)
+            return {
+                "request_id": envelope.request_id,
+                "ok": True,
+                "state": "ok",
+                "data": data,
+            }
+        if envelope.kind == "grant.acquire":
+            # Query before reservation; admission rechecks state after awaited I/O.
+            project = self.project(envelope.project_id)
+            if (
+                envelope.origin.thread_id != project["coordinator_thread_id"]
+                or not envelope.origin.run_id
+            ):
+                raise StateError("coordinator_identity_required")
+            if self.state._one(
+                "SELECT id FROM inbox WHERE id=?", (envelope.request_id,)
+            ):
+                # A replay must not prepare the next attempt before returning the
+                # original receipt. request_begin also checks immutable payload.
+                return self.state.request_begin(
+                    envelope.request_id, envelope.model_dump(mode="json")
+                )
+            job = self.state.get_job(envelope.payload["job_id"])
+            if (
+                not job
+                or self.state.get_objective(job["objective_id"])["project_id"]
+                != envelope.project_id
+            ):
+                raise StateError("job_project_mismatch")
+            if job["kind"] != "memory" and job["state"] in {
+                "queued",
+                "quota_wait",
+                "auth_required",
+            }:
+                prepared_cycle = await self.prepare_work_memory(job)
         if envelope.kind == "memory.read":
             # Reads revalidate the live grant even for a repeated request_id;
             # cached pages must not bypass cancellation or artifact integrity.
@@ -622,9 +908,7 @@ class Service:
             attempt = self.owner(envelope, executor=True)
             job = self.state.get_job(attempt["job_id"])
             artifact = envelope.payload["artifact"]
-            if job["kind"] != "memory" or artifact != self.state.get_meta(
-                f"memory_artifact:{job['id']}"
-            ):
+            if artifact != self.state.get_meta(f"memory_artifact:{job['id']}"):
                 raise StateError("memory_artifact_not_issued_to_job")
             data = MemoryArtifacts(self.config.state_dir).read(
                 artifact,
@@ -632,6 +916,11 @@ class Service:
                 job["id"],
                 envelope.payload.get("offset", 0),
             )
+            cycle_id = self.state.get_meta(f"attempt_cycle:{attempt['id']}")
+            if cycle_id:
+                self.memory_cycles.delivered(
+                    cycle_id, attempt["thread_id"], attempt["run_id"], artifact
+                )
             return {
                 "request_id": envelope.request_id,
                 "ok": True,
@@ -660,7 +949,7 @@ class Service:
                     )
                 return previous
             if not external:
-                data = self.local_command(envelope)
+                data = self.local_command(envelope, prepared_cycle)
                 response = {
                     "request_id": envelope.request_id,
                     "ok": True,
@@ -788,7 +1077,7 @@ class Service:
         )
 
     async def dispatch(self, client: Any) -> None:
-        if len(self.state.leases()) >= self.config.max_executors:
+        if not self.state.capacity()["available"]:
             return
         candidates = [j for j in self.state.list_jobs() if j["state"] == "queued"]
         candidates.sort(
@@ -801,9 +1090,7 @@ class Service:
             objective = self.state.get_objective(job["objective_id"])
             if objective["status"] in {"cancel_requested", "stopped"}:
                 continue
-            if not self.job_ready(job):
-                continue
-            if self.state._scope_conflicts(job, objective["project_id"]):
+            if self.state.admission_blockers(job):
                 continue
             if not self.router.select(job["kind"], self.catalog):
                 self.health = "blocked_eligibility"
@@ -815,7 +1102,7 @@ class Service:
             attempt_count = self.state.connection.execute(
                 "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
             ).fetchone()[0]
-            base_key = f"dispatch:{job['id']}:{attempt_count}"
+            base_key = self.dispatch_key(job["id"], attempt_count)
             key = base_key
             existing = self.state._one("SELECT * FROM outbox WHERE id=?", (key,))
             if existing:
@@ -864,6 +1151,11 @@ class Service:
             context: dict = {}
             if job["kind"] == "memory":
                 context = await self.memory_context(project, payload)
+            else:
+                cycle = await self.prepare_work_memory(job)
+                context = self.state.get_meta(
+                    f"work_memory_reference:{job['id']}:{cycle['identity']['attempt_number']}"
+                )
             if not self.dispatch_current(job, attempt_count):
                 continue
             body = {
@@ -876,10 +1168,12 @@ class Service:
                 "executor_instructions": self.prompt("executor"),
                 "objective_id": objective["id"],
                 "task_context": self.task_context(job),
+                "memory": public_cycle(cycle) if job["kind"] != "memory" else None,
             }
             if body["task_context"]:
                 # Existing coordinator contexts can predate this protocol version.
                 body["coordinator_instructions"] = self.prompt("coordinator")
+                body["parallel_dispatches"] = self.parallel_dispatches(job, candidates)
             if job["kind"] == "memory":
                 body["memory_instructions"] = self.prompt("memory")
                 from oraculo.memory.transport import MemoryArtifacts, memory_message
@@ -892,9 +1186,17 @@ class Service:
                         f"memory_artifact:{job['id']}", reference["artifact"]
                     )
             else:
-                message = canonical_json(body)
                 from oraculo.memory.transport import MAX_MESSAGE_UNITS, utf16_units
 
+                # An oversized companion must not block an otherwise bounded task.
+                companions = body.pop("parallel_dispatches", [])
+                if companions:
+                    body["parallel_dispatches"] = []
+                    for companion in companions:
+                        body["parallel_dispatches"].append(companion)
+                        if utf16_units(canonical_json(body)) > MAX_MESSAGE_UNITS:
+                            body["parallel_dispatches"].pop()
+                message = canonical_json(body)
                 if utf16_units(message) > MAX_MESSAGE_UNITS:
                     # This is a new intent, known not to have been sent. Persist a
                     # useful blocker instead of treating it as an uncertain replay.
@@ -921,13 +1223,58 @@ class Service:
                         )
                     self.health = "task_dispatch_too_large"
                     continue
-            self.state.enqueue_outbox(
-                key, {"thread_id": coordinator, "message": message}, objective["id"]
-            )
+            with self.state.transaction():
+                self.state.enqueue_outbox(
+                    key, {"thread_id": coordinator, "message": message}, objective["id"]
+                )
+                for offered in [body, *body.get("parallel_dispatches", [])]:
+                    offered_count = self.state.connection.execute(
+                        "SELECT count(*) FROM attempts WHERE job_id=?",
+                        (offered["job_id"],),
+                    ).fetchone()[0]
+                    self.state.set_meta(
+                        f"dispatch_member:{offered['job_id']}:{offered_count}", key
+                    )
             await self.send_dispatch(
                 client, self.state._one("SELECT * FROM outbox WHERE id=?", (key,))
             )
             return
+
+    async def prepare_work_memory(self, job: dict, number: int | None = None) -> dict:
+        """A new attempt gets a new snapshot; dispatch replay preserves its version."""
+        objective = self.state.get_objective(job["objective_id"])
+        number = number or (
+            self.state.connection.execute(
+                "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
+            ).fetchone()[0]
+            + 1
+        )
+        payload = json.loads(job["payload"])
+        cycle = await self.memory_io(
+            "begin",
+            objective["project_id"],
+            f"job:{job['id']}:{number}",
+            payload.get("task_spec", {}).get("brief", objective["text"]),
+            {
+                "entry": "managed",
+                "objective_id": objective["id"],
+                "job_id": job["id"],
+                "attempt_number": number,
+            },
+        )
+        from oraculo.memory.transport import MemoryArtifacts
+
+        reference = MemoryArtifacts(self.config.state_dir).create(
+            {
+                "project_id": objective["project_id"],
+                "job_id": job["id"],
+                "payload": {},
+                "context": artifact_context(cycle),
+            }
+        )
+        self.state.set_meta(f"work_cycle:{job['id']}:{number}", cycle["id"])
+        self.state.set_meta(f"work_memory_reference:{job['id']}:{number}", reference)
+        return cycle
 
     def dispatch_current(self, job: dict, attempt_count: int) -> bool:
         """Recheck admission after remote reads or context preparation yielded."""
@@ -937,13 +1284,61 @@ class Service:
             "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
         ).fetchone()[0]
         return (
-            len(self.state.leases()) < self.config.max_executors
-            and self.job_ready(current)
+            not self.state.admission_blockers(current)
             and current["state"] == "queued"
             and objective["status"] not in {"cancel_requested", "stopped"}
             and not self.state._scope_conflicts(current, objective["project_id"])
             and count == attempt_count
         )
+
+    def parallel_dispatches(self, primary: dict, candidates: list[dict]) -> list[dict]:
+        """Offer bounded companions; only acquire_grant can authorize each child."""
+        capacity = self.state.plan_capacity(primary["objective_id"])
+        if not capacity["requested"] or capacity["requested"] < 2:
+            return []
+        remaining = max(0, capacity["available"] - 1)
+        result = []
+        project_id = self.state.get_objective(primary["objective_id"])["project_id"]
+        offered = [dict(primary, project_id=project_id)]
+        primary_target = self.router.select(primary["kind"], self.catalog)
+        allocations = {primary_target.provider: 1} if primary_target else {}
+        for job in candidates:
+            if len(result) >= remaining:
+                break
+            if (
+                job["id"] == primary["id"]
+                or job["objective_id"] != primary["objective_id"]
+                or job["kind"] == "memory"
+                or not self.admission(job)["eligible"]
+                or self.state._scope_conflicts(job, project_id, active=offered)
+            ):
+                continue
+            count = self.state.connection.execute(
+                "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
+            ).fetchone()[0]
+            if self.state._one(
+                "SELECT id FROM outbox WHERE id=?",
+                (self.dispatch_key(job["id"], count),),
+            ):
+                # An accepted/uncertain offer retains its original outbox identity.
+                continue
+            target = self.router.select(job["kind"], self.catalog, reserved=allocations)
+            if (
+                not target
+                or allocations.get(target.provider, 0)
+                >= self.state.provider_capacity(target.provider)["available"]
+            ):
+                continue
+            allocations[target.provider] = allocations.get(target.provider, 0) + 1
+            offered.append(dict(job, project_id=project_id))
+            result.append(
+                {
+                    "job_id": job["id"],
+                    "payload": json.loads(job["payload"]),
+                    "task_context": self.task_context(job),
+                }
+            )
+        return result
 
     def task_context(self, job: dict) -> dict:
         plan = self.plans.get(job["objective_id"])
@@ -1084,13 +1479,141 @@ class Service:
             await self.verify_operation(operation)
         await Reconciler(self.state, client).reconcile()
         self.after_execution()
+        self.start_memory_flush()
         await self.poll_coordinators(client)
+        await self.reconcile_settlements(client)
         await self.flush_status(client)
+        await self.reconcile_managed_tasks(client)
         self.health = "online"
         self.discover()
         await self.dispatch(client)
 
+    async def reconcile_managed_tasks(self, client: Any) -> None:
+        """Bounded background recovery; slow Git/GitHub never blocks admission."""
+        if self.managed_flush is not None and not self.managed_flush.done():
+            return
+        if self.managed_flush is not None:
+            try:
+                self.managed_flush.result()
+            except Exception as exc:
+                self.log.warning("managed_reconcile_failed:%s", type(exc).__name__)
+        path = self.config.state_dir / "managed-tasks.sqlite3"
+        if not path.exists():
+            return
+        loop = asyncio.get_running_loop()
+
+        class HostProxy:
+            async def call(self, name, arguments):
+                future = asyncio.run_coroutine_threadsafe(
+                    client.call(name, arguments), loop
+                )
+                return await asyncio.wrap_future(future)
+
+        def reconcile_batch():
+            from oraculo.managed_tasks import ManagedTasks
+            from oraculo.publication import GitHubPublisher
+            from oraculo.task_store import TaskStore
+            from oraculo.task_transport import SocketMemory
+
+            descriptor = os.open(
+                path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+            )
+            store = None
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                store = TaskStore(path)
+                adapter = ManagedTasks(
+                    self.config,
+                    store,
+                    HostProxy(),
+                    SocketMemory(self.config),
+                    GitHubPublisher(),
+                )
+                cursor = store.state.get_meta("managed_reconcile_cursor", 0)
+                rows = store.db.execute(
+                    "SELECT rowid,id FROM managed_tasks WHERE rowid>? ORDER BY rowid LIMIT 16",
+                    (cursor,),
+                ).fetchall()
+                if not rows:
+                    store.state.set_meta("managed_reconcile_cursor", 0)
+
+                async def run_batch():
+                    for row in rows:
+                        try:
+                            await adapter.reconcile(row["id"])
+                        except Exception as exc:
+                            self.log.warning(
+                                "managed_reconcile_failed:%s", type(exc).__name__
+                            )
+
+                asyncio.run(run_batch())
+                if rows:
+                    store.state.set_meta("managed_reconcile_cursor", rows[-1]["rowid"])
+            finally:
+                if store:
+                    store.close()
+                os.close(descriptor)
+
+        self.managed_flush = asyncio.create_task(asyncio.to_thread(reconcile_batch))
+
+    def start_memory_flush(self) -> None:
+        # One bounded batch at a time, independent of dispatch/reconciliation.
+        if self.memory_flush is not None and not self.memory_flush.done():
+            return
+        if self.memory_flush is not None:
+            try:
+                self.memory_flush.result()
+            except Exception as exc:
+                self.log.warning("memory_flush_failed:%s", type(exc).__name__)
+        if not self.memory_cycles.pending():
+            return
+        self.memory_flush = asyncio.create_task(
+            self.memory_io("publish_pending", limit=4)
+        )
+
+    async def reconcile_settlements(self, client: Any) -> None:
+        engine = Settlements(self.state, self.settlements, self.plans)
+        for binding in self.settlements.list():
+            if binding["state"] == "reopened":
+                continue
+            project = self.state.get_project(binding["project_id"])
+            if (
+                not project
+                or project["status"] != "registered"
+                or not self.config.project_in_scope(project["path"])
+            ):
+                self.settlements.record(
+                    binding["id"],
+                    "blocked",
+                    error="project_not_registered_or_outside_scope",
+                )
+                continue
+            await engine.reconcile(client, binding["id"])
+
     def after_execution(self) -> None:
+        # A dispatch may be cancelled before any grant/child exists. Preserve that
+        # history without inventing an executor identity or scheduling more work.
+        for cycle in self.memory_cycles.list():
+            identity = cycle["identity"]
+            if (
+                identity.get("entry") != "managed"
+                or identity.get("attempt_id")
+                or cycle["work_status"] != "running"
+            ):
+                continue
+            objective = self.state.get_objective(identity["objective_id"])
+            if objective["status"] in {"cancel_requested", "stopped"}:
+                self.memory_cycles.finish(
+                    cycle["id"],
+                    "stopped",
+                    {
+                        "summary": "Cancelled before executor admission",
+                        "limitations": ["No executor received this context"],
+                    },
+                )
         attempts = [
             dict(row)
             for row in self.state.connection.execute(
@@ -1105,6 +1628,21 @@ class Service:
             objective = self.state.get_objective(job["objective_id"])
             report = self.state.get_meta(f"execution_report:{attempt['id']}", {})
             evidence = report.get("evidence", {})
+            cycle_id = self.state.get_meta(f"attempt_cycle:{attempt['id']}")
+            if cycle_id:
+                self.memory_cycles.bind(
+                    cycle_id,
+                    {
+                        k: attempt[k]
+                        for k in ("thread_id", "run_id", "task_id")
+                        if attempt.get(k)
+                    },
+                )
+                self.memory_cycles.finish(
+                    cycle_id,
+                    attempt["status"],
+                    evidence if isinstance(evidence, dict) else {"evidence": evidence},
+                )
             with self.state.transaction():
                 quota = (
                     isinstance(evidence, dict) and evidence.get("error_kind") == "quota"
@@ -1133,7 +1671,8 @@ class Service:
                         (objective["id"],),
                     )
                 elif (
-                    not planned
+                    not cycle_id
+                    and not planned
                     and job["kind"] not in {"memory", "discovery"}
                     and objective["status"] not in {"cancel_requested", "stopped"}
                 ):
@@ -1177,6 +1716,9 @@ class Service:
                             "attempt_id": attempt["id"],
                             "status": attempt["status"],
                             "retry_queued": retry,
+                            "memory": public_cycle(self.memory_cycles.get(cycle_id))
+                            if cycle_id
+                            else None,
                         }
                     )
                     self.state.enqueue_outbox(
@@ -1271,6 +1813,7 @@ class Service:
         from oraculo.t3.contracts import ContractError
 
         while not self.stop.is_set():
+            self.start_memory_flush()
             try:
                 async with T3Client(
                     self.config.t3_mcp_url, build_auth(self.config.t3_mcp_url)
@@ -1341,6 +1884,8 @@ async def serve(config: Config, config_path: Path) -> None:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
         finally:
+            if service.memory_flush is not None:
+                await asyncio.gather(service.memory_flush, return_exceptions=True)
             config.socket_path.unlink(missing_ok=True)
             service.state.close()
             service.log.removeHandler(handler)

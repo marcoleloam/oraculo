@@ -2,10 +2,14 @@ schema_version = 1
 projects_root = "~/projects/work"
 # Optional exact project allowlist. Omitted = all registered projects under root;
 # [] = no project. Paths are resolved; nested projects are not implicitly allowed.
-# allowed_projects = ["~/projects/work/projeto-a"]
+# allowed_projects = ["~/projects/work/example-project"]
 vault_root = "~/Obsidian/Oraculo"
 state_dir = "~/Library/Application Support/Oraculo"
 t3_mcp_url = "https://t3.example.invalid/mcp"
+# Service ceiling (1–4), loaded at startup. Default remains serial.
+# Once an authorized ceiling is installed, `oraculo capacity --set N` persists
+# an operational limit up to this ceiling without editing config/restarting.
+# Plans request concurrency independently with max_parallel (1 = serial).
 max_executors = 1
 poll_active_seconds = 15
 poll_idle_seconds = 60
@@ -20,18 +24,22 @@ instance_id = "codex"
 auth_kind = "existing_subscription"
 billing_verified = false
 models = []
+# Optional local provider admission cap (1–4; default 4), not a subscription quota.
+# max_executors = 4
 
 [providers.claude]
 instance_id = "claudeAgent"
 auth_kind = "existing_subscription"
 billing_verified = false
 models = []
+# max_executors = 4
 
 [providers.grok]
 instance_id = "grok"
 auth_kind = "existing_subscription"
 billing_verified = false
 models = []
+# max_executors = 4
 
 [memory]
 max_batch_pages = 20

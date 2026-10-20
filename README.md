@@ -6,9 +6,11 @@
 
 Serviço local que coordena trabalho nos projetos de `~/projects/work` pelo T3 Code e mantém memória persistente em um vault Obsidian separado.
 
-O Oráculo escolhe Claude Code, Codex ou Grok conforme a tarefa, com um executor de trabalho ativo por vez. Pode descobrir melhorias e avançar objetivos, incluindo merge e deploy com verificações e recibos. Usa somente modelos e autenticações de assinaturas existentes explicitamente habilitados na configuração; não oferece fallback para APIs pagas.
+O Oráculo escolhe Claude Code, Codex ou Grok conforme a tarefa. A execução é serial por padrão e permite até quatro executores, conforme a capacidade configurada e os escopos de escrita. Pode descobrir melhorias e avançar objetivos com verificações e recibos. Usa somente modelos e autenticações de assinaturas existentes explicitamente habilitados na configuração; não oferece fallback para APIs pagas.
 
 A memória funciona com o Obsidian fechado. Aprendizados de projeto podem ser promovidos para a área compartilhada após sanitização pelo agente, por um objetivo de memória específico. O serviço publica a wiki canônica; o plugin Karpathy LLM Wiki trabalha em uma revisão versionada no mesmo vault, importada ao encerrar a revisão quando não há conflito.
+
+O fluxo de [tarefas geridas](docs/MANAGED_TASKS.md) resolve o projeto autorizado, consulta sua memória e abre um contexto com branch e worktree próprios. Mantém o vínculo com a conversa de origem até a validação, publicação do PR, checks, merge e encerramento. Trabalho concluído, memória salva, PR aberto, merge e implantação são estados separados. A entrada depende de um adapter cooperativo na origem; este pacote não instala um hook global no T3. A preparação e o push do código revisado continuam sob responsabilidade da origem.
 
 ## V1 validada
 
@@ -53,6 +55,8 @@ A ativação permite descoberta e execução autônomas nos projetos cadastrados
 ## Documentação e validação
 
 - [Operação](docs/OPERACAO.md): configuração, comandos, revisão, entrega e recuperação.
+- [Tarefas geridas](docs/MANAGED_TASKS.md): projeto, isolamento, memória, retorno à origem, PR e merge.
+- [Encerramento verificado](docs/ENCERRAMENTO.md): vínculo da entrega, critérios e confirmação de fechamento.
 - [Validação](docs/VALIDACAO_ORACULO.md): evidências necessárias para integrações reais e aceite.
 - [Validação da V1](docs/VALIDACAO_V1.md): resultados, escopos e limitações.
 - [Bateria AT-020](docs/TESTES_AT020.md): testes reproduzíveis de continuidade.

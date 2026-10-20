@@ -64,6 +64,44 @@ class ThreadRead(RemoteModel):
     nextPosition: int | None
 
 
+class SettlementThread(Thread):
+    """Stricter optional state contract; legacy execution reads stay compatible."""
+
+    threadId: str = Field(min_length=1)
+    projectId: str = Field(min_length=1)
+    parentThreadId: str | None
+    settled: bool
+
+
+class SettlementRead(ThreadRead):
+    thread: SettlementThread
+
+
+class SettlementListThread(RemoteModel):
+    threadId: str = Field(min_length=1)
+    parentThreadId: str | None
+    status: str
+
+
+class SettlementListPage(RemoteModel):
+    projectId: str = Field(min_length=1)
+    threads: list[SettlementListThread]
+    nextCursor: int | None = Field(ge=0)
+
+
+def settlement_child_clear(snapshot: SettlementRead) -> bool:
+    """A failed/interrupted child is unresolved, even though its run is terminal."""
+    thread = snapshot.thread
+    if thread.activeRunId is not None or thread.pendingRequestCount != 0:
+        return False
+    if thread.status == "idle" and thread.latestRunId is None:
+        return not snapshot.recentRuns
+    if thread.status != "completed" or not thread.latestRunId:
+        return False
+    latest = [run for run in snapshot.recentRuns if run.runId == thread.latestRunId]
+    return len(latest) == 1 and latest[0].status == "completed"
+
+
 def execution_terminal(snapshot: dict[str, Any], expected_run_id: str) -> bool:
     parsed = ThreadRead.model_validate(snapshot)
     return (

@@ -17,6 +17,7 @@ class ProviderConfig(StrictModel):
     auth_kind: Literal["existing_subscription"] = "existing_subscription"
     billing_verified: bool = False
     models: list[str] = Field(default_factory=list)
+    max_executors: int = Field(default=4, ge=1, le=4, strict=True)
 
 
 class MemoryConfig(StrictModel):

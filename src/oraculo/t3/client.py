@@ -16,8 +16,11 @@ from oraculo.t3.auth import AuthRequired, build_auth, validate_endpoint
 from oraculo.t3.contracts import (
     REQUIRED_TOOLS,
     ContractError,
+    SettlementListPage,
+    SettlementRead,
     ThreadRead,
     join_utf16,
+    settlement_child_clear,
     utf16_length,
 )
 
@@ -41,6 +44,7 @@ READ_TOOLS = frozenset(
         "t3_thread_read",
         "t3_thread_wait",
         "orchestrator_capabilities",
+        "list_thread_pull_requests",
     }
 )
 
@@ -134,7 +138,8 @@ class T3Client:
         if missing:
             raise ContractError(f"T3 tools missing: {', '.join(sorted(missing))}")
 
-    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def validate_call(self, name: str, arguments: dict[str, Any]) -> None:
+        """Check availability and input before reserving an irreversible intent."""
         if name not in self.tools:
             raise ContractError(f"Unavailable T3 tool: {name}")
         tool = self.tools[name]
@@ -144,6 +149,10 @@ class T3Client:
             raise ContractError(
                 f"T3 input schema mismatch: {name}", tool=name, direction="input"
             ) from exc
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.validate_call(name, arguments)
+        tool = self.tools[name]
         try:
             result = _dict(
                 await self.session.call_tool(tool["name"], arguments=arguments)
@@ -301,6 +310,139 @@ class T3Client:
         return result
 
     read = read_thread
+
+    async def list_thread_pull_requests(self, thread_id: str) -> dict[str, Any]:
+        return await self.call("list_thread_pull_requests", {"threadId": thread_id})
+
+    async def link_pull_request(
+        self, thread_id: str, pr: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Do not permit a supplied PR object to override the authorized thread.
+        identity = {
+            key: pr[key] for key in ("host", "repository", "number", "url") if key in pr
+        }
+        if not identity.get("url") and not (
+            identity.get("host")
+            and identity.get("repository")
+            and type(identity.get("number")) is int
+            and identity["number"] > 0
+        ):
+            raise ContractError("Pull request requires URL or host/repository/number")
+        return await self.call("link_pull_request", {**identity, "threadId": thread_id})
+
+    async def settle_thread(self, thread_id: str) -> dict[str, Any]:
+        """Return only the request receipt; confirmation requires a later read."""
+        return await self.call(
+            "t3_thread_organize", {"action": "settle", "threadId": thread_id}
+        )
+
+    def validate_settle(self, thread_id: str) -> None:
+        self.validate_call(
+            "t3_thread_organize", {"action": "settle", "threadId": thread_id}
+        )
+
+    async def _settlement_read(self, thread_id: str) -> SettlementRead:
+        # Minimize timeline text; settlement needs durable state, not prose.
+        payload = await self.call(
+            "t3_thread_read",
+            {
+                "threadId": thread_id,
+                "view": "activity",
+                "limit": 1,
+                "runLimit": 50,
+                "maxCharsPerItem": 1,
+            },
+        )
+        try:
+            snapshot = SettlementRead.model_validate(payload)
+        except ValidationError as exc:
+            raise ContractError("Invalid T3 settlement read") from exc
+        if snapshot.thread.threadId != thread_id:
+            raise ContractError("Settlement read identity mismatch")
+        return snapshot
+
+    async def settlement_snapshot(self, thread_id: str) -> dict[str, Any]:
+        """Read bounded descendant evidence, without watching or polling.
+
+        The public list API is project-scoped. This proves only descendants
+        visible in that project and is not an atomic lock against new work.
+        """
+        root = await self._settlement_read(thread_id)
+        project_id = root.thread.projectId
+        rows: dict[str, Any] = {}
+        cursor = None
+        seen_cursors: set[int] = set()
+        for _ in range(10):
+            payload = await self.call(
+                "t3_thread_list",
+                {
+                    "projectId": project_id,
+                    "includeSubagents": True,
+                    "limit": 100,
+                    **({"cursor": cursor} if cursor is not None else {}),
+                },
+            )
+            try:
+                page = SettlementListPage.model_validate(payload)
+            except ValidationError as exc:
+                raise ContractError("Invalid T3 settlement thread list") from exc
+            if page.projectId != project_id:
+                raise ContractError("Settlement list project mismatch")
+            if len(rows) + len(page.threads) > 1000:
+                raise ContractError("Settlement project thread limit exceeded")
+            for row in page.threads:
+                if row.threadId in rows:
+                    raise ContractError("Duplicate settlement thread identity")
+                rows[row.threadId] = row
+            cursor = page.nextCursor
+            if cursor is None:
+                break
+            if cursor in seen_cursors:
+                raise ContractError("Repeated settlement thread list cursor")
+            seen_cursors.add(cursor)
+        else:
+            raise ContractError("Settlement project page limit exceeded")
+        if thread_id not in rows:
+            raise ContractError("Settlement thread absent from project list")
+        if rows[thread_id].parentThreadId != root.thread.parentThreadId:
+            raise ContractError("Settlement parent changed during read")
+        children: dict[str, list[str]] = {}
+        for row in rows.values():
+            if row.parentThreadId is not None:
+                children.setdefault(row.parentThreadId, []).append(row.threadId)
+        pending = list(children.get(thread_id, []))
+        visited = {thread_id}
+        has_pending = False
+        while pending:
+            child_id = pending.pop()
+            if child_id in visited:
+                raise ContractError("Cyclic settlement parent links")
+            visited.add(child_id)
+            if len(visited) > 101:
+                raise ContractError("Settlement descendant limit exceeded")
+            child = await self._settlement_read(child_id)
+            if child.thread.projectId != project_id:
+                raise ContractError("Settlement descendant project mismatch")
+            if child.thread.parentThreadId != rows[child_id].parentThreadId:
+                raise ContractError("Settlement descendant parent changed during read")
+            has_pending = has_pending or not settlement_child_clear(child)
+            pending.extend(children.get(child_id, []))
+        # Refresh the target after descendant reads so newly active work blocks
+        # the caller's policy, rather than relying on the initial target state.
+        current = await self._settlement_read(thread_id)
+        if (
+            current.thread.projectId != project_id
+            or current.thread.parentThreadId != root.thread.parentThreadId
+        ):
+            raise ContractError("Settlement target scope changed during read")
+        return {
+            "thread": current.thread.model_dump(mode="json"),
+            "recentRuns": [run.model_dump(mode="json") for run in current.recentRuns],
+            "hasPendingChildRuns": has_pending,
+            "childrenObserved": True,
+            "childrenScope": "project",
+            "observedChildCount": len(visited) - 1,
+        }
 
     async def wait(
         self, thread_id: str, run_id: str, *, timeout_ms: int = 30000

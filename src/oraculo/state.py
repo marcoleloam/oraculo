@@ -47,10 +47,16 @@ CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY,kind TEXT NOT NUL
 
 
 class State:
-    def __init__(self, path: str | Path, max_executors: int = 1) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        max_executors: int = 1,
+        provider_limits: dict[str, int] | None = None,
+    ) -> None:
         if type(max_executors) is not int or not 1 <= max_executors <= 4:
             raise StateError("max_executors must be an integer between 1 and 4")
         self.max_executors = max_executors
+        self.provider_limits = provider_limits or {}
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.connection = sqlite3.connect(self.path, isolation_level=None, timeout=5)
@@ -284,12 +290,19 @@ class State:
                 raise StateError("write_paths must contain canonical relative paths")
         return paths
 
-    def _scope_conflicts(self, job: dict[str, Any], project_id: str) -> bool:
-        active = self.connection.execute(
-            "SELECT j.*,o.project_id FROM executor_lease l "
-            "JOIN attempts a ON a.id=l.attempt_id JOIN jobs j ON j.id=a.job_id "
-            "JOIN objectives o ON o.id=j.objective_id"
-        ).fetchall()
+    def _scope_conflicts(
+        self,
+        job: dict[str, Any],
+        project_id: str,
+        *,
+        active: list | None = None,
+    ) -> bool:
+        if active is None:
+            active = self.connection.execute(
+                "SELECT j.*,o.project_id FROM executor_lease l "
+                "JOIN attempts a ON a.id=l.attempt_id JOIN jobs j ON j.id=a.job_id "
+                "JOIN objectives o ON o.id=j.objective_id"
+            ).fetchall()
         try:
             paths = self._write_paths(json.loads(job["payload"]))
         except (StateError, ValueError, TypeError, AttributeError):
@@ -354,6 +367,122 @@ class State:
     def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
         return self._one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
 
+    def capacity(self) -> dict[str, Any]:
+        requested = self.get_meta("executor_capacity")
+        effective = min(
+            self.max_executors,
+            requested if requested is not None else self.max_executors,
+        )
+        occupied = len(self.leases())
+        return {
+            "configured_ceiling": self.max_executors,
+            "requested": requested,
+            "effective": effective,
+            "occupied": occupied,
+            "available": max(0, effective - occupied),
+            "draining": occupied > effective,
+            "source": "persisted" if requested is not None else "configuration",
+        }
+
+    def set_capacity(self, maximum: int) -> dict[str, Any]:
+        if type(maximum) is not int or not 1 <= maximum <= self.max_executors:
+            raise StateError("capacity_outside_configured_ceiling")
+        with self.transaction():
+            self.set_meta("executor_capacity", maximum)
+            self.audit("capacity.set", {"max_executors": maximum})
+            return self.capacity()
+
+    def plan_capacity(self, objective_id: str) -> dict[str, Any]:
+        requested = self.get_meta(f"plan_parallel:{objective_id}")
+        effective = min(
+            self.capacity()["effective"],
+            requested if requested is not None else self.max_executors,
+        )
+        occupied = self.connection.execute(
+            "SELECT count(*) FROM executor_lease l JOIN attempts a ON a.id=l.attempt_id "
+            "JOIN jobs j ON j.id=a.job_id WHERE j.objective_id=?",
+            (objective_id,),
+        ).fetchone()[0]
+        return {
+            "requested": requested,
+            "effective": effective,
+            "occupied": occupied,
+            "available": min(
+                self.capacity()["available"], max(0, effective - occupied)
+            ),
+            "limited": requested is not None and requested > effective,
+            "draining": occupied > effective,
+        }
+
+    def provider_capacity(self, provider: str) -> dict[str, int]:
+        maximum = self.provider_limits.get(provider, self.max_executors)
+        occupied = self.connection.execute(
+            "SELECT count(*) FROM executor_lease l JOIN attempts a ON a.id=l.attempt_id "
+            "WHERE a.provider=?",
+            (provider,),
+        ).fetchone()[0]
+        return {
+            "limit": maximum,
+            "occupied": occupied,
+            "available": max(0, maximum - occupied),
+        }
+
+    def admission_blockers(self, job: dict, provider: str | None = None) -> list[dict]:
+        """The same durable gates are used by status, dispatch and atomic admission."""
+        objective = self.get_objective(job["objective_id"])
+        blockers = []
+
+        def block(reason: str, action: str, **details: Any) -> None:
+            blockers.append({"reason": reason, "action": action, **details})
+
+        if objective["status"] in {"cancel_requested", "stopped"}:
+            block("objective_stopped", "Reconcile cancellation; do not dispatch")
+        if job["state"] not in {"queued", "quota_wait", "auth_required"}:
+            block(
+                "job_not_queued", "Reconcile the original attempt", state=job["state"]
+            )
+        missing = [
+            r[0]
+            for r in self.connection.execute(
+                "SELECT d.depends_on FROM dependencies d JOIN jobs j ON j.id=d.depends_on "
+                "WHERE d.job_id=? AND j.state!='succeeded'",
+                (job["id"],),
+            )
+        ]
+        if missing:
+            block(
+                "dependencies_pending",
+                "Reconcile successful dependency criteria",
+                job_ids=missing,
+            )
+        if job["next_attempt_at"] > time.time():
+            block(
+                "retry_backoff", "Wait for retry time", retry_at=job["next_attempt_at"]
+            )
+        if self._scope_conflicts(job, objective["project_id"]):
+            block(
+                "scope_conflict",
+                "Wait for conflicting writers and effects to reconcile",
+            )
+        if not self.capacity()["available"]:
+            block(
+                "service_capacity",
+                "Wait for a slot or set capacity within the configured ceiling",
+            )
+        plan = self.plan_capacity(job["objective_id"])
+        if plan["occupied"] >= plan["effective"]:
+            block(
+                "plan_capacity",
+                "Wait for this plan's active attempts or configure max_parallel",
+            )
+        if provider and not self.provider_capacity(provider)["available"]:
+            block(
+                "provider_capacity",
+                "Wait for authorized provider capacity",
+                provider=provider,
+            )
+        return blockers
+
     def acquire_grant(
         self,
         job_id: str,
@@ -364,27 +493,15 @@ class State:
     ) -> dict[str, Any] | None:
         with self.transaction():
             leases = self.leases()
-            if len(leases) >= self.max_executors:
-                return None
             job = self.get_job(job_id)
-            if (
-                not job
-                or job["state"] not in {"queued", "quota_wait", "auth_required"}
-                or job["next_attempt_at"] > time.time()
-            ):
+            if not job or self.admission_blockers(job, provider):
                 return None
             objective = self.get_objective(job["objective_id"])
-            if objective["status"] in {"cancel_requested", "stopped"}:
-                return None
-            pending = self._one(
-                "SELECT d.job_id FROM dependencies d JOIN jobs j ON d.depends_on=j.id WHERE d.job_id=? AND j.state!='succeeded' LIMIT 1",
-                (job_id,),
-            )
-            if pending or self._scope_conflicts(job, objective["project_id"]):
-                return None
             occupied = {lease["slot"] for lease in leases}
             slot = next(
-                i for i in range(1, self.max_executors + 1) if i not in occupied
+                i
+                for i in range(1, self.capacity()["effective"] + 1)
+                if i not in occupied
             )
             generation = self.get_meta("grant_generation", 0) + 1
             self.set_meta("grant_generation", generation)

@@ -86,6 +86,7 @@ class PlanSpec(StrictModel):
     text: str = Field(min_length=1, max_length=16000)
     tasks: list[TaskSpec] = Field(min_length=1, max_length=32)
     max_followups: int = Field(default=4, ge=0, le=4)
+    max_parallel: int | None = Field(default=None, ge=1, le=4, strict=True)
 
     @model_validator(mode="after")
     def dag(self) -> PlanSpec:
@@ -132,6 +133,9 @@ class Plans:
         if any(t.kind not in profiles for t in spec.tasks):
             raise StateError("unknown_job_kind")
         data = spec.model_dump(mode="json")
+        if spec.max_parallel is None:
+            # Preserve ORA-CONT-003 submission hashes for replays after upgrade.
+            data.pop("max_parallel")
         digest = content_hash(data)
         with self.state.transaction():
             objective = self.state.submit_objective(
@@ -150,7 +154,27 @@ class Plans:
                 "INSERT INTO objective_plans VALUES(?,?,?,?,0)",
                 (objective["id"], canonical_json(data), digest, canonical_json(jobs)),
             )
+            if spec.max_parallel is not None:
+                self.state.set_meta(
+                    f"plan_parallel:{objective['id']}", spec.max_parallel
+                )
             return self.describe(objective["id"])
+
+    def configure(self, objective_id: str, maximum: int) -> dict:
+        if type(maximum) is not int or not 1 <= maximum <= 4:
+            raise StateError("max_parallel_must_be_between_1_and_4")
+        with self.state.transaction():
+            if not self.get(objective_id):
+                raise StateError("planned_objective_required")
+            self.state.set_meta(f"plan_parallel:{objective_id}", maximum)
+            self.state.audit(
+                "plan.configure",
+                {
+                    "objective_id": objective_id,
+                    "max_parallel": maximum,
+                },
+            )
+            return self.describe(objective_id)
 
     def _enqueue(
         self, tasks: list[TaskSpec], objective_id: str, jobs: dict[str, str]
@@ -474,4 +498,5 @@ class Plans:
             else "Resolve blockers or cancel",
             "followups": plan["followups"],
             "max_followups": plan["spec"]["max_followups"],
+            "concurrency": self.state.plan_capacity(objective_id),
         }

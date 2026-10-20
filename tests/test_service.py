@@ -96,7 +96,7 @@ async def test_billing_options_follow_selected_model_catalog(running_service):
     }
 
 
-async def test_submit_dispatch_execute_reconcile_queues_memory(running_service):
+async def test_submit_dispatch_execute_reconcile_publishes_cycle(running_service):
     service = running_service
     submitted = await command(
         service,
@@ -172,10 +172,17 @@ async def test_submit_dispatch_execute_reconcile_queues_memory(running_service):
     service.after_execution()
     service.after_execution()
     memory = [j for j in service.state.list_jobs() if j["kind"] == "memory"]
-    assert len(memory) == 1
-    evidence = json.loads(memory[0]["payload"])
-    assert evidence["provenance"]["run_id"] == "run"
-    assert evidence["execution_evidence"]["evidence"]["checks"] == "passed"
+    assert memory == []  # New admissions do not require another model/executor.
+    cycles = service.memory_cycles.for_objective(submitted["data"]["objective"])
+    assert len(cycles) == 1
+    assert cycles[0]["identity"]["run_id"] == "run"
+    assert cycles[0]["report"]["evidence"]["checks"] == "passed"
+    assert cycles[0]["write_state"] == "pending"
+    await service.memory_io("publish_pending")
+    assert (
+        service.memory_cycles.get(cycles[0]["id"])["write_receipt"]["state"]
+        == "confirmed"
+    )
 
 
 async def test_request_dedupe_and_reused_id_rejection(running_service):

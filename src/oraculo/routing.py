@@ -25,6 +25,7 @@ class Router:
         self.state = state
         self.blocked: dict[str, float] = {}
         self.last_reason = "unconfigured"
+        self.last_blockers: list[dict] = []
 
     def mark_quota(self, provider: str, now: float | None = None) -> None:
         until = (
@@ -42,6 +43,8 @@ class Router:
         kind: str,
         catalog: dict[str, Any] | list[dict[str, Any]],
         now: float | None = None,
+        *,
+        reserved: dict[str, int] | None = None,
     ) -> Target | None:
         timestamp = time.time() if now is None else now
         entries = catalog.get("providers", []) if isinstance(catalog, dict) else catalog
@@ -53,11 +56,18 @@ class Router:
             entry.get("providerInstanceId", entry.get("id")): entry for entry in entries
         }
         self.last_reason = "unavailable"
+        self.last_blockers = []
         for name in self.config.profiles.get(
             kind, self.config.profiles["implementation"]
         ):
             config = self.config.providers.get(name)
             if not config or not config.billing_verified or not config.models:
+                self.last_blockers.append(
+                    {
+                        "provider": name,
+                        "reason": "subscription_or_models_not_authorized",
+                    }
+                )
                 continue
             provider = live.get(config.instance_id)
             if (
@@ -69,6 +79,15 @@ class Router:
                 or provider.get("status")
                 in {"unavailable", "auth_required", "disabled"}
             ):
+                self.last_blockers.append(
+                    {
+                        "provider": config.instance_id,
+                        "reason": "catalog_unavailable_or_constrained",
+                        "constraints": provider.get("constraints", [])
+                        if provider
+                        else [],
+                    }
+                )
                 continue
             blocked = self.blocked.get(config.instance_id, 0)
             if self.state:
@@ -79,6 +98,21 @@ class Router:
                 blocked = max(blocked, row["blocked_until"] if row else 0)
             if blocked > timestamp:
                 self.last_reason = "quota_wait"
+                self.last_blockers.append(
+                    {
+                        "provider": config.instance_id,
+                        "reason": "quota_wait",
+                        "retry_at": blocked,
+                    }
+                )
+                continue
+            if self.state and self.state.provider_capacity(config.instance_id)[
+                "available"
+            ] <= (reserved or {}).get(config.instance_id, 0):
+                self.last_reason = "provider_capacity"
+                self.last_blockers.append(
+                    {"provider": config.instance_id, "reason": "provider_capacity"}
+                )
                 continue
             models = provider.get("models", [])
             eligible = {
@@ -94,4 +128,10 @@ class Router:
                 if model in eligible:
                     self.last_reason = "ready"
                     return Target(config.instance_id, model, kind)
+            self.last_blockers.append(
+                {
+                    "provider": config.instance_id,
+                    "reason": "authorized_model_unavailable",
+                }
+            )
         return None

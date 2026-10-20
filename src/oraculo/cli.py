@@ -131,6 +131,35 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="oraculo")
     root.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     commands = root.add_subparsers(dest="command", required=True)
+    task = commands.add_parser("task")
+    task.add_argument(
+        "action",
+        choices=[
+            "start",
+            "resume",
+            "status",
+            "list",
+            "continue",
+            "progress",
+            "finish",
+            "publish",
+            "pr-check",
+            "merge",
+            "settle",
+            "unwatch",
+        ],
+    )
+    task.add_argument("--file", type=Path, help="JSON payload; stdin when omitted")
+    task.add_argument(
+        "--stdio-host",
+        action="store_true",
+        help="Bridge native T3 calls through interactive JSON request/ack",
+    )
+    task.add_argument(
+        "--transport-command",
+        type=Path,
+        help="JSON argv for an explicit caller-bound host bridge",
+    )
     commands.add_parser("serve")
     commands.add_parser("doctor")
     commands.add_parser("init")
@@ -138,6 +167,8 @@ def parser() -> argparse.ArgumentParser:
     auth.add_argument("action", choices=["login"])
     status = commands.add_parser("status")
     status.add_argument("--project", default="*")
+    capacity = commands.add_parser("capacity")
+    capacity.add_argument("--set", dest="max_executors", type=int, choices=range(1, 5))
     submit = commands.add_parser("submit")
     submit.add_argument("project")
     submit.add_argument("text")
@@ -146,6 +177,12 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("project")
     plan.add_argument("--file", type=Path, required=True)
     plan.add_argument("--key", required=True)
+    configure = commands.add_parser("plan-configure")
+    configure.add_argument("project")
+    configure.add_argument("objective_id")
+    configure.add_argument(
+        "--max-parallel", type=int, choices=range(1, 5), required=True
+    )
     retry = commands.add_parser("retry")
     retry.add_argument("project")
     retry.add_argument("objective_id")
@@ -155,10 +192,32 @@ def parser() -> argparse.ArgumentParser:
     cancel.add_argument("objective_id")
     raw = commands.add_parser("request")
     raw.add_argument("--file", type=Path)
+    settlement = commands.add_parser("settlement")
+    settlement.add_argument("action", choices=["bind", "status"])
+    settlement.add_argument("project")
+    settlement.add_argument("--file", type=Path)
+    settlement.add_argument("--binding-id")
     review = commands.add_parser("review")
     review.add_argument("action", choices=["open", "close"])
     review.add_argument("project")
     review.add_argument("--session")
+    cycle = commands.add_parser("memory-cycle")
+    cycle.add_argument("action", choices=["begin", "read", "finish", "status", "retry"])
+    cycle.add_argument("project")
+    cycle.add_argument("--thread-id", required=True)
+    cycle.add_argument("--run-id", required=True)
+    cycle.add_argument("--key")
+    cycle.add_argument("--query", default="")
+    cycle.add_argument("--cycle-id")
+    cycle.add_argument("--status", choices=["succeeded", "failed", "stopped"])
+    cycle.add_argument("--file", type=Path)
+    cycle.add_argument("--offset", type=int, default=0)
+    cycle.add_argument("--artifact")
+    cycle.add_argument("--phase", choices=["read", "write"], default="write")
+    repair = commands.add_parser("memory-retry")
+    repair.add_argument("project")
+    repair.add_argument("--cycle-id", required=True)
+    repair.add_argument("--file", type=Path)
     memory = commands.add_parser("memory")
     memory.add_argument(
         "action", choices=["ingest", "query", "lint", "propose", "promote", "read"]
@@ -239,6 +298,73 @@ def main(argv: list[str] | None = None) -> int:
             }
         else:
             config = Config.load(args.config)
+            if args.command == "task":
+                from oraculo.managed_tasks import ManagedTasks
+                from oraculo.pr_lifecycle import GitHubPRLifecycle
+                from oraculo.publication import GitHubPublisher
+                from oraculo.task_store import TaskStore
+                from oraculo.task_transport import (
+                    CommandTransport,
+                    SocketMemory,
+                    StdioHostTransport,
+                )
+
+                if args.stdio_host and (not args.file or args.transport_command):
+                    raise ValueError(
+                        "--stdio-host requires --file and excludes --transport-command"
+                    )
+                payload = (
+                    {}
+                    if args.action == "list"
+                    else json.loads(
+                        args.file.read_text() if args.file else sys.stdin.read()
+                    )
+                )
+                command = (
+                    json.loads(args.transport_command.read_text())
+                    if args.transport_command
+                    else None
+                )
+                store = TaskStore(config.state_dir / "managed-tasks.sqlite3")
+                try:
+                    if args.action in {"list", "status"}:
+                        result = (
+                            {
+                                "tasks": [
+                                    store.describe(row[0])
+                                    for row in store.db.execute(
+                                        "SELECT id FROM managed_tasks ORDER BY rowid DESC"
+                                    )
+                                ],
+                                "source": "local_ledger",
+                            }
+                            if args.action == "list"
+                            else {
+                                **store.describe(payload["task_id"]),
+                                "source": "local_ledger",
+                            }
+                        )
+                        print(json.dumps(result, ensure_ascii=False, indent=2))
+                        return 0
+                    transport = (
+                        StdioHostTransport()
+                        if args.stdio_host
+                        else CommandTransport(command)
+                    )
+                    adapter = ManagedTasks(
+                        config,
+                        store,
+                        transport,
+                        SocketMemory(config),
+                        GitHubPublisher(),
+                        GitHubPRLifecycle(),
+                    )
+                    adapter.config_path = args.config.resolve()
+                    result = asyncio.run(adapter.command(args.action, payload))
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    return 1 if result.get("phase") == "blocked" else 0
+                finally:
+                    store.close()
             if args.command == "serve":
                 from oraculo.service import serve
 
@@ -259,6 +385,68 @@ def main(argv: list[str] | None = None) -> int:
                     envelope = json.loads(raw)
                 elif args.command == "status":
                     envelope = make_envelope("status.get", args.project, {})
+                elif args.command == "capacity":
+                    envelope = make_envelope(
+                        "capacity.get"
+                        if args.max_executors is None
+                        else "capacity.set",
+                        "*",
+                        (
+                            {}
+                            if args.max_executors is None
+                            else {"max_executors": args.max_executors}
+                        ),
+                    )
+                elif args.command == "settlement":
+                    if args.action == "bind":
+                        if not args.file:
+                            raise ValueError("settlement bind exige --file")
+                        payload = json.loads(args.file.read_text())
+                    else:
+                        payload = (
+                            {"binding_id": args.binding_id} if args.binding_id else {}
+                        )
+                    envelope = make_envelope(
+                        f"settlement.{args.action}", args.project, payload
+                    )
+                elif args.command == "memory-cycle":
+                    if args.action == "begin":
+                        if not args.key:
+                            raise ValueError("memory-cycle begin exige --key")
+                        payload = {"key": args.key, "query": args.query}
+                    else:
+                        if not args.cycle_id:
+                            raise ValueError("memory-cycle exige --cycle-id")
+                        payload = {"cycle_id": args.cycle_id}
+                        if args.action == "read":
+                            payload["offset"] = args.offset
+                            if args.artifact:
+                                payload["artifact"] = args.artifact
+                        elif args.action == "finish":
+                            if not args.file or not args.status:
+                                raise ValueError(
+                                    "memory-cycle finish exige --status e --file"
+                                )
+                            payload.update(
+                                status=args.status,
+                                evidence=json.loads(args.file.read_text()),
+                            )
+                        elif args.action == "retry":
+                            payload["phase"] = args.phase
+                    envelope = make_envelope(
+                        f"memory.cycle.{args.action}", args.project, payload
+                    )
+                    envelope["origin"] = {
+                        "thread_id": args.thread_id,
+                        "run_id": args.run_id,
+                    }
+                elif args.command == "memory-retry":
+                    payload = {"cycle_id": args.cycle_id}
+                    if args.file:
+                        payload["evidence"] = json.loads(args.file.read_text())
+                    envelope = make_envelope(
+                        "memory.cycle.repair", args.project, payload
+                    )
                 elif args.command == "submit":
                     envelope = make_envelope(
                         "objective.submit",
@@ -279,6 +467,15 @@ def main(argv: list[str] | None = None) -> int:
                         "task.retry",
                         args.project,
                         {"objective_id": args.objective_id, "task_id": args.task_id},
+                    )
+                elif args.command == "plan-configure":
+                    envelope = make_envelope(
+                        "plan.configure",
+                        args.project,
+                        {
+                            "objective_id": args.objective_id,
+                            "max_parallel": args.max_parallel,
+                        },
                     )
                 elif args.command == "cancel":
                     envelope = make_envelope(
