@@ -37,9 +37,9 @@ def test_no_spend_or_embedded_credentials():
 
 def test_explicit_scope_excludes_siblings_and_nested_projects(tmp_path):
     root = tmp_path / "work"
-    project = root / "projeto-a"
+    project = root / "example-project"
     project.mkdir(parents=True)
-    alias = root / "projeto-alias"
+    alias = root / "example-alias"
     alias.symlink_to(project, target_is_directory=True)
     config = Config(
         projects_root=root,

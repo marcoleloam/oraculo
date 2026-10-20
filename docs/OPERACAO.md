@@ -289,3 +289,23 @@ Use fontes por referência e recibos concisos. Um despacho novo que excede o
 limite T3 fica `blocked` com `task_dispatch_too_large`, sem envio/grant; cancele e
 reformule o plano. Uma outbox antiga incerta conserva os bytes/ID originais e exige
 reconciliação. Memória preserva o transporte integral por artefato da ORA-CONT-002.
+
+## Ciclo completo ligado à conversa de origem
+
+O fluxo `oraculo task` resolve o projeto, prepara memória e isolamento e mantém
+o vínculo com a origem até PR, checks, merge e encerramento. Consulte
+[tarefas geridas](MANAGED_TASKS.md) para o contrato de entrada, o bridge T3,
+comandos, política de publicação e limites de cobertura. O adapter é cooperativo;
+instalar o pacote não intercepta automaticamente todas as conversas do host.
+
+Jobs geridos recebem consulta versionada antes da admissão e gravação terminal
+com recibo canônico. O estado da memória é separado do resultado da execução;
+falha de gravação não deve ser apresentada como entrega encerrada. Conversas
+diretas usam o contrato de `memory-cycle`, também por adoção explícita do adapter.
+
+`oraculo capacity` mostra a capacidade efetiva. Alterações operacionais e limites
+por plano não ultrapassam `max_executors`; reduzir a capacidade preserva trabalhos
+já admitidos. Escritas conflitantes continuam serializadas.
+
+O [encerramento verificado](ENCERRAMENTO.md) distingue PR aberto, merge observado,
+memória confirmada e conversa fechada. Merge não comprova implantação.

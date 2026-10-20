@@ -20,7 +20,7 @@ class Scheduler:
         catalog: dict[str, Any] | list[dict[str, Any]],
         project_id: str | None = None,
     ) -> dict[str, Any] | None:
-        if len(self.state.leases()) >= self.state.max_executors:
+        if not self.state.capacity()["available"]:
             return None
         rows = self.state.connection.execute(
             "SELECT j.*,o.priority,o.origin,o.project_id FROM jobs j JOIN objectives o ON j.objective_id=o.id WHERE j.state IN ('queued','quota_wait','auth_required') AND o.status NOT IN ('cancel_requested','stopped') AND j.next_attempt_at<=? ORDER BY (o.priority + CASE WHEN j.kind='memory' THEN CAST((?-j.created_at)/3600 AS INTEGER) ELSE 0 END) DESC,j.created_at",
