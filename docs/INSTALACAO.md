@@ -38,6 +38,19 @@ Edite `~/.config/oraculo/config.toml`:
 
 O Oráculo considera projetos cadastrados no T3 dentro de `projects_root`. Ao ativá-lo, a descoberta configurada pode iniciar objetivos autonomamente nesses projetos; selecione essa raiz de acordo com os projetos que deseja autorizar.
 
+Para autorizar somente projetos específicos, configure `allowed_projects` no início
+do TOML, antes dos blocos `[providers.*]`. A lista contém os caminhos reais exatos
+dos projetos dentro de `projects_root`; não inclui automaticamente projetos aninhados.
+Lista vazia autoriza nenhum projeto; omitir o campo mantém o comportamento por raiz.
+
+```toml
+projects_root = "~/projects/work"
+allowed_projects = ["~/projects/work/projeto-a"]
+```
+
+Para executar apenas objetivos enviados pelo usuário, defina `discovery = []` no
+bloco `[profiles]`, preservando os demais perfis configurados.
+
 ## 3. Autenticar e iniciar
 
 ```bash
@@ -70,3 +83,24 @@ Pare o serviço antes de reinstalar, alterar o ambiente Python ou refazer o logi
 A desinstalação descarrega e remove o LaunchAgent. Configuração, vault, estado, credenciais, ambiente Python e logs são preservados.
 
 Comandos de objetivos, revisão de memória e diagnóstico: [Operação](OPERACAO.md).
+
+## Atualização ORA-CONT-003 e rollback
+
+O serviço permanente usa o checkout configurado no LaunchAgent da sua instalação.
+Não reinstale a partir de worktree temporário nem inicie um segundo daemon.
+Valide testes/revisão e confira `status`: nenhum executor ativo ou incerto e
+nenhum job pronto para iniciar durante a transferência. Pare o LaunchAgent,
+confirme a parada, preserve backup dos arquivos transferidos, configuração e
+SQLite (incluindo estado consistente via backup SQLite), e só então transfira o
+delta revisado para o checkout permanente. Verifique hashes de origem/base antes
+de sobrescrever: divergência exige nova integração.
+
+A migração de `executor_lease` para slots preserva grants e geração; padrão 1
+continua compatível. Para rollback de versão, use juntos código e backup do
+SQLite capturados sem atividade. Não restaure banco antigo depois de novos
+efeitos: reconcilie primeiro, pois apagar recibos pode duplicar operações.
+
+Após iniciar o único LaunchAgent, confira health, executors, max_executors,
+planos, processos e caminho executado. Instalar código não demonstra sucesso
+operacional de objetivos. Os resultados desta evolução estão em
+[tarefa ORA-CONT-003](VALIDACAO_CONTINUIDADE.md).

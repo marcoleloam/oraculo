@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from oraculo.protocol import canonical_json, content_hash
@@ -32,7 +34,7 @@ CREATE TABLE IF NOT EXISTS objectives(id TEXT PRIMARY KEY,project_id TEXT NOT NU
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,objective_id TEXT NOT NULL REFERENCES objectives(id),kind TEXT NOT NULL,payload TEXT NOT NULL,payload_hash TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'queued',next_attempt_at REAL NOT NULL DEFAULT 0,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS dependencies(job_id TEXT REFERENCES jobs(id),depends_on TEXT REFERENCES jobs(id),PRIMARY KEY(job_id,depends_on));
 CREATE TABLE IF NOT EXISTS attempts(id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES jobs(id),number INTEGER NOT NULL,generation INTEGER NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,owner_thread_id TEXT NOT NULL,owner_run_id TEXT NOT NULL,thread_id TEXT,run_id TEXT,task_id TEXT,status TEXT NOT NULL,raw_status TEXT,created_at REAL NOT NULL,UNIQUE(job_id,number));
-CREATE TABLE IF NOT EXISTS executor_lease(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation INTEGER NOT NULL,attempt_id TEXT NOT NULL REFERENCES attempts(id),state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS executor_lease(slot INTEGER PRIMARY KEY CHECK(slot>=1),generation INTEGER NOT NULL,attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),state TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,attempt_id TEXT REFERENCES attempts(id),kind TEXT NOT NULL,idempotency_key TEXT,expected_state TEXT NOT NULL,observed_state TEXT,state TEXT NOT NULL,payload_hash TEXT NOT NULL,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS inbox(id TEXT PRIMARY KEY,origin_key TEXT UNIQUE,payload_hash TEXT NOT NULL,payload TEXT NOT NULL,response TEXT);
 CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,objective_id TEXT REFERENCES objectives(id),payload_hash TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending');
@@ -45,7 +47,10 @@ CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY,kind TEXT NOT NUL
 
 
 class State:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, max_executors: int = 1) -> None:
+        if type(max_executors) is not int or not 1 <= max_executors <= 4:
+            raise StateError("max_executors must be an integer between 1 and 4")
+        self.max_executors = max_executors
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.connection = sqlite3.connect(self.path, isolation_level=None, timeout=5)
@@ -55,6 +60,27 @@ class State:
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
         self.connection.executescript(SCHEMA)
+        # Rebuild the old singleton table atomically without losing a live grant.
+        with self.transaction():
+            columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(executor_lease)")
+            }
+            if "singleton" in columns:
+                self.connection.execute(
+                    "ALTER TABLE executor_lease RENAME TO executor_lease_v1"
+                )
+                self.connection.execute(
+                    "CREATE TABLE executor_lease(slot INTEGER PRIMARY KEY CHECK(slot>=1),"
+                    "generation INTEGER NOT NULL,attempt_id TEXT NOT NULL UNIQUE "
+                    "REFERENCES attempts(id),state TEXT NOT NULL)"
+                )
+                self.connection.execute(
+                    "INSERT INTO executor_lease SELECT singleton,generation,attempt_id,state "
+                    "FROM executor_lease_v1"
+                )
+                self.connection.execute("DROP TABLE executor_lease_v1")
+            self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(2)")
         self.path.chmod(0o600)
 
     def close(self) -> None:
@@ -170,6 +196,7 @@ class State:
         payload: dict[str, Any],
         dependencies: Sequence[str] = (),
     ) -> dict[str, Any]:
+        self._write_paths(payload)
         with self.transaction():
             objective = self.get_objective(objective_id)
             if not objective or objective["status"] in {"cancel_requested", "stopped"}:
@@ -214,8 +241,115 @@ class State:
             )
         ]
 
-    def lease(self) -> dict[str, Any] | None:
-        return self._one("SELECT * FROM executor_lease WHERE singleton=1")
+    def leases(self) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM executor_lease ORDER BY slot"
+            )
+        ]
+
+    def lease(self, attempt_id: str | None = None) -> dict[str, Any] | None:
+        if attempt_id is None:
+            return self._one("SELECT * FROM executor_lease ORDER BY slot LIMIT 1")
+        return self._one(
+            "SELECT * FROM executor_lease WHERE attempt_id=?", (attempt_id,)
+        )
+
+    @staticmethod
+    def _write_paths(payload: dict[str, Any]) -> list[str]:
+        """Accept only canonical project-relative paths; legacy jobs lock all."""
+        spec = payload.get("task_spec")
+        if spec is None:
+            return ["*"]
+        if not isinstance(spec, dict):
+            raise StateError("task_spec must be an object")
+        paths = spec.get("write_paths", ["*"])
+        if not isinstance(paths, list):
+            raise StateError("write_paths must be a list")
+        for path in paths:
+            if not isinstance(path, str) or not path or "\\" in path:
+                raise StateError("write_paths must contain canonical relative paths")
+            if path == "*":
+                continue
+            parsed = PurePosixPath(path)
+            if (
+                parsed.is_absolute()
+                or str(parsed) != path
+                or path == "."
+                or ".." in parsed.parts
+                or any(c in path for c in "*?[]\x00")
+                or ":" in path
+            ):
+                raise StateError("write_paths must contain canonical relative paths")
+        return paths
+
+    def _scope_conflicts(self, job: dict[str, Any], project_id: str) -> bool:
+        active = self.connection.execute(
+            "SELECT j.*,o.project_id FROM executor_lease l "
+            "JOIN attempts a ON a.id=l.attempt_id JOIN jobs j ON j.id=a.job_id "
+            "JOIN objectives o ON o.id=j.objective_id"
+        ).fetchall()
+        try:
+            paths = self._write_paths(json.loads(job["payload"]))
+        except (StateError, ValueError, TypeError, AttributeError):
+            # An old or externally written malformed payload cannot narrow a lock.
+            paths = ["*"]
+
+        def locations(
+            paths: list[str], project: str
+        ) -> tuple[set[PurePosixPath], set[tuple[int, int]]]:
+            root = Path(self.get_project(project)["path"]).absolute()
+            result: set[PurePosixPath] = set()
+            identities: set[tuple[int, int]] = set()
+            for path in paths:
+                location = root if path == "*" else root / path
+                # Retain both the directory entry and its physical target. Two
+                # registered project IDs may address the same checkout, and a
+                # symlink must not bypass writer exclusion.
+                for candidate in (location, location.resolve()):
+                    # APFS may ignore case and Unicode normalization, including
+                    # paths which do not exist yet. Use the same conservative
+                    # key on all hosts instead of inferring volume behavior.
+                    result.add(
+                        PurePosixPath(
+                            unicodedata.normalize("NFD", str(candidate)).casefold()
+                        )
+                    )
+                try:
+                    info = location.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    # resolve() does not detect two names for the same inode.
+                    identities.add((info.st_dev, info.st_ino))
+            return result, identities
+
+        try:
+            targets, identities = locations(paths, project_id)
+        except (OSError, RuntimeError):
+            return bool(active)
+        for other in active:
+            # Memory can mutate the shared vault/root regardless of task scopes.
+            if job["kind"] == "memory" or other["kind"] == "memory":
+                return True
+            try:
+                other_paths = self._write_paths(json.loads(other["payload"]))
+            except (StateError, ValueError, TypeError, AttributeError):
+                other_paths = ["*"]
+            try:
+                other_targets, other_identities = locations(
+                    other_paths, other["project_id"]
+                )
+            except (OSError, RuntimeError):
+                return True
+            if identities & other_identities or any(
+                a == b or a in b.parents or b in a.parents
+                for a in targets
+                for b in other_targets
+            ):
+                return True
+        return False
 
     def get_attempt(self, attempt_id: str) -> dict[str, Any] | None:
         return self._one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
@@ -229,7 +363,8 @@ class State:
         owner_run_id: str,
     ) -> dict[str, Any] | None:
         with self.transaction():
-            if self.lease():
+            leases = self.leases()
+            if len(leases) >= self.max_executors:
                 return None
             job = self.get_job(job_id)
             if (
@@ -245,8 +380,12 @@ class State:
                 "SELECT d.job_id FROM dependencies d JOIN jobs j ON d.depends_on=j.id WHERE d.job_id=? AND j.state!='succeeded' LIMIT 1",
                 (job_id,),
             )
-            if pending:
+            if pending or self._scope_conflicts(job, objective["project_id"]):
                 return None
+            occupied = {lease["slot"] for lease in leases}
+            slot = next(
+                i for i in range(1, self.max_executors + 1) if i not in occupied
+            )
             generation = self.get_meta("grant_generation", 0) + 1
             self.set_meta("grant_generation", generation)
             attempt_id = uuid.uuid4().hex
@@ -269,8 +408,8 @@ class State:
                 ),
             )
             self.connection.execute(
-                "INSERT INTO executor_lease VALUES(1,?,?,?)",
-                (generation, attempt_id, "reserved"),
+                "INSERT INTO executor_lease VALUES(?,?,?,?)",
+                (slot, generation, attempt_id, "reserved"),
             )
             self.connection.execute(
                 "UPDATE jobs SET state='admitted' WHERE id=?", (job_id,)
@@ -281,13 +420,14 @@ class State:
             return self.get_attempt(attempt_id)
 
     def validate_grant(self, attempt_id: str, generation: int) -> dict[str, Any]:
-        lease = self.lease()
+        lease = self.lease(attempt_id)
         attempt = self.get_attempt(attempt_id)
         if (
             not lease
             or lease["attempt_id"] != attempt_id
             or lease["generation"] != generation
             or not attempt
+            or attempt["generation"] != generation
         ):
             raise StaleGrant("grant is stale or unavailable")
         job = self.get_job(attempt["job_id"])
@@ -295,6 +435,35 @@ class State:
         if objective["status"] in {"cancel_requested", "stopped"}:
             raise StaleGrant("objective cancellation invalidated grant")
         return attempt
+
+    @staticmethod
+    def _validate_execution_identity(
+        thread_id: str,
+        run_id: str,
+        task_id: str | None = None,
+    ) -> None:
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id.strip()
+            or not isinstance(run_id, str)
+            or not run_id.strip()
+            or (
+                task_id is not None
+                and (not isinstance(task_id, str) or not task_id.strip())
+            )
+        ):
+            raise StateError("execution identities required")
+
+    def _check_execution_binding(
+        self, attempt_id: str, thread_id: str, run_id: str, task_id: str | None
+    ) -> None:
+        if self._one(
+            "SELECT a.id FROM attempts a JOIN executor_lease l ON l.attempt_id=a.id "
+            "WHERE a.id!=? AND ((a.thread_id=? AND a.run_id=?) "
+            "OR (? IS NOT NULL AND a.task_id=?)) LIMIT 1",
+            (attempt_id, thread_id, run_id, task_id, task_id),
+        ):
+            raise StaleGrant("execution already bound to another live grant")
 
     def claim_grant(
         self,
@@ -304,19 +473,28 @@ class State:
         run_id: str,
         task_id: str | None = None,
     ) -> dict[str, Any]:
+        self._validate_execution_identity(thread_id, run_id, task_id)
         with self.transaction():
             attempt = self.validate_grant(attempt_id, generation)
+            self._check_execution_binding(attempt_id, thread_id, run_id, task_id)
             if attempt["thread_id"] and (attempt["thread_id"], attempt["run_id"]) != (
                 thread_id,
                 run_id,
             ):
                 raise StaleGrant("grant already claimed by another run")
+            if (
+                attempt["task_id"] is not None
+                and task_id is not None
+                and attempt["task_id"] != task_id
+            ):
+                raise StaleGrant("grant already claimed by another task")
             self.connection.execute(
                 "UPDATE attempts SET thread_id=?,run_id=?,task_id=COALESCE(?,task_id),status='running' WHERE id=?",
                 (thread_id, run_id, task_id, attempt_id),
             )
             self.connection.execute(
-                "UPDATE executor_lease SET state='claimed' WHERE singleton=1"
+                "UPDATE executor_lease SET state='claimed' WHERE attempt_id=?",
+                (attempt_id,),
             )
             self.connection.execute(
                 "UPDATE jobs SET state='running' WHERE id=?", (attempt["job_id"],)
@@ -331,10 +509,9 @@ class State:
         run_id: str,
         task_id: str | None = None,
     ) -> dict[str, Any]:
-        if not thread_id or not run_id:
-            raise StateError("execution identities required")
+        self._validate_execution_identity(thread_id, run_id, task_id)
         with self.transaction():
-            lease = self.lease()
+            lease = self.lease(attempt_id)
             attempt = self.get_attempt(attempt_id)
             if (
                 not lease
@@ -350,6 +527,7 @@ class State:
             objective = self.get_objective(job["objective_id"])
             if objective["status"] != "cancel_requested":
                 raise StateError("objective has no pending cancellation")
+            self._check_execution_binding(attempt_id, thread_id, run_id, task_id)
             if (
                 (attempt["thread_id"] is not None and attempt["thread_id"] != thread_id)
                 or (attempt["run_id"] is not None and attempt["run_id"] != run_id)
@@ -383,7 +561,7 @@ class State:
     def mark_uncertain(self, attempt_id: str, reason: str) -> None:
         with self.transaction():
             attempt = self.get_attempt(attempt_id)
-            if attempt:
+            if attempt and self.lease(attempt_id):
                 self.connection.execute(
                     "UPDATE attempts SET status='uncertain',raw_status=? WHERE id=?",
                     (reason, attempt_id),
@@ -421,7 +599,7 @@ class State:
         ):
             raise StateError("transport ambiguity cannot prove no child")
         with self.transaction():
-            lease = self.lease()
+            lease = self.lease(attempt_id)
             attempt = self.get_attempt(attempt_id)
             if (
                 not lease
@@ -490,12 +668,13 @@ class State:
     ) -> bool:
         with self.transaction():
             attempt = self.get_attempt(attempt_id)
-            lease = self.lease()
+            lease = self.lease(attempt_id)
             if (
                 not attempt
                 or not lease
                 or lease["attempt_id"] != attempt_id
                 or attempt["generation"] != generation
+                or lease["generation"] != generation
                 or attempt["run_id"] != run_id
             ):
                 return False
@@ -548,7 +727,14 @@ class State:
                 )
                 self.connection.execute(
                     "UPDATE objectives SET status=? WHERE id=?",
-                    ("failed" if failed else final, objective["id"]),
+                    (
+                        "stopped"
+                        if objective["status"] == "cancel_requested"
+                        else "failed"
+                        if failed
+                        else final,
+                        objective["id"],
+                    ),
                 )
             return True
 
@@ -569,7 +755,10 @@ class State:
                 (objective_id,),
             )
             self.connection.execute(
-                "UPDATE jobs SET state=CASE WHEN state IN ('queued','quota_wait','auth_required') THEN 'stopped' ELSE 'cancel_requested' END WHERE objective_id=? AND state NOT IN ('succeeded','failed','stopped')",
+                "UPDATE jobs SET state=CASE WHEN EXISTS("
+                "SELECT 1 FROM attempts a JOIN executor_lease l ON l.attempt_id=a.id "
+                "WHERE a.job_id=jobs.id) THEN 'cancel_requested' ELSE 'stopped' END "
+                "WHERE objective_id=? AND state NOT IN ('succeeded','failed','stopped')",
                 (objective_id,),
             )
             self.connection.execute(

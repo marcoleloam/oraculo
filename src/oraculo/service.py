@@ -20,12 +20,14 @@ from oraculo.memory.context import Context
 from oraculo.memory.maintenance import Maintenance
 from oraculo.memory.publish import Publisher
 from oraculo.memory.review import ReviewManager
+from oraculo.plans import Plans
 from oraculo.protocol import (
     CONTROL_MARKER,
     MAX_ENVELOPE_BYTES,
     Envelope,
     canonical_json,
     parse_envelope,
+    validate_memory_submission,
 )
 from oraculo.routing import Router
 from oraculo.state import State, StateError
@@ -64,7 +66,8 @@ class Service:
     def __init__(self, config: Config, config_path: Path):
         self.config = config
         self.config_path = config_path
-        self.state = State(config.db_path)
+        self.state = State(config.db_path, max_executors=config.max_executors)
+        self.plans = Plans(self.state)
         self.publisher = Publisher(config.vault_root, config.state_dir)
         self.reviews = ReviewManager(self.publisher)
         self.router = Router(config, self.state)
@@ -105,6 +108,12 @@ class Service:
         return attempt
 
     def status(self, project_id: str) -> dict:
+        plans = [
+            self.plans.describe(o["id"])
+            for o in self.state.list_objectives()
+            if (project_id == "*" or o["project_id"] == project_id)
+            and self.plans.get(o["id"])
+        ]
         objectives = [
             o
             for o in self.state.list_objectives()
@@ -130,6 +139,12 @@ class Service:
                 for j in jobs[-200:]
             ],
             "executor": lease,
+            "executors": [
+                dict(item, attempt=self.state.get_attempt(item["attempt_id"]))
+                for item in self.state.leases()
+            ],
+            "max_executors": self.config.max_executors,
+            "plans": plans,
             "additional_spend_allowed": False,
         }
 
@@ -166,12 +181,38 @@ class Service:
         if kind == "status.get":
             return self.status(envelope.project_id)
         project = self.project(envelope.project_id)
+        if kind in {"plan.submit", "objective.submit"} and envelope.origin.thread_id:
+            source = self.state._one(
+                "SELECT j.objective_id FROM attempts a JOIN jobs j ON j.id=a.job_id "
+                "WHERE a.thread_id=? AND a.run_id=?",
+                (envelope.origin.thread_id, envelope.origin.run_id),
+            )
+            if source and self.plans.get(source["objective_id"]):
+                raise StateError("planned_executor_must_use_bounded_plan_extend")
+        if kind == "plan.submit":
+            return self.plans.submit(
+                envelope.project_id,
+                p["plan"],
+                p.get("dedupe_key", envelope.request_id),
+                self.config.profiles,
+            )
+        if kind == "plan.extend":
+            attempt = self.owner(envelope, executor=True)
+            return self.plans.extend(attempt, p["task"], self.config.profiles)
+        if kind == "task.retry":
+            objective = self.state.get_objective(p["objective_id"])
+            if not objective or objective["project_id"] != envelope.project_id:
+                raise StateError("objective_project_mismatch")
+            return self.plans.retry(
+                objective["id"], p["task_id"], 1 + self.config.max_correction_rounds
+            )
         if kind == "objective.submit":
             if p.get("marker") == CONTROL_MARKER or p.get("kind") == "status_event":
                 raise StateError("control_event_is_not_objective")
             job_kind = p.get("kind", "implementation")
             if job_kind not in self.config.profiles:
                 raise StateError("unknown_job_kind")
+            validate_memory_submission(p)
             origin = p.get("origin", "human")
             evidence = p.get("evidence")
             if origin == "autonomous" and not evidence:
@@ -321,6 +362,23 @@ class Service:
                 and envelope.origin.run_id != attempt["run_id"]
             ):
                 raise StateError("execution_origin_run_mismatch")
+            self.plans.validate_report(attempt, p)
+            blocker = (
+                p["evidence"].get("blocker")
+                if isinstance(p["evidence"], dict)
+                else None
+            )
+            if blocker is not None and json.loads(job["payload"]).get("task_spec"):
+                if (
+                    p["status"] != "failed"
+                    or not isinstance(blocker, dict)
+                    or any(
+                        not isinstance(blocker.get(key), str)
+                        or not blocker[key].strip()
+                        for key in ("reason", "owner", "action")
+                    )
+                ):
+                    raise StateError("planned_blocker_requires_reason_owner_action")
             previous = self.state.get_meta(f"execution_report:{attempt['id']}")
             if previous is not None and previous != p:
                 raise StateError("execution_report_is_immutable")
@@ -368,7 +426,16 @@ class Service:
         project = self.project(envelope.project_id)
         operations = Operations(self.state)
         if envelope.kind == "operation.prepare":
-            self.owner(envelope, executor=True)
+            attempt = self.owner(envelope, executor=True)
+            job = self.state.get_job(attempt["job_id"])
+            spec = json.loads(job["payload"]).get("task_spec")
+            if spec:
+                allowed = {
+                    "publication": {"push", "merge", "pr"},
+                    "deployment": {"deploy"},
+                }.get(spec["stage"], set())
+                if p["kind"] not in allowed:
+                    raise StateError("operation_outside_planned_stage")
             previous = operations.get(p["operation_id"])
             if previous:
                 raise StateError("operation_already_prepared_reconcile_before_effect")
@@ -714,8 +781,14 @@ class Service:
         )
         return result["threadId"]
 
+    def job_ready(self, job: dict) -> bool:
+        return not self.state._one(
+            "SELECT d.job_id FROM dependencies d JOIN jobs j ON d.depends_on=j.id WHERE d.job_id=? AND j.state!='succeeded' LIMIT 1",
+            (job["id"],),
+        )
+
     async def dispatch(self, client: Any) -> None:
-        if self.state.lease():
+        if len(self.state.leases()) >= self.config.max_executors:
             return
         candidates = [j for j in self.state.list_jobs() if j["state"] == "queued"]
         candidates.sort(
@@ -727,6 +800,10 @@ class Service:
         for job in candidates:
             objective = self.state.get_objective(job["objective_id"])
             if objective["status"] in {"cancel_requested", "stopped"}:
+                continue
+            if not self.job_ready(job):
+                continue
+            if self.state._scope_conflicts(job, objective["project_id"]):
                 continue
             if not self.router.select(job["kind"], self.catalog):
                 self.health = "blocked_eligibility"
@@ -797,7 +874,12 @@ class Service:
                 "payload": payload,
                 "context": context,
                 "executor_instructions": self.prompt("executor"),
+                "objective_id": objective["id"],
+                "task_context": self.task_context(job),
             }
+            if body["task_context"]:
+                # Existing coordinator contexts can predate this protocol version.
+                body["coordinator_instructions"] = self.prompt("coordinator")
             if job["kind"] == "memory":
                 body["memory_instructions"] = self.prompt("memory")
                 from oraculo.memory.transport import MemoryArtifacts, memory_message
@@ -811,6 +893,34 @@ class Service:
                     )
             else:
                 message = canonical_json(body)
+                from oraculo.memory.transport import MAX_MESSAGE_UNITS, utf16_units
+
+                if utf16_units(message) > MAX_MESSAGE_UNITS:
+                    # This is a new intent, known not to have been sent. Persist a
+                    # useful blocker instead of treating it as an uncertain replay.
+                    with self.state.transaction():
+                        self.state.connection.execute(
+                            "UPDATE jobs SET state='blocked' WHERE id=?", (job["id"],)
+                        )
+                        self.state.set_meta(
+                            f"blocker:{job['id']}",
+                            {
+                                "reason": "task_dispatch_too_large",
+                                "owner": payload.get("task_spec", {}).get(
+                                    "owner", "objective owner"
+                                ),
+                                "action": (
+                                    "Cancel and resubmit a bounded plan using source "
+                                    "references and concise criterion/dependency receipts"
+                                ),
+                            },
+                        )
+                        self.state.connection.execute(
+                            "UPDATE objectives SET status='blocked' WHERE id=?",
+                            (objective["id"],),
+                        )
+                    self.health = "task_dispatch_too_large"
+                    continue
             self.state.enqueue_outbox(
                 key, {"thread_id": coordinator, "message": message}, objective["id"]
             )
@@ -827,11 +937,43 @@ class Service:
             "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
         ).fetchone()[0]
         return (
-            not self.state.lease()
+            len(self.state.leases()) < self.config.max_executors
+            and self.job_ready(current)
             and current["state"] == "queued"
             and objective["status"] not in {"cancel_requested", "stopped"}
+            and not self.state._scope_conflicts(current, objective["project_id"])
             and count == attempt_count
         )
+
+    def task_context(self, job: dict) -> dict:
+        plan = self.plans.get(job["objective_id"])
+        if not plan:
+            return {}
+        dependencies = self.state.connection.execute(
+            "SELECT depends_on FROM dependencies WHERE job_id=?", (job["id"],)
+        ).fetchall()
+        proofs = []
+        for dep in dependencies:
+            attempt = self.state._one(
+                "SELECT * FROM attempts WHERE job_id=? ORDER BY number DESC LIMIT 1",
+                (dep["depends_on"],),
+            )
+            if attempt:
+                report = self.state.get_meta(f"execution_report:{attempt['id']}", {})
+                proofs.append(
+                    {
+                        "job_id": dep["depends_on"],
+                        "thread_id": attempt["thread_id"],
+                        "run_id": attempt["run_id"],
+                        "task_id": attempt["task_id"],
+                        "evidence": report.get("evidence"),
+                    }
+                )
+        return {
+            "objective": plan["spec"]["text"],
+            "dependency_evidence": proofs,
+            "isolation": "shared",
+        }
 
     async def send_dispatch(self, client: Any, row: dict) -> None:
         from oraculo.memory.transport import MAX_MESSAGE_UNITS, utf16_units
@@ -967,8 +1109,13 @@ class Service:
                 quota = (
                     isinstance(evidence, dict) and evidence.get("error_kind") == "quota"
                 )
+                blocker = (
+                    evidence.get("blocker") if isinstance(evidence, dict) else None
+                )
+                planned = self.plans.get(objective["id"]) is not None
                 retry = (
-                    attempt["status"] == "failed"
+                    not blocker
+                    and attempt["status"] == "failed"
                     and attempt["number"] <= self.config.max_correction_rounds
                     and objective["status"] not in {"cancel_requested", "stopped"}
                 )
@@ -985,9 +1132,11 @@ class Service:
                         "UPDATE objectives SET status='queued' WHERE id=?",
                         (objective["id"],),
                     )
-                elif job["kind"] not in {"memory", "discovery"} and objective[
-                    "status"
-                ] not in {"cancel_requested", "stopped"}:
+                elif (
+                    not planned
+                    and job["kind"] not in {"memory", "discovery"}
+                    and objective["status"] not in {"cancel_requested", "stopped"}
+                ):
                     self.state.enqueue_job(
                         objective["id"],
                         "memory",
@@ -1011,6 +1160,13 @@ class Service:
                         "UPDATE objectives SET status='queued' WHERE id=?",
                         (objective["id"],),
                     )
+                if planned:
+                    if blocker and attempt["status"] == "failed":
+                        self.state.set_meta(f"blocker:{job['id']}", blocker)
+                        self.state.connection.execute(
+                            "UPDATE jobs SET state='blocked' WHERE id=?", (job["id"],)
+                        )
+                    self.plans.describe(objective["id"])
                 project = self.state.get_project(objective["project_id"])
                 if project["coordinator_thread_id"]:
                     message = canonical_json(
