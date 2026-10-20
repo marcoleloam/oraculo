@@ -190,8 +190,10 @@ resposta perdida. Se watch não estiver disponível ou a origem for um subagente
 incapaz de observar PR, o bloqueio é explícito: a operação pertence à origem
 raiz. `task unwatch` encerra o acompanhamento quando houver devolução ao usuário.
 
-`merge` exige política, memória anterior confirmada, trabalho/descendentes sem
-pendências e HEAD/base/repo exatos. Usa `gh pr merge --match-head-commit` e método
+`merge` exige política, memória anterior confirmada, execução original concluída
+com sucesso, estado atual compatível, descendentes verificados e HEAD/base/repo
+exatos. Uma execução posterior falha, cancelada ou interrompida, ou um descendente
+nesses estados, bloqueia antes da emissão do merge. Usa `gh pr merge --match-head-commit` e método
 permitido, sem bypass, auto-merge ou remoção de branch. Checks antigos não valem
 para um HEAD novo; uma revisão nova precisa validar/publicar a nova versão.
 Conflitos, revisão pendente, checks falhos/pendentes ou efeitos incertos bloqueiam.
@@ -201,7 +203,11 @@ SHA de merge confirmado muda a tarefa para `merged`.
 Um ciclo canônico adicional salva o resultado final e o SHA de merge. Falha dessa
 memória mantém `merged=true`, `settled=false` e pode ser retomada por `settle`.
 O encerramento reaproveita os gates 004: thread/run/projeto originais, estado
-terminal, perguntas/filhos ausentes e revisão do thread compatível. A chamada de
+terminal, perguntas/filhos ausentes e revisão do thread compatível. Também confere
+o conjunto completo de PRs vinculados ao executor: deve corresponder ao PR
+registrado, com merge confirmado e base esperada. PR adicional, desconhecido ou
+ainda aberto bloqueia o encerramento, inclusive ao recuperar uma resposta perdida.
+A chamada de
 settlement é intenção, não prova: o estado precisa ser relido. ACK perdido nunca
 dispara segundo settlement; observa-se o resultado. A origem permanente não é
 settled; somente a conversa de execução. A outbox devolve conclusão à origem e o

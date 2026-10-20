@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from oraculo.protocol import content_hash
-from oraculo.settlement import Settlements
+from oraculo.settlement import Settlements, verify_pull_requests
 from oraculo.state import StateError
 from oraculo.t3.client import T3Client
 
@@ -127,6 +127,10 @@ class TaskClosure:
 
         if receipt["state"] != "merged":
             await self.watch(task_id)
+            # A terminal result is not proof of successful current execution.
+            # Recheck the original run, current thread and all visible descendants
+            # before the irreversible merge, including for native delegations.
+            await self._execution_gate(task)
 
         def before_merge():
             self.store.update(
@@ -193,18 +197,18 @@ class TaskClosure:
         )
         if not self.engine._saved(saved):
             raise StateError("final_memory_write_unconfirmed")
-        # Reuse the established strict settlement transport and remote gate;
-        # only its authenticated call path is supplied by the current adapter.
-        client = T3Client("http://127.0.0.1/mcp")
-        client.call = self.host.call
-        thread_id = task["child"]["childThreadId"]
-        binding = {
-            "thread_id": thread_id,
-            "project_id": task["project"]["project_id"],
-            "run_id": task["child"]["childRunId"],
-        }
-        snapshot = await client.settlement_snapshot(thread_id)
-        Settlements.remote_gate(binding, snapshot)
+        client, binding, snapshot = await self._execution_gate(task)
+        thread_id = binding["thread_id"]
+        await self._pull_request_gate(client, task)
+        # PR inspection may overlap a new message or run. Re-read execution
+        # before requesting settlement; the host offers no atomic cross-API lock.
+        _, _, fresh = await self._execution_gate(task)
+        if any(
+            fresh["thread"][key] != snapshot["thread"][key]
+            for key in ("updatedAt", "itemCount")
+        ):
+            raise StateError("thread_changed_during_settlement_check")
+        snapshot = fresh
         if snapshot["thread"]["settled"] is not True:
             if task.get("settlement_attempted"):
                 raise StateError("settlement_uncertain_observe_only")
@@ -221,6 +225,8 @@ class TaskClosure:
             Settlements.remote_gate(binding, snapshot)
             if snapshot["thread"]["settled"] is not True:
                 raise StateError("settlement_unconfirmed")
+        # Also validate after a new request or when reconciling a lost response.
+        await self._pull_request_gate(client, task)
         unwatched = await self.host.call(
             "unwatch_pull_request",
             {"threadId": task["origin"]["thread_id"], "url": merged["url"]},
@@ -238,3 +244,32 @@ class TaskClosure:
             },
             settled=True,
         )
+
+    async def _execution_gate(self, task):
+        client = T3Client("http://127.0.0.1/mcp")
+        client.call = self.host.call
+        binding = {
+            "thread_id": task["child"]["childThreadId"],
+            "project_id": task["project"]["project_id"],
+            "run_id": task["child"]["childRunId"],
+        }
+        snapshot = await client.settlement_snapshot(binding["thread_id"])
+        Settlements.remote_gate(binding, snapshot)
+        return client, binding, snapshot
+
+    async def _pull_request_gate(self, client, task):
+        pr = task["merge_receipt"]
+        # GitHub supplied the verified commit receipt. T3 exposes the linked
+        # PR identities, target and host state, but not commit SHAs.
+        expected = [
+            {
+                "host": "github.com" if pr["host"] == "github" else pr["host"],
+                "repository": pr["repository"],
+                "number": pr["number"],
+                "base_branch": pr["base"],
+            }
+        ]
+        observed = await client.list_thread_pull_requests(
+            task["child"]["childThreadId"]
+        )
+        verify_pull_requests(expected, observed)

@@ -2,6 +2,7 @@
 
 import copy
 
+import pytest
 from test_managed_tasks import publication_setup
 from test_managed_tasks import system as system_fixture
 
@@ -56,6 +57,19 @@ async def setup(system):
             system.host.threads[args["threadId"]]["settled"] = True
             return {"accepted": True}
         result = await original(name, args)
+        if name == "list_thread_pull_requests":
+            result["pullRequests"] = [
+                {
+                    "url": row["url"],
+                    "host": "github.com",
+                    "repository": spec["repository"],
+                    "number": int(row["url"].rsplit("/", 1)[1]),
+                    "state": "merged" if lifecycle.merged else "open",
+                    "isDraft": False,
+                    "baseBranch": spec["base"],
+                }
+                for row in result["pullRequests"]
+            ]
         if name == "t3_thread_read":
             result["thread"].update(
                 pendingRequestCount=0,
@@ -247,3 +261,153 @@ async def test_merge_rechecks_publication_allowlist(system):
     )
     assert result["blocked_reason"] == "publication_binding_outside_scope"
     assert lifecycle.calls == 0
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("failure", ["failed", "cancelled", "interrupted"])
+@pytest.mark.parametrize("case", ["later_failed_run", "failed_descendant"])
+async def test_merge_must_reject_unresolved_execution(
+    system, monkeypatch, case, failure, native
+):
+    original = system.host.call
+
+    async def no_native(name, args):
+        result = await original(name, args)
+        if name == "orchestrator_capabilities":
+            result["features"]["appOwnedSubagents"] = native
+        return result
+
+    monkeypatch.setattr(system.host, "call", no_native)
+    task, policy, lifecycle, calls = await setup(system)
+    child_id = task["child"]["childThreadId"]
+    original_run = task["child"]["childRunId"]
+    call_before = system.host.call
+    if case == "later_failed_run":
+        system.host.threads[child_id].update(
+            status=failure, activeRunId=None, latestRunId="later-failed"
+        )
+    else:
+        system.host.threads["failed-review"] = {
+            "threadId": "failed-review",
+            "projectId": "alpha",
+            "parentThreadId": child_id,
+            "status": failure,
+            "activeRunId": None,
+            "latestRunId": "failed-review-run",
+            "pendingRequestCount": 0,
+            "title": "Failed review",
+        }
+
+    async def observed(name, args):
+        result = await call_before(name, args)
+        if (
+            case == "later_failed_run"
+            and name == "t3_thread_read"
+            and args["threadId"] == child_id
+        ):
+            result["recentRuns"] = [
+                {"runId": original_run, "status": "completed", "ordinal": 1},
+                {"runId": "later-failed", "status": failure, "ordinal": 2},
+            ]
+        return result
+
+    monkeypatch.setattr(system.host, "call", observed)
+    result = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": policy}
+    )
+    assert lifecycle.calls == 0, (
+        "must reject unresolved execution BEFORE irreversible merge"
+    )
+    assert not result["merged"] and not result["settled"]
+    assert result["blocked_reason"] == (
+        "thread_active_failed_or_pending_question"
+        if case == "later_failed_run"
+        else "thread_children_pending_or_unknown"
+    )
+
+
+async def test_settlement_must_check_complete_linked_pr_set(system, monkeypatch):
+    task, policy, lifecycle, counts = await setup(system)
+    child_id = task["child"]["childThreadId"]
+    system.host.links.add(
+        (child_id, "https://github.com/example/public-project/pull/99")
+    )
+    original = system.host.call
+    list_reads = []
+
+    async def observed(name, args):
+        result = await original(name, args)
+        if name == "list_thread_pull_requests" and args["threadId"] == child_id:
+            list_reads.append(name)
+            result["pullRequests"] = [
+                {
+                    "host": "github.com",
+                    "repository": "example/public-project",
+                    "number": 17,
+                    "url": system.store.get(task["id"])["publication"]["url"],
+                    "state": "merged",
+                    "isDraft": False,
+                    "baseBranch": "main",
+                },
+                {
+                    "host": "github.com",
+                    "repository": "example/public-project",
+                    "number": 99,
+                    "url": "https://github.com/example/public-project/pull/99",
+                    "state": "open",
+                    "isDraft": False,
+                    "baseBranch": "main",
+                },
+            ]
+        return result
+
+    monkeypatch.setattr(system.host, "call", observed)
+    result = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": policy}
+    )
+    assert counts["settle"] == 0, "must not settle a task with another linked open PR"
+    assert list_reads
+    assert result["merged"] and not result["settled"]
+    assert result["blocked_reason"] == "linked_pull_request_set_mismatch"
+
+
+@pytest.mark.parametrize("already_settled", [True, False])
+async def test_settlement_does_not_confirm_unverified_pr_state(system, already_settled):
+    task, policy, lifecycle, counts = await setup(system)
+    lifecycle.merged = True
+    child_id = task["child"]["childThreadId"]
+    system.host.threads[child_id]["settled"] = already_settled
+    original = system.host.call
+
+    async def stale(name, args):
+        result = await original(name, args)
+        if name == "list_thread_pull_requests" and args["threadId"] == child_id:
+            result["pullRequests"][0]["state"] = "open"
+        return result
+
+    system.host.call = stale
+    result = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": policy}
+    )
+    assert result["merged"] and not result["settled"]
+    assert counts["settle"] == 0
+    assert result["blocked_reason"] == "pull_request_not_verified_merged"
+
+
+async def test_settlement_rechecks_pr_set_after_request(system):
+    task, policy, lifecycle, counts = await setup(system)
+    original = system.host.call
+
+    async def changed(name, args):
+        result = await original(name, args)
+        if name == "list_thread_pull_requests" and counts["settle"]:
+            result["pullRequests"] = []
+        return result
+
+    system.host.call = changed
+    result = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": policy}
+    )
+    assert result["merged"] and not result["settled"]
+    assert counts["settle"] == 1
+    assert result["blocked_reason"] == "linked_pull_request_set_mismatch"
