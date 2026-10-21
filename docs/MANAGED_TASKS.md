@@ -316,6 +316,26 @@ e resposta perdida e só é liberada por término/descendentes confirmados. Esta
 incerto mantém ocupação. `executor_slots` pode reservar um orçamento maior para
 uma tarefa; não aumenta o teto configurado. Consultas não reservam executor.
 
+Uma reserva cujo lançamento nunca vinculou filho pode ser descartada somente
+pela origem com `task cancel` e payload `{"task_id": ...}`. O adapter reconsulta
+o catálogo de conversas do projeto, inclusive subagentes: qualquer conversa com
+o título de lançamento registrado bloqueia o cancelamento
+(`managed_cancel_candidate_child_exists_resume`) e exige `resume`. Sem candidato,
+a reserva é removida com auditoria `managed.cancel`, a tarefa passa a
+`cancelled` e nenhuma ação posterior além de `status` a reutiliza. Tarefa com
+filho vinculado não é cancelável por esse caminho; use o fluxo de término.
+
+Se o daemon em execução antecede `task cancel`, ele não consegue descartar a
+reserva, e a reserva impede a quiescência exigida por `service stop` e
+`runtime activate`. Para esse único caso, `task cancel` executado pela origem
+com a CLI candidata e **sem daemon respondendo no socket** usa a rota offline:
+adquire o lock do daemon e o lock do ledger, abre State e ledger com o mesmo
+schema, reconsulta o catálogo pela ponte e remove a reserva. Serviço vivo faz a
+rota recusar com `live_service_use_socket`. A resposta traz
+`source: offline_ledger`. Depois, `service start` e a ativação seguem o fluxo
+normal; parar o daemon antigo fora da ferramenta continua decisão do operador,
+registrada como estado não comprovado até o próximo `service status`.
+
 Cobertura é cooperativa: filhos/revisores adicionais precisam ingressar pelo
 adapter. Chamadas diretas de delegação no T3 não são interceptadas. Portanto o
 valor `capacity.occupied` não é inventário global de todas as conversas T3. Sem

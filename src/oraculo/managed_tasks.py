@@ -169,10 +169,14 @@ class ManagedTasks:
             }:
                 raise StateError("managed_task_origin_mismatch")
             try:
+                if action != "status" and task.get("work_status") == "cancelled":
+                    raise StateError("managed_task_cancelled")
                 if action != "status" and task.get("project"):
                     await self._scope(task)
                 if action == "status":
                     pass
+                elif action == "cancel":
+                    await self._cancel(task_id, actor)
                 elif action in {"start", "resume"}:
                     await self._advance(task_id, actor, caps)
                 elif action == "approve":
@@ -492,6 +496,63 @@ class ManagedTasks:
             task["launch_arguments"],
         )
         await self._accept_launch(self.store.get(task_id), child)
+
+    async def _cancel(self, task_id: str, actor: dict):
+        """Origin-only: drop a task that never bound a child and free its slot.
+
+        A lost launch response may still have created a child; the current host
+        catalog must show no thread with the recorded launch title before the
+        reservation is released. A visible candidate requires resume instead.
+        """
+        task = self.store.get(task_id)
+        if actor["thread_id"] != task["origin"]["thread_id"]:
+            raise StateError("managed_cancel_origin_required")
+        if task.get("child"):
+            raise StateError("managed_cancel_child_bound_use_finish")
+        matches, rows = 0, []
+        arguments = task.get("launch_arguments") or {}
+        if task.get("launch_attempted") and arguments.get("title"):
+            project_id = task["project"]["project_id"]
+            if task.get("transport_mode") == "native_child":
+                rows = await self._thread_rows(project_id)
+                matches = len(
+                    [
+                        r
+                        for r in rows
+                        if r.get("title") == arguments["title"]
+                        and r.get("parentThreadId") == task["origin"]["thread_id"]
+                    ]
+                )
+            else:
+                rows = await self._thread_rows(project_id)
+                matches = len(
+                    [
+                        r
+                        for r in rows
+                        if r.get("title") == arguments["title"]
+                        and not r.get("parentThreadId")
+                    ]
+                )
+            if matches:
+                raise StateError("managed_cancel_candidate_child_exists_resume")
+        proof = {
+            "reason": "origin_cancelled",
+            "child_bound": False,
+            "launch_attempted": bool(task.get("launch_attempted")),
+            "catalog_matches": matches,
+            "catalog_rows": len(rows),
+            "actor": actor,
+        }
+        released = None
+        if self.admission is not None:
+            released = self.admission.release_unlaunched(task_id, proof)
+        self.store.update(
+            task_id,
+            "cancelled",
+            dict(proof, released=released),
+            work_status="cancelled",
+            launch_attempted=False,
+        )
 
     async def _thread_rows(self, project_id: str) -> list[dict]:
         rows, cursor, seen = [], None, set()
@@ -1069,6 +1130,9 @@ class ManagedTasks:
         queues one idempotent resume notice to that parent instead of impersonating it.
         """
         task = self.store.get(task_id)
+        if task.get("work_status") == "cancelled":
+            await self.flush_returns(task_id)
+            return
         if (
             not task.get("child")
             and task.get("launch_attempted")
