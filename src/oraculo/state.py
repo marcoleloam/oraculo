@@ -54,8 +54,8 @@ class State:
         max_executors: int = 1,
         provider_limits: dict[str, int] | None = None,
     ) -> None:
-        if type(max_executors) is not int or not 1 <= max_executors <= 4:
-            raise StateError("max_executors must be an integer between 1 and 4")
+        if type(max_executors) is not int or max_executors < 1:
+            raise StateError("max_executors must be a positive integer")
         self.max_executors = max_executors
         self.provider_limits = provider_limits or {}
         self.path = Path(path)
@@ -425,9 +425,8 @@ class State:
                 raise StateError("maintenance_admission_closed")
             if self.get_meta("managed_legacy_untracked"):
                 raise StateError("managed_legacy_execution_requires_reconciliation")
-            if (
-                self.capacity()["available"] < slots
-                or self.provider_capacity(provider)["available"] < slots
+            if self.capacity()["available"] < slots or not self.provider_available(
+                provider, slots
             ):
                 raise StateError("managed_capacity_wait")
             self.connection.execute(
@@ -491,8 +490,9 @@ class State:
             "draining": occupied > effective,
         }
 
-    def provider_capacity(self, provider: str) -> dict[str, int]:
-        maximum = self.provider_limits.get(provider, self.max_executors)
+    def provider_capacity(self, provider: str) -> dict[str, int | None]:
+        """``limit``/``available`` are None when the provider has no own ceiling."""
+        maximum = self.provider_limits.get(provider)
         occupied = self.connection.execute(
             "SELECT count(*) FROM executor_lease l JOIN attempts a ON a.id=l.attempt_id "
             "WHERE a.provider=?",
@@ -505,8 +505,12 @@ class State:
         return {
             "limit": maximum,
             "occupied": occupied,
-            "available": max(0, maximum - occupied),
+            "available": None if maximum is None else max(0, maximum - occupied),
         }
+
+    def provider_available(self, provider: str, needed: int = 1) -> bool:
+        available = self.provider_capacity(provider)["available"]
+        return available is None or available >= needed
 
     def admission_blockers(self, job: dict, provider: str | None = None) -> list[dict]:
         """The same durable gates are used by status, dispatch and atomic admission."""
@@ -566,7 +570,7 @@ class State:
                 "plan_capacity",
                 "Wait for this plan's active attempts or configure max_parallel",
             )
-        if provider and not self.provider_capacity(provider)["available"]:
+        if provider and not self.provider_available(provider):
             block(
                 "provider_capacity",
                 "Wait for authorized provider capacity",

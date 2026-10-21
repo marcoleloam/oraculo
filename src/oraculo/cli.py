@@ -128,6 +128,16 @@ def stage_proposal(
     return {"artifact": name, "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="oraculo")
     root.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -186,7 +196,7 @@ def parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     status.add_argument("--project", default="*")
     capacity = commands.add_parser("capacity")
-    capacity.add_argument("--set", dest="max_executors", type=int, choices=range(1, 5))
+    capacity.add_argument("--set", dest="max_executors", type=positive_int)
     submit = commands.add_parser("submit")
     submit.add_argument("project")
     submit.add_argument("text")
@@ -198,9 +208,7 @@ def parser() -> argparse.ArgumentParser:
     configure = commands.add_parser("plan-configure")
     configure.add_argument("project")
     configure.add_argument("objective_id")
-    configure.add_argument(
-        "--max-parallel", type=int, choices=range(1, 5), required=True
-    )
+    configure.add_argument("--max-parallel", type=positive_int, required=True)
     retry = commands.add_parser("retry")
     retry.add_argument("project")
     retry.add_argument("objective_id")

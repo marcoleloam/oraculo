@@ -80,3 +80,31 @@ def test_explicit_scope_cannot_escape_root(tmp_path, location):
             vault_root=tmp_path / "vault",
             state_dir=tmp_path / "state",
         )
+
+
+def test_executor_ceilings_have_no_fixed_upper_bound(tmp_path):
+    base = dict(
+        projects_root=tmp_path / "work",
+        vault_root=tmp_path / "vault",
+        state_dir=tmp_path / "state",
+    )
+    config = Config(**base, max_executors=7)
+    assert config.max_executors == 7
+    assert all(p.max_executors is None for p in config.providers.values())
+    config = Config(
+        **base,
+        providers={
+            "codex": {"instance_id": "codex", "max_executors": 9},
+            "claude": {"instance_id": "claudeAgent"},
+        },
+    )
+    assert config.providers["codex"].max_executors == 9
+    assert config.providers["claude"].max_executors is None
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError):
+            Config(**base, max_executors=invalid)
+        with pytest.raises(ValidationError):
+            Config(
+                **base,
+                providers={"codex": {"instance_id": "codex", "max_executors": invalid}},
+            )

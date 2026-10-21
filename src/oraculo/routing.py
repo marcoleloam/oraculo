@@ -106,9 +106,9 @@ class Router:
                     }
                 )
                 continue
-            if self.state and self.state.provider_capacity(config.instance_id)[
-                "available"
-            ] <= (reserved or {}).get(config.instance_id, 0):
+            if self.state and not self.state.provider_available(
+                config.instance_id, (reserved or {}).get(config.instance_id, 0) + 1
+            ):
                 self.last_reason = "provider_capacity"
                 self.last_blockers.append(
                     {"provider": config.instance_id, "reason": "provider_capacity"}
