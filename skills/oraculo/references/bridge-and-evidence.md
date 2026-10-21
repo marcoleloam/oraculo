@@ -5,6 +5,13 @@ The managed adapter uses a caller-bound host bridge. If the host exports
 documented bridge command or native host tools via `--stdio-host --file payload.json`.
 Never make the daemon impersonate the parent or synthesize a host response.
 
+A harness may expose two T3 servers with the same tool names: a per-thread
+injected one (tools prefixed `mcp__t3-code__`) and a generic HTTP one
+(`mcp__t3__`). Only the injected server is caller-bound; its
+`orchestrator_capabilities` returns `parentThreadId`. A null `parentThreadId`
+or "not running inside a T3 thread" from the generic server is not evidence of
+running outside a thread. Answer bridge frames with the caller-bound server.
+
 For stdio, keep stdin open and process complete `ORACULO_HOST_CALL_V1` JSON frames.
 Call the named native tool with exactly the frame's arguments, once; return its
 actual `request_id` and `result` in one JSON line on stdin. Do not execute a partial
