@@ -271,8 +271,10 @@ e outra delegação. Planos usam checkout compartilhado com propriedade declarad
 contexto T3 separado não exige worktree separado. Worktrees legados continuam
 partindo do commit do pai e não recebem alterações não commitadas.
 
-`max_executors=1` continua sendo o padrão. Valores 2–4 permitem concorrência
-limitada apenas entre escopos independentes e destinos elegíveis na assinatura.
+`max_executors=1` continua sendo o padrão. Qualquer inteiro ≥ 2 permite
+concorrência apenas entre escopos independentes e destinos elegíveis na
+assinatura; não há teto fixo no código, e `providers.<nome>.max_executors`
+(inteiro ≥ 1, opcional) restringe um provedor específico.
 `write_paths` são prefixos relativos: ausência ou `['*']` bloqueia todo o projeto,
 lista vazia é somente leitura. Declare artefatos de testes e todas as escritas;
 commits/índice Git compartilhado exigem `'*'`. Aliases de roots, symlinks,

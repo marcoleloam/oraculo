@@ -86,7 +86,7 @@ class PlanSpec(StrictModel):
     text: str = Field(min_length=1, max_length=16000)
     tasks: list[TaskSpec] = Field(min_length=1, max_length=32)
     max_followups: int = Field(default=4, ge=0, le=4)
-    max_parallel: int | None = Field(default=None, ge=1, le=4, strict=True)
+    max_parallel: int | None = Field(default=None, ge=1, strict=True)
 
     @model_validator(mode="after")
     def dag(self) -> PlanSpec:
@@ -161,8 +161,8 @@ class Plans:
             return self.describe(objective["id"])
 
     def configure(self, objective_id: str, maximum: int) -> dict:
-        if type(maximum) is not int or not 1 <= maximum <= 4:
-            raise StateError("max_parallel_must_be_between_1_and_4")
+        if type(maximum) is not int or maximum < 1:
+            raise StateError("max_parallel_must_be_positive_integer")
         with self.state.transaction():
             if not self.get(objective_id):
                 raise StateError("planned_objective_required")

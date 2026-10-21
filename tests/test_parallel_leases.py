@@ -149,9 +149,27 @@ def test_default_serial_and_capacity_validation(tmp_path):
     state = State(tmp_path / "db")
     assert acquire(state, job(state, objective, []))
     assert acquire(state, job(state, objective, [])) is None
-    for capacity in (0, -1, 5, True, 1.5, "2"):
+    for capacity in (0, -1, True, 1.5, "2"):
         with pytest.raises(StateError):
             State(tmp_path / "invalid", max_executors=capacity)
+    state.close()
+
+
+def test_capacity_above_four_admits_without_provider_ceiling(tmp_path):
+    state, objective = setup(tmp_path, 7)
+    assert state.capacity()["configured_ceiling"] == 7
+    assert state.set_capacity(7)["effective"] == 7
+    assert state.provider_capacity("codex") == {
+        "limit": None,
+        "occupied": 0,
+        "available": None,
+    }
+    assert state.provider_available("codex", 7)
+    for _ in range(7):
+        assert acquire(state, job(state, objective, []))
+    assert acquire(state, job(state, objective, [])) is None
+    assert state.capacity()["available"] == 0
+    state.close()
 
 
 def test_migrate_live_singleton_and_restart_with_lower_capacity(tmp_path):

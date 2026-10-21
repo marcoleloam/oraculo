@@ -25,7 +25,8 @@ class ProviderConfig(StrictModel):
     auth_kind: Literal["existing_subscription"] = "existing_subscription"
     billing_verified: bool = False
     models: list[str] = Field(default_factory=list)
-    max_executors: int = Field(default=4, ge=1, le=4, strict=True)
+    # None means no provider-specific ceiling: the service ceiling applies.
+    max_executors: int | None = Field(default=None, ge=1, strict=True)
 
 
 class MemoryConfig(StrictModel):
@@ -44,7 +45,7 @@ class Config(StrictModel):
     vault_root: Path = Path.home() / "Obsidian/Oraculo"
     state_dir: Path = Path.home() / "Library/Application Support/Oraculo"
     t3_mcp_url: str = "https://t3.example.invalid/mcp"
-    max_executors: int = Field(default=1, ge=1, le=4)
+    max_executors: int = Field(default=1, ge=1)
     poll_active_seconds: int = Field(default=15, ge=1)
     poll_idle_seconds: int = Field(default=60, ge=1)
     proactive_interval_seconds: int = Field(default=1800, ge=1)

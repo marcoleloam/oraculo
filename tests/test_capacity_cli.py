@@ -11,6 +11,13 @@ from oraculo.protocol import parse_envelope
     [
         (["capacity"], "capacity.get", "*", {}),
         (["capacity", "--set", "2"], "capacity.set", "*", {"max_executors": 2}),
+        (["capacity", "--set", "7"], "capacity.set", "*", {"max_executors": 7}),
+        (
+            ["plan-configure", "alpha", "objective", "--max-parallel", "7"],
+            "plan.configure",
+            "alpha",
+            {"objective_id": "objective", "max_parallel": 7},
+        ),
         (
             ["plan-configure", "alpha", "objective", "--max-parallel", "1"],
             "plan.configure",
@@ -41,7 +48,7 @@ def test_capacity_controls_send_valid_local_envelopes(
     assert received[0]["origin"] == {}
 
 
-@pytest.mark.parametrize("value", ["0", "5", "1.5"])
+@pytest.mark.parametrize("value", ["0", "-1", "1.5"])
 def test_capacity_rejects_invalid_limits_before_request(
     service_config, monkeypatch, value
 ):

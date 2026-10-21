@@ -86,17 +86,20 @@ class Service:
             if config_path.is_file()
             else None
         )
+        provider_limits: dict[str, int] = {}
+        for alias in config.providers.values():
+            if alias.max_executors is None:
+                continue
+            current = provider_limits.get(alias.instance_id)
+            provider_limits[alias.instance_id] = (
+                alias.max_executors
+                if current is None
+                else min(current, alias.max_executors)
+            )
         self.state = State(
             config.db_path,
             max_executors=config.max_executors,
-            provider_limits={
-                p.instance_id: min(
-                    alias.max_executors
-                    for alias in config.providers.values()
-                    if alias.instance_id == p.instance_id
-                )
-                for p in config.providers.values()
-            },
+            provider_limits=provider_limits,
         )
         self.plans = Plans(self.state)
         self.settlements = SettlementStore(self.state)
@@ -1428,10 +1431,8 @@ class Service:
                 # An accepted/uncertain offer retains its original outbox identity.
                 continue
             target = self.router.select(job["kind"], self.catalog, reserved=allocations)
-            if (
-                not target
-                or allocations.get(target.provider, 0)
-                >= self.state.provider_capacity(target.provider)["available"]
+            if not target or not self.state.provider_available(
+                target.provider, allocations.get(target.provider, 0) + 1
             ):
                 continue
             allocations[target.provider] = allocations.get(target.provider, 0) + 1
