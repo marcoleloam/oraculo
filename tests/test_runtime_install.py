@@ -190,7 +190,18 @@ def test_crash_before_begin_retains_operation_id(setup, monkeypatch):
     journal = json.loads((root / "operation.json").read_text())
     assert journal["state"] == "acquiring_maintenance"
     assert journal["operation_id"]
+    assert journal["capacity"] is None
     assert rt.current_release(root) == "old"
+    # Recovery must adopt the first observed capacity instead of comparing
+    # the restarted service against the never-recorded None.
+    monkeypatch.undo()
+    result = rt.activate(root, bin_dir, conf, controller, "new")
+    assert result["state"] == "active"
+    journal = json.loads((root / "operation.json").read_text())
+    assert journal["state"] == "complete"
+    assert journal["operation_id"] == result["operation_id"]
+    assert journal["capacity"] == {"effective": 3}
+    assert rt.current_release(root) == "new"
 
 
 def test_config_race_preserves_stopped_state(setup):

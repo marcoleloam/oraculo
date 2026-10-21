@@ -550,7 +550,9 @@ def activate(
             match_guard(journal, guard)
         journal["token"] = guard.get("token")
         journal["maintenance_end_attempted"] = False
-        if not pending:
+        if not pending or journal.get("capacity") is None:
+            # A first attempt that failed before maintenance never observed
+            # capacity; the recovered guard is the baseline the restart must keep.
             journal["capacity"] = guard.get("capacity")
         step("maintenance")
         compatible(manifest, guard)
