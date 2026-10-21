@@ -4,6 +4,9 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -79,3 +82,56 @@ def test_init_new_state_then_repeat_preserves_database(service_config, capsys):
     # Both writer locks were released, including on the rejected retry.
     with Singleton(config.state_dir):
         pass
+
+
+@pytest.mark.parametrize("database", ["state", "managed"])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_init_preserves_orphaned_sqlite_sidecars(service_config, database, suffix):
+    config, path = service_config
+    db_path = (
+        config.db_path
+        if database == "state"
+        else config.state_dir / "managed-tasks.sqlite3"
+    )
+    sidecar = Path(str(db_path) + suffix)
+    original = b"orphaned recovery data\x00\xff"
+    sidecar.write_bytes(original)
+    assert main(["--config", str(path), "init"]) == 1
+    assert sidecar.read_bytes() == original
+    assert not config.db_path.exists()
+    assert not config.vault_root.exists()
+
+
+@pytest.mark.parametrize("database", ["state", "managed"])
+def test_init_preserves_real_journal_after_interrupted_writer(service_config, database):
+    config, path = service_config
+    db_path = (
+        config.db_path
+        if database == "state"
+        else config.state_dir / "managed-tasks.sqlite3"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, sqlite3, sys; "
+            "db=sqlite3.connect(sys.argv[1]); "
+            "db.execute('PRAGMA journal_mode=DELETE'); "
+            "db.execute('CREATE TABLE payload(value BLOB)'); "
+            "db.execute('INSERT INTO payload VALUES(zeroblob(8192))'); "
+            "db.commit(); "
+            "db.execute('UPDATE payload SET value=randomblob(8192)'); "
+            "os._exit(0)",
+            str(db_path),
+        ],
+        check=True,
+    )
+    journal = Path(str(db_path) + "-journal")
+    original = journal.read_bytes()
+    assert len(original) > 512
+    # Simulate partial loss after interruption without touching any live state.
+    db_path.unlink()
+    assert main(["--config", str(path), "init"]) == 1
+    assert journal.read_bytes() == original
+    assert not config.db_path.exists()
+    assert not config.vault_root.exists()

@@ -399,13 +399,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    existing = (
+                    databases = (
                         config.db_path,
-                        Path(str(config.db_path) + "-wal"),
-                        Path(str(config.db_path) + "-shm"),
                         config.state_dir / "managed-tasks.sqlite3",
-                        config.socket_path,
                     )
+                    existing = [config.socket_path] + [
+                        Path(str(database) + suffix)
+                        for database in databases
+                        for suffix in ("", "-wal", "-shm", "-journal")
+                    ]
                     if any(os.path.lexists(path) for path in existing):
                         raise ValueError(
                             "init_requires_new_state_use_runtime_migration"
