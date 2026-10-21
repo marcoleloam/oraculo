@@ -73,7 +73,10 @@ async def test_bridge_error_does_not_expose_stderr(tmp_path):
 
 
 def test_cli_list_without_host_bridge(service_config, monkeypatch, capsys):
-    _, config_path = service_config
+    from oraculo.task_store import TaskStore
+
+    config, config_path = service_config
+    TaskStore(config.state_dir / "managed-tasks.sqlite3").close()
     monkeypatch.delenv("T3_ACP_MCP_NODE", raising=False)
     assert main(["--config", str(config_path), "task", "list"]) == 0
     assert json.loads(capsys.readouterr().out) == {

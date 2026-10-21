@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -13,7 +14,31 @@ from oraculo.state import DedupeConflict, State, StateError
 
 
 class TaskStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only=False):
+        if read_only:
+            # Offline inspection must not run State's schema migrations or
+            # contend with the daemon's writer authority. URI mode also forbids
+            # creating a missing ledger; a read transaction gives one snapshot.
+            self.state = None
+            try:
+                self.db = sqlite3.connect(
+                    path.absolute().as_uri() + "?mode=ro", uri=True
+                )
+                self.db.row_factory = sqlite3.Row
+                self.db.execute("PRAGMA query_only=ON")
+                self.db.execute("BEGIN")
+                version = self.db.execute(
+                    "SELECT max(version) FROM schema_migrations"
+                ).fetchone()[0]
+                if version and version > 4:
+                    raise StateError("state_schema_newer_than_runtime")
+                self.db.execute("SELECT id,payload FROM managed_tasks LIMIT 0")
+                self.db.execute("SELECT id,payload,receipt FROM task_returns LIMIT 0")
+            except (sqlite3.Error, StateError) as exc:
+                if hasattr(self, "db"):
+                    self.db.close()
+                raise StateError("managed_ledger_read_unavailable") from exc
+            return
         self.state = State(path)
         self.db = self.state.connection
         self.db.executescript("""
@@ -25,9 +50,15 @@ class TaskStore:
             id TEXT PRIMARY KEY, task_id TEXT NOT NULL, payload TEXT NOT NULL,
             receipt TEXT);
         """)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(task_returns)")}
+        if "delivery" not in columns:
+            self.db.execute("ALTER TABLE task_returns ADD COLUMN delivery TEXT")
 
     def close(self):
-        self.state.close()
+        if self.state is None:
+            self.db.close()
+        else:
+            self.state.close()
 
     def get(self, task_id: str) -> dict:
         row = self.db.execute(
@@ -74,24 +105,43 @@ class TaskStore:
             raise StateError("task_transition_requires_proof")
         with self.state.transaction():
             task = self.get(task_id)
+            before = canonical_json(task)
             task.update(changes)
             task["phase"] = phase
             if phase != "blocked":
                 task["blocked_reason"] = None
             event = dict(phase=phase, proof=proof)
             signature = content_hash(event)
-            if not any(e["id"] == signature for e in task["events"]):
-                task["events"].append(dict(event, id=signature, at=time.time()))
+            if before != canonical_json(task) or not any(
+                e.get("signature", e["id"]) == signature for e in task["events"]
+            ):
+                revision = task.get("snapshot_revision", 0) + 1
+                task["snapshot_revision"] = revision
+                task["observed_at"] = time.time()
+                event_id = content_hash([task_id, revision, signature])
+                task["events"].append(
+                    dict(
+                        event,
+                        id=event_id,
+                        signature=signature,
+                        sequence=revision,
+                        at=time.time(),
+                    )
+                )
                 # Only bounded structural status is sent to the origin, never reports/context.
                 notification = dict(
                     marker="ORACULO_CONTROL_V1",
                     task_id=task_id,
+                    schema_version=2,
+                    event_id=event_id,
+                    sequence=revision,
+                    occurred_at=task["events"][-1]["at"],
                     phase=phase,
                     proof=proof,
                 )
                 self.db.execute(
-                    "INSERT OR IGNORE INTO task_returns VALUES(?,?,?,NULL)",
-                    (task_id + ":" + signature, task_id, canonical_json(notification)),
+                    "INSERT OR IGNORE INTO task_returns(id,task_id,payload,receipt) VALUES(?,?,?,NULL)",
+                    (task_id + ":" + event_id, task_id, canonical_json(notification)),
                 )
             self.db.execute(
                 "UPDATE managed_tasks SET payload=? WHERE id=?",
@@ -107,6 +157,44 @@ class TaskStore:
                 (task_id,),
             )
         ]
+
+    def delivery(self, event: dict) -> dict:
+        cached = self.db.execute(
+            "SELECT delivery FROM task_returns WHERE id=?", (event["id"],)
+        ).fetchone()
+        if cached and cached[0]:
+            return json.loads(cached[0])
+        task = self.get(event["payload"]["task_id"])
+        payload = dict(event["payload"])
+        revision = task.get("snapshot_revision", 0)
+        payload.update(
+            delivered_at=time.time(),
+            snapshot_revision=revision,
+            historical=payload.get("sequence", -1) < revision,
+            # A frozen retry can arrive after later revisions. The snapshot is
+            # an observation at emission, never proof of freshness at receipt.
+            refresh_required=True,
+            replayed=False,
+            replay_semantics="immutable_delivery_may_repeat",
+            snapshot={
+                k: task.get(k)
+                for k in (
+                    "id",
+                    "phase",
+                    "work_status",
+                    "blocked_reason",
+                    "snapshot_revision",
+                    "observed_at",
+                    "deliverable_kind",
+                    "approval_state",
+                )
+            },
+        )
+        self.db.execute(
+            "UPDATE task_returns SET delivery=? WHERE id=?",
+            (canonical_json(payload), event["id"]),
+        )
+        return payload
 
     def acknowledge_return(self, event_id: str, receipt: dict):
         if not receipt.get("messageId") or not receipt.get("threadId"):
@@ -152,6 +240,20 @@ class TaskStore:
             "scope": "selected_project_and_sanitized_shared",
         }
 
+    def history(self, task_id: str, offset: int = 0) -> dict:
+        if type(offset) is not int or offset < 0:
+            raise StateError("invalid_history_offset")
+        task = self.get(task_id)
+        events = task["events"][offset : offset + 50]
+        return dict(
+            task_id=task_id,
+            events=events,
+            offset=offset,
+            next_offset=offset + len(events),
+            total=len(task["events"]),
+            snapshot_revision=task.get("snapshot_revision", 0),
+        )
+
     def describe(self, task_id: str) -> dict:
         task = self.get(task_id)
         return {
@@ -164,5 +266,11 @@ class TaskStore:
                 "report",
                 "submitted_report",
                 "launch_arguments",
+                "events",
             }
-        } | {"pending_returns": len(self.pending_returns(task_id))}
+        } | {
+            "pending_returns": len(self.pending_returns(task_id)),
+            "events": task["events"][-100:],
+            "event_count": len(task["events"]),
+            "history_truncated": len(task["events"]) > 100,
+        }

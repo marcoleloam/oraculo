@@ -89,17 +89,20 @@ class SettlementListPage(RemoteModel):
     nextCursor: int | None = Field(ge=0)
 
 
-def settlement_child_clear(snapshot: SettlementRead) -> bool:
+def settlement_child_clear(
+    snapshot: SettlementRead, *, terminal_only: bool = False
+) -> bool:
     """A failed/interrupted child is unresolved, even though its run is terminal."""
     thread = snapshot.thread
     if thread.activeRunId is not None or thread.pendingRequestCount != 0:
         return False
     if thread.status == "idle" and thread.latestRunId is None:
         return not snapshot.recentRuns
-    if thread.status != "completed" or not thread.latestRunId:
+    accepted = TERMINAL_STATUSES if terminal_only else {"completed"}
+    if thread.status not in accepted or not thread.latestRunId:
         return False
     latest = [run for run in snapshot.recentRuns if run.runId == thread.latestRunId]
-    return len(latest) == 1 and latest[0].status == "completed"
+    return len(latest) == 1 and latest[0].status in accepted
 
 
 def execution_terminal(snapshot: dict[str, Any], expected_run_id: str) -> bool:

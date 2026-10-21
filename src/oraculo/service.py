@@ -37,6 +37,16 @@ from oraculo.settlement_store import SettlementStore
 from oraculo.state import State, StateError
 
 
+def validate_startup_config(config: Config, config_path: Path) -> None:
+    expected = os.environ.get("ORACULO_EXPECTED_CONFIG_SHA256")
+    if expected is not None and (
+        not expected
+        or config._loaded_sha256 != expected
+        or hashlib.sha256(config_path.read_bytes()).hexdigest() != expected
+    ):
+        raise StateError("startup_config_mismatch")
+
+
 class Singleton:
     def __init__(self, directory: Path):
         self.directory = directory
@@ -68,8 +78,14 @@ class Singleton:
 
 class Service:
     def __init__(self, config: Config, config_path: Path):
+        validate_startup_config(config, config_path)
         self.config = config
         self.config_path = config_path
+        self.config_sha256 = config._loaded_sha256 or (
+            hashlib.sha256(config_path.read_bytes()).hexdigest()
+            if config_path.is_file()
+            else None
+        )
         self.state = State(
             config.db_path,
             max_executors=config.max_executors,
@@ -90,12 +106,19 @@ class Service:
         self.memory_cycles = MemoryCycles(self.state, self.publisher)
         self.memory_flush: asyncio.Task | None = None
         self.managed_flush: asyncio.Task | None = None
+        self.managed_service = None
         self.router = Router(config, self.state)
         self.catalog: dict = {}
         self.health = "starting"
         self.stop = asyncio.Event()
         self.memory_lock = asyncio.Lock()
+        self.memory_operations = 0
         self.log = logging.getLogger("oraculo")
+        # Claim an existing ledger before any scheduler admission can occur.
+        if (config.state_dir / "managed-tasks.sqlite3").exists():
+            from oraculo.managed_service import ManagedService
+
+            self.managed_service = ManagedService(self)
 
     def project(self, project_id: str) -> dict:
         project = self.state.get_project(project_id)
@@ -146,6 +169,16 @@ class Service:
         if lease:
             lease = dict(lease, attempt=self.state.get_attempt(lease["attempt_id"]))
         return {
+            "runtime": {
+                "pid": os.getpid(),
+                "release_id": os.environ.get("ORACULO_RELEASE_ID"),
+                "config_path": str(self.config_path.resolve()),
+                "config_sha256": self.config_sha256,
+                "protocol_version": 1,
+            },
+            "maintenance": __import__(
+                "oraculo.maintenance", fromlist=["status"]
+            ).status(self.state),
             "health": self.health,
             "projects": self.state.list_projects(),
             "objectives": [
@@ -280,6 +313,29 @@ class Service:
             if envelope.origin.thread_id or envelope.origin.run_id:
                 raise StateError("capacity_requires_local_operator")
             return self.state.set_capacity(p["max_executors"])
+        if kind.startswith("maintenance."):
+            from oraculo import maintenance
+
+            if envelope.origin.thread_id or envelope.origin.run_id:
+                raise StateError("maintenance_requires_local_operator")
+            if kind == "maintenance.status":
+                return maintenance.status(self.state)
+            if self.managed_service is None:
+                from oraculo.managed_service import ManagedService
+
+                self.managed_service = ManagedService(self)
+            if (
+                self.memory_operations
+                or self.memory_lock.locked()
+                or (self.memory_flush is not None and not self.memory_flush.done())
+            ):
+                raise StateError("maintenance_memory_operation_active")
+            if self.managed_service.busy:
+                raise StateError("maintenance_managed_operation_active")
+            maintenance.check_legacy_tasks(self.config)
+            if kind == "maintenance.begin":
+                return maintenance.begin(self.state, p["operation_id"])
+            return maintenance.end(self.state, p["operation_id"], p["token"])
         project = self.project(envelope.project_id)
         if kind == "plan.configure":
             if (envelope.origin.thread_id or envelope.origin.run_id) and (
@@ -733,6 +789,8 @@ class Service:
         ):
             self.project(envelope.project_id)
         async with self.memory_lock:
+            if self.state.get_meta("runtime_maintenance"):
+                raise StateError("maintenance_admission_closed")
             p = envelope.payload
             if envelope.kind == "review.open":
                 session_id = hashlib.sha256(envelope.request_id.encode()).hexdigest()[
@@ -857,10 +915,41 @@ class Service:
             finally:
                 state.close()
 
-        return await asyncio.to_thread(work)
+        if self.state.get_meta("runtime_maintenance") and envelope.kind not in {
+            "memory.cycle.read",
+            "memory.cycle.status",
+        }:
+            raise StateError("maintenance_admission_closed")
+        self.memory_operations += 1
+        try:
+            return await asyncio.to_thread(work)
+        finally:
+            self.memory_operations -= 1
 
     async def handle(self, envelope: Envelope) -> dict:
         prepared_cycle = None
+        if envelope.kind in {"managed.capabilities", "managed.read"}:
+            if envelope.kind == "managed.capabilities":
+                data = {
+                    "protocol_version": 1,
+                    "authority": "service",
+                    "coverage": "cooperative",
+                    "global_host_enforcement": False,
+                }
+            else:
+                if self.managed_service is None:
+                    from oraculo.managed_service import ManagedService
+
+                    self.managed_service = ManagedService(self)
+                data = self.managed_service.describe(
+                    envelope.payload["action"], envelope.payload["payload"]
+                )
+            return {
+                "request_id": envelope.request_id,
+                "ok": True,
+                "state": "ok",
+                "data": data,
+            }
         if envelope.kind.startswith("memory.cycle."):
             # Cycle identities provide durable dedupe; reads must never use inbox cache.
             data = await self.direct_memory_command(envelope)
@@ -981,7 +1070,20 @@ class Service:
                 raw = await reader.readline()
             envelope = parse_envelope(raw)
             request_id = envelope.request_id
-            response = await self.handle(envelope)
+            if envelope.kind == "managed.execute":
+                if self.managed_service is None:
+                    from oraculo.managed_service import ManagedService
+
+                    self.managed_service = ManagedService(self)
+                data = await self.managed_service.execute(envelope, reader, writer)
+                response = {
+                    "request_id": request_id,
+                    "ok": True,
+                    "state": "ok",
+                    "data": data,
+                }
+            else:
+                response = await self.handle(envelope)
         except Exception as exc:
             response = {
                 "request_id": request_id,
@@ -1000,7 +1102,10 @@ class Service:
             pass
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
     def prompt(self, name: str) -> str:
         path = resources_root() / "prompts" / f"{name}.md"
@@ -1498,8 +1603,19 @@ class Service:
             except Exception as exc:
                 self.log.warning("managed_reconcile_failed:%s", type(exc).__name__)
         path = self.config.state_dir / "managed-tasks.sqlite3"
-        if not path.exists():
+        if not path.exists() or self.state.get_meta("runtime_maintenance"):
             return
+        if self.managed_service is None:
+            from oraculo.managed_service import ManagedService
+
+            try:
+                self.managed_service = ManagedService(self)
+            except BlockingIOError:
+                return
+        if self.managed_service.busy:
+            return
+        facade = self.managed_service
+        facade.busy = True
         loop = asyncio.get_running_loop()
 
         class HostProxy:
@@ -1515,22 +1631,25 @@ class Service:
             from oraculo.task_store import TaskStore
             from oraculo.task_transport import SocketMemory
 
-            descriptor = os.open(
-                path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
-            )
-            store = None
+            store = admission = None
             try:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return
+                # The facade retains the process lock. A worker-local connection
+                # keeps slow Git operations off the service loop; busy serializes
+                # it with caller-bound mutations under the same authority.
                 store = TaskStore(path)
+                store.authority_owned = True
+                admission = State(
+                    self.config.db_path,
+                    max_executors=self.config.max_executors,
+                    provider_limits=self.state.provider_limits,
+                )
                 adapter = ManagedTasks(
                     self.config,
                     store,
                     HostProxy(),
                     SocketMemory(self.config),
                     GitHubPublisher(),
+                    admission=admission,
                 )
                 cursor = store.state.get_meta("managed_reconcile_cursor", 0)
                 rows = store.db.execute(
@@ -1555,11 +1674,20 @@ class Service:
             finally:
                 if store:
                     store.close()
-                os.close(descriptor)
+                if admission:
+                    admission.close()
 
-        self.managed_flush = asyncio.create_task(asyncio.to_thread(reconcile_batch))
+        async def serialized_batch():
+            try:
+                await asyncio.to_thread(reconcile_batch)
+            finally:
+                facade.busy = False
+
+        self.managed_flush = asyncio.create_task(serialized_batch())
 
     def start_memory_flush(self) -> None:
+        if self.state.get_meta("runtime_maintenance"):
+            return
         # One bounded batch at a time, independent of dispatch/reconciliation.
         if self.memory_flush is not None and not self.memory_flush.done():
             return
@@ -1856,6 +1984,7 @@ class Service:
 
 
 async def serve(config: Config, config_path: Path) -> None:
+    validate_startup_config(config, config_path)
     with Singleton(config.state_dir):
         service = Service(config, config_path)
         log_dir = Path.home() / "Library/Logs/Oraculo"
@@ -1884,9 +2013,15 @@ async def serve(config: Config, config_path: Path) -> None:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
         finally:
+            if service.managed_flush is not None:
+                # Keep writer ownership until the worker has persisted its final
+                # observation; do not release the lock under a live thread.
+                await asyncio.gather(service.managed_flush, return_exceptions=True)
             if service.memory_flush is not None:
                 await asyncio.gather(service.memory_flush, return_exceptions=True)
             config.socket_path.unlink(missing_ok=True)
+            if service.managed_service is not None:
+                service.managed_service.close()
             service.state.close()
             service.log.removeHandler(handler)
             handler.close()

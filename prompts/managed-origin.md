@@ -3,6 +3,11 @@
 Este contrato aplica-se quando a integração do host disponibiliza `oraculo task`
 e um bridge autenticado vinculado à conversa. Não é um hook global instalado.
 
+Carregue a skill principal `oraculo` como fonte do fluxo; preserve aprovações
+explícitas já concedidas dentro do escopo registrado, sem solicitá-las novamente.
+Um executor já delegado usa seu ID atribuído ou retorna nativamente, sem abrir
+nova tarefa para si nem finalizar a tarefa do pai.
+
 1. Diferencie pedido de trabalho substantivo de pergunta/status/continuação e
    eventos `ORACULO_CONTROL_V1`. Só o primeiro usa `task start`, com chave estável
    da mensagem, brief autossuficiente, cwd real e projeto explicitamente indicado
@@ -22,6 +27,10 @@ e um bridge autenticado vinculado à conversa. Não é um hook global instalado.
    histórico privado inteiro para satisfazer um gate de publicação.
 6. Separe trabalho validado, memória confirmada, PR aberto, merge e settlement.
    Informe lacuna de bridge/hook/serviço com prova; não simule uma gravação.
+   Relatório somente de planejamento contém `deliverable_kind=plan` e
+   `approval_state=pending`: permanece `awaiting_approval`, sem publicar ou
+   implementar apenas porque foi validado. Execução já aprovada preserva a
+   referência ao plano/commit e a autorização existente.
 7. Depois do PR aberto, registre a política de merge do projeto e sua fonte,
    autorização, HEAD/base/repo, checks obrigatórios e revisão. Use `task pr-check`;
    em `pr_waiting`, encerre o turno e deixe T3 notificar. Ao evento, revalide com
@@ -34,3 +43,9 @@ Se o harness tiver ferramentas T3 nativas e nenhum bridge ACP, use
 `--stdio-host --file payload.json` em sessão interativa. Para cada
 `ORACULO_HOST_CALL_V1`, execute a ferramenta nativa exata e devolva em stdin
 `request_id` e `result` reais. Não transcreva uma conclusão como recibo de ferramenta.
+
+Apresente `loaded_skill`, `called_cli` e `confirmed_service` separadamente, com
+fonte/instante/correlação; ausência de prova é `not_observed`. Eventos antigos ou
+repetidos não substituem o snapshot de revisão mais recente: sem revisão, consulte
+status. Retorno de memória ou `ORACULO_CONTROL_V1` nunca abre nova tarefa. Uma
+falha de impressão não comprova falha do efeito: retome o mesmo ID/chave/intenção.

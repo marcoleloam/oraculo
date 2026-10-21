@@ -361,7 +361,9 @@ class T3Client:
             raise ContractError("Settlement read identity mismatch")
         return snapshot
 
-    async def settlement_snapshot(self, thread_id: str) -> dict[str, Any]:
+    async def settlement_snapshot(
+        self, thread_id: str, *, terminal_only: bool = False
+    ) -> dict[str, Any]:
         """Read bounded descendant evidence, without watching or polling.
 
         The public list API is project-scoped. This proves only descendants
@@ -425,7 +427,9 @@ class T3Client:
                 raise ContractError("Settlement descendant project mismatch")
             if child.thread.parentThreadId != rows[child_id].parentThreadId:
                 raise ContractError("Settlement descendant parent changed during read")
-            has_pending = has_pending or not settlement_child_clear(child)
+            has_pending = has_pending or not settlement_child_clear(
+                child, terminal_only=terminal_only
+            )
             pending.extend(children.get(child_id, []))
         # Refresh the target after descendant reads so newly active work blocks
         # the caller's policy, rather than relying on the initial target state.

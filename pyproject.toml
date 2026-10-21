@@ -30,3 +30,25 @@ select = ["E4", "E7", "E9", "F", "I"]
 "config/oraculo.example.toml" = "oraculo/assets/config/oraculo.example.toml"
 "prompts" = "oraculo/assets/prompts"
 "templates/vault" = "oraculo/assets/templates/vault"
+
+"skills/oraculo" = "oraculo/assets/skills/oraculo"
+"templates/integration" = "oraculo/assets/templates/integration"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/oraculo/**/*.py",
+  "/config/oraculo.example.toml",
+  "/prompts/**",
+  "/templates/vault/**",
+  "/templates/integration/**",
+  "/skills/oraculo/**",
+  "/scripts/install-cli.sh",
+  "/scripts/install-service.sh",
+  "/deploy/local.oraculo.plist",
+  "/docs/INSTALACAO.md",
+  "/docs/SKILLS.md",
+  "/pyproject.toml",
+  "/uv.lock",
+  "/LICENSE",
+]
+exclude = ["**/__pycache__/**", "**/*.pyc", "/docs/tasks/**", "/docs/contexto/**"]

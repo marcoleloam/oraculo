@@ -17,6 +17,7 @@ from oraculo.protocol import (
     parse_envelope,
     validate_memory_submission,
 )
+from oraculo.stdio import print_json
 
 DEFAULT_CONFIG = Path.home() / ".config/oraculo/config.toml"
 
@@ -139,9 +140,11 @@ def parser() -> argparse.ArgumentParser:
             "resume",
             "status",
             "list",
+            "history",
             "continue",
             "progress",
             "finish",
+            "approve",
             "publish",
             "pr-check",
             "merge",
@@ -161,7 +164,21 @@ def parser() -> argparse.ArgumentParser:
         help="JSON argv for an explicit caller-bound host bridge",
     )
     commands.add_parser("serve")
-    commands.add_parser("doctor")
+    diagnostics = commands.add_parser("doctor")
+    diagnostics.add_argument(
+        "--provider", choices=["codex", "claude", "grok"], default="codex"
+    )
+    diagnostics.add_argument("--skill-root", type=Path)
+    diagnostics.add_argument("--home", type=Path)
+    diagnostics.add_argument("--root", type=Path)
+    diagnostics.add_argument("--bin-dir", type=Path)
+    diagnostics.add_argument("--label", default="local.oraculo")
+    diagnostics.add_argument("--plist-dir", type=Path)
+    from oraculo import runtime, service_control, skill_install
+
+    skill_install.register_parsers(commands)
+    runtime.register_parsers(commands)
+    service_control.register_parsers(commands)
     commands.add_parser("init")
     auth = commands.add_parser("auth")
     auth.add_argument("action", choices=["login"])
@@ -260,6 +277,65 @@ def doctor(config: Config) -> dict:
     }
 
 
+def doctor_report(args) -> dict:
+    from oraculo import runtime, service_control, skill_install
+
+    report = {
+        "schema_version": 1,
+        "source": "local_diagnostics",
+        "python": sys.version.split()[0],
+        "launcher": shutil.which("oraculo"),
+        "config": {"path": str(args.config), "exists": args.config.is_file()},
+        "bridge": {
+            "acp_environment_present": bool(os.environ.get("T3_ACP_MCP_NODE")),
+            "caller_bound": "not_observed",
+            "stdio": "cooperative",
+        },
+        "skill": skill_install.diagnose(
+            provider=args.provider, root=args.skill_root, home=args.home
+        ),
+        "service": {"state": "not_observed"},
+    }
+    try:
+        config = Config.load(args.config)
+        report["local"] = doctor(config)
+        try:
+            report["service"] = asyncio.run(
+                request(config, make_envelope("status.get", "*", {}))
+            )
+        except (OSError, TimeoutError, ValueError) as exc:
+            report["service"] = {
+                "state": "unavailable",
+                "error_code": type(exc).__name__,
+            }
+        report["ok"] = report["local"]["ok"]
+    except (OSError, ValueError) as exc:
+        report["config"]["error_code"] = type(exc).__name__
+        report["ok"] = False
+    report["runtime"] = runtime.diagnose(
+        root=args.root or runtime.DEFAULT_ROOT,
+        bin_dir=args.bin_dir or runtime.DEFAULT_BIN,
+        config=args.config,
+    )
+    report["launchd"] = service_control.diagnose(
+        args.config, root=args.root, label=args.label, plist_dir=args.plist_dir
+    )
+    report["ok"] = bool(
+        report.get("ok")
+        and report["runtime"]["state"] == "installed"
+        and report["service"].get("ok")
+        and report["service"].get("data", {}).get("health") == "online"
+        and report["launchd"]["state"]
+        not in {"unknown", "failed", "starting", "stopping"}
+    )
+    report["note"] = (
+        "Each probe identifies its own target. ok covers local/runtime/service health; "
+        "skill loading and caller-bound bridge require separate observed evidence."
+    )
+    report["state"] = "diagnosed"
+    return report
+
+
 def make_envelope(kind: str, project: str, payload: dict) -> dict:
     return {
         "schema_version": 1,
@@ -274,6 +350,29 @@ def make_envelope(kind: str, project: str, payload: dict) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command in {"runtime", "service"}:
+            from oraculo import runtime, service_control
+
+            result = (
+                runtime if args.command == "runtime" else service_control
+            ).dispatch(args)
+            print_json(result)
+            return (
+                1
+                if result.get("state")
+                in {"blocked", "failed", "unknown", "recovery_required", "unsupported"}
+                else 0
+            )
+        if args.command == "skill":
+            from oraculo import skill_install
+
+            result = skill_install.dispatch(args)
+            print_json(result)
+            return 1 if result.get("state") in {"blocked", "failed"} else 0
+        if args.command == "doctor":
+            result = doctor_report(args)
+            print_json(result)
+            return 0 if result["ok"] else 1
         if args.command == "init":
             from oraculo.memory.publish import Publisher
             from oraculo.state import State
@@ -299,15 +398,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             config = Config.load(args.config)
             if args.command == "task":
-                from oraculo.managed_tasks import ManagedTasks
-                from oraculo.pr_lifecycle import GitHubPRLifecycle
-                from oraculo.publication import GitHubPublisher
+                from oraculo.managed_service import command as managed_command
+                from oraculo.state import StateError
                 from oraculo.task_store import TaskStore
-                from oraculo.task_transport import (
-                    CommandTransport,
-                    SocketMemory,
-                    StdioHostTransport,
-                )
+                from oraculo.task_transport import CommandTransport, StdioHostTransport
 
                 if args.stdio_host and (not args.file or args.transport_command):
                     raise ValueError(
@@ -320,51 +414,65 @@ def main(argv: list[str] | None = None) -> int:
                         args.file.read_text() if args.file else sys.stdin.read()
                     )
                 )
+                if args.action in {"list", "status", "history"}:
+                    try:
+                        result = asyncio.run(
+                            managed_command(config, args.action, payload, None)
+                        )
+                    except (OSError, TimeoutError):
+                        store = TaskStore(
+                            config.state_dir / "managed-tasks.sqlite3", read_only=True
+                        )
+                        try:
+                            result = (
+                                {
+                                    "tasks": [
+                                        store.describe(row[0])
+                                        for row in store.db.execute(
+                                            "SELECT id FROM managed_tasks ORDER BY rowid DESC"
+                                        )
+                                    ]
+                                }
+                                if args.action == "list"
+                                else store.describe(payload["task_id"])
+                            )
+                            if args.action == "history":
+                                result = store.history(
+                                    payload["task_id"], payload.get("offset", 0)
+                                )
+                            result["source"] = "local_ledger"
+                        finally:
+                            store.close()
+                    print_json(result)
+                    return 0
+                # Never mutate the ledger locally after negotiating service authority.
+                capabilities = asyncio.run(
+                    request(config, make_envelope("managed.capabilities", "*", {}))
+                )
+                if (
+                    not capabilities.get("ok")
+                    or capabilities.get("data", {}).get("protocol_version") != 1
+                ):
+                    raise StateError("managed_service_upgrade_required")
                 command = (
                     json.loads(args.transport_command.read_text())
                     if args.transport_command
                     else None
                 )
-                store = TaskStore(config.state_dir / "managed-tasks.sqlite3")
+                transport = (
+                    StdioHostTransport()
+                    if args.stdio_host
+                    else CommandTransport(command)
+                )
                 try:
-                    if args.action in {"list", "status"}:
-                        result = (
-                            {
-                                "tasks": [
-                                    store.describe(row[0])
-                                    for row in store.db.execute(
-                                        "SELECT id FROM managed_tasks ORDER BY rowid DESC"
-                                    )
-                                ],
-                                "source": "local_ledger",
-                            }
-                            if args.action == "list"
-                            else {
-                                **store.describe(payload["task_id"]),
-                                "source": "local_ledger",
-                            }
-                        )
-                        print(json.dumps(result, ensure_ascii=False, indent=2))
-                        return 0
-                    transport = (
-                        StdioHostTransport()
-                        if args.stdio_host
-                        else CommandTransport(command)
+                    result = asyncio.run(
+                        managed_command(config, args.action, payload, transport)
                     )
-                    adapter = ManagedTasks(
-                        config,
-                        store,
-                        transport,
-                        SocketMemory(config),
-                        GitHubPublisher(),
-                        GitHubPRLifecycle(),
-                    )
-                    adapter.config_path = args.config.resolve()
-                    result = asyncio.run(adapter.command(args.action, payload))
-                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    print_json(result)
                     return 1 if result.get("phase") == "blocked" else 0
                 finally:
-                    store.close()
+                    if args.stdio_host:
+                        transport.close()
             if args.command == "serve":
                 from oraculo.service import serve
 
@@ -568,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
                     result = asyncio.run(download_memory(config, envelope, args.file))
                 else:
                     result = asyncio.run(request(config, envelope))
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print_json(result)
         return 0 if result.get("ok", True) else 1
     except (OSError, ValueError, TimeoutError) as exc:
         print(
@@ -578,4 +686,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
             file=sys.stderr,
         )
-        return 1
+        return (
+            2
+            if args.command in {"skill", "runtime", "service"}
+            and isinstance(exc, ValueError)
+            else 1
+        )

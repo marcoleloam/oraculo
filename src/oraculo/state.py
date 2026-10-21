@@ -28,6 +28,7 @@ class DedupeConflict(StateError):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
 INSERT OR IGNORE INTO schema_migrations VALUES(1);
+CREATE TABLE IF NOT EXISTS managed_reservations(id TEXT PRIMARY KEY,provider TEXT NOT NULL,slots INTEGER NOT NULL,state TEXT NOT NULL,receipt TEXT);
 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,path TEXT NOT NULL,status TEXT NOT NULL,coordinator_thread_id TEXT);
 CREATE TABLE IF NOT EXISTS objectives(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),text TEXT NOT NULL,origin TEXT NOT NULL,dedupe_key TEXT UNIQUE,evidence TEXT NOT NULL,priority INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'queued',stop_generation INTEGER NOT NULL DEFAULT 0,created_at REAL NOT NULL);
@@ -65,6 +66,15 @@ class State:
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
+        if self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='schema_migrations'"
+        ).fetchone():
+            version = self.connection.execute(
+                "SELECT max(version) FROM schema_migrations"
+            ).fetchone()[0]
+            if version and version > 4:
+                self.connection.close()
+                raise StateError("state_schema_newer_than_runtime")
         self.connection.executescript(SCHEMA)
         # Rebuild the old singleton table atomically without losing a live grant.
         with self.transaction():
@@ -87,6 +97,7 @@ class State:
                 )
                 self.connection.execute("DROP TABLE executor_lease_v1")
             self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(2)")
+            self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(4)")
         self.path.chmod(0o600)
 
     def close(self) -> None:
@@ -373,16 +384,82 @@ class State:
             self.max_executors,
             requested if requested is not None else self.max_executors,
         )
-        occupied = len(self.leases())
+        occupied = (
+            len(self.leases())
+            + self.connection.execute(
+                "SELECT coalesce(sum(slots),0) FROM managed_reservations"
+            ).fetchone()[0]
+        )
         return {
             "configured_ceiling": self.max_executors,
             "requested": requested,
             "effective": effective,
             "occupied": occupied,
-            "available": max(0, effective - occupied),
+            "available": 0
+            if (
+                self.get_meta("runtime_maintenance")
+                or self.get_meta("managed_legacy_untracked")
+            )
+            else max(0, effective - occupied),
             "draining": occupied > effective,
             "source": "persisted" if requested is not None else "configuration",
+            **(
+                {"untracked_managed_tasks": self.get_meta("managed_legacy_untracked")}
+                if self.get_meta("managed_legacy_untracked")
+                else {}
+            ),
         }
+
+    def reserve_managed(self, task_id: str, provider: str, slots: int = 1) -> dict:
+        if not provider or type(slots) is not int or slots < 1:
+            raise StateError("managed_admission_invalid")
+        with self.transaction():
+            prior = self._one(
+                "SELECT * FROM managed_reservations WHERE id=?", (task_id,)
+            )
+            if prior:
+                if prior["provider"] != provider or prior["slots"] != slots:
+                    raise StateError("managed_reservation_conflict")
+                return prior
+            if self.get_meta("runtime_maintenance"):
+                raise StateError("maintenance_admission_closed")
+            if self.get_meta("managed_legacy_untracked"):
+                raise StateError("managed_legacy_execution_requires_reconciliation")
+            if (
+                self.capacity()["available"] < slots
+                or self.provider_capacity(provider)["available"] < slots
+            ):
+                raise StateError("managed_capacity_wait")
+            self.connection.execute(
+                "INSERT INTO managed_reservations VALUES(?,?,?,'reserved',NULL)",
+                (task_id, provider, slots),
+            )
+            return self._one(
+                "SELECT * FROM managed_reservations WHERE id=?", (task_id,)
+            )
+
+    def bind_managed(self, task_id: str, receipt: dict) -> None:
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE managed_reservations SET state='executing',receipt=? WHERE id=?",
+                (canonical_json(receipt), task_id),
+            )
+
+    def release_managed(self, task_id: str, proof: dict) -> None:
+        if (
+            proof.get("workState") != "result_available"
+            or proof.get("hasPendingChildRuns") is not False
+        ):
+            raise StateError("managed_terminal_proof_required")
+        with self.transaction():
+            self.audit("managed.release", {"task_id": task_id, "proof": proof})
+            untracked = self.get_meta("managed_legacy_untracked") or []
+            self.set_meta(
+                "managed_legacy_untracked", [x for x in untracked if x != task_id]
+            )
+            self.connection.execute(
+                "DELETE FROM managed_reservations WHERE id=?", (task_id,)
+            )
 
     def set_capacity(self, maximum: int) -> dict[str, Any]:
         if type(maximum) is not int or not 1 <= maximum <= self.max_executors:
@@ -421,6 +498,10 @@ class State:
             "WHERE a.provider=?",
             (provider,),
         ).fetchone()[0]
+        occupied += self.connection.execute(
+            "SELECT coalesce(sum(slots),0) FROM managed_reservations WHERE provider=?",
+            (provider,),
+        ).fetchone()[0]
         return {
             "limit": maximum,
             "occupied": occupied,
@@ -435,6 +516,16 @@ class State:
         def block(reason: str, action: str, **details: Any) -> None:
             blockers.append({"reason": reason, "action": action, **details})
 
+        if self.get_meta("runtime_maintenance"):
+            block(
+                "maintenance_admission_closed",
+                "Wait for verified maintenance completion",
+            )
+        if self.get_meta("managed_legacy_untracked"):
+            block(
+                "managed_legacy_execution_requires_reconciliation",
+                "Observe terminal legacy tasks through their original caller before admission",
+            )
         if objective["status"] in {"cancel_requested", "stopped"}:
             block("objective_stopped", "Reconcile cancellation; do not dispatch")
         if job["state"] not in {"queued", "quota_wait", "auth_required"}:

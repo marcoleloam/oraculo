@@ -74,3 +74,15 @@ Os testes locais não substituem os cenários reais de OAuth, provedores, plugin
 ## Licença
 
 Código distribuído sob a [licença MIT](LICENSE). Integrações externas como T3, Obsidian, plugins e provedores continuam sujeitas às respectivas licenças e assinaturas.
+
+## CLI instalada e integração cooperativa
+
+A CLI inclui operações de runtime/serviço e uma skill fina `oraculo`. Consulte
+[instalação](docs/INSTALACAO.md), [skills](docs/SKILLS.md) e
+[tarefas geridas](docs/MANAGED_TASKS.md) para contratos, compatibilidade e limites.
+Releases são preparadas antes da ativação; instalação não inicia o daemon.
+Planejamento concluído aguarda aprovação vinculada, e recibos revisionados
+separam o estado atual do histórico. O serviço compartilha admissão entre
+scheduler e tarefas geridas; delegações T3 feitas fora do adapter continuam
+fora dessa cobertura. Suporte de provedor depende de evidência por harness,
+não apenas da presença de um arquivo de skill.

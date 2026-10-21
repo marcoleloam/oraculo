@@ -29,6 +29,9 @@ def _now() -> str:
 
 REPORT_FIELDS = frozenset(
     {
+        "deliverable_kind",
+        "approval_state",
+        "approved_plan",
         "decisions",
         "changes",
         "results",

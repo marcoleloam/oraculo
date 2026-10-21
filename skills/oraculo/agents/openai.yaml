@@ -1,0 +1,6 @@
+interface:
+  display_name: "Oraculo"
+  short_description: "Project work with memory and task continuity"
+  default_prompt: "Use $oraculo to inspect my project task and continue its authorized work."
+policy:
+  allow_implicit_invocation: true

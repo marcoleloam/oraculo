@@ -4,7 +4,10 @@ Este guia descreve a implementação do checkout. A instalação e os cenários 
 
 ## Configuração e instalação
 
-Use macOS, Python 3.12, `uv`, Git e um T3 acessível por MCP. O LaunchAgent funciona na sessão do usuário enquanto o Mac estiver ligado e acordado. O runtime é o Python absoluto da `.venv` deste checkout: mover ou apagar o checkout exige reinstalar o LaunchAgent.
+Use macOS, Python 3.12, `uv`, Git e um T3 acessível por MCP. O LaunchAgent funciona na sessão do usuário enquanto o Mac estiver ligado e acordado. O launcher instalado usa o Python absoluto de uma release verificada em
+`~/.local/share/oraculo/releases`, selecionada por `current`. Siga
+[Instalação e manutenção](INSTALACAO.md) para construir o bundle, instalar,
+ativar e recuperar; o daemon instalado não depende de manter o checkout.
 
 ```bash
 uv sync --locked --python 3.12
@@ -309,3 +312,62 @@ já admitidos. Escritas conflitantes continuam serializadas.
 
 O [encerramento verificado](ENCERRAMENTO.md) distingue PR aberto, merge observado,
 memória confirmada e conversa fechada. Merge não comprova implantação.
+
+## Instalação, ativação e rollback
+
+Código validado e release instalada são evidências distintas da versão ativa.
+`runtime install`/`upgrade` preparam arquivos; `runtime activate` seleciona a
+release. Uma primeira seleção não inicia o serviço. Use `service start` quando
+configuração e credenciais estiverem prontas. Operações sobre serviço já ativo
+exigem quiescência e fecham admissão durante a troca.
+
+```sh
+oraculo status
+oraculo capacity
+oraculo runtime status
+oraculo service status
+oraculo runtime upgrade --bundle /caminho/bundle --dry-run
+oraculo runtime upgrade --bundle /caminho/bundle
+oraculo runtime activate RELEASE --dry-run
+oraculo runtime activate RELEASE
+oraculo service status
+oraculo capacity
+```
+
+`status.runtime` identifica PID, release, caminho/hash da configuração carregada
+e protocolo. Alterar o TOML não muda a configuração já carregada: divergência
+com o arquivo bloqueia confirmação de identidade. `service status` exige PID e
+socket correspondentes; loaded não equivale a online. `doctor` aceita `--root`,
+`--bin-dir`, `--label`, `--plist-dir`, `--provider` e `--skill-root` para identificar
+os alvos de ensaios isolados. A configuração é sempre opção global `--config`.
+
+`maintenance.begin` fecha admissão e devolve operation_id/token somente após
+provar quiescência. Trabalho ativo/incerto, operação de memória ou sessão gerida
+em andamento bloqueia a manutenção. `maintenance.end` exige a mesma operação e
+token. O caminho offline oficial adquire o lock do daemon e do ledger; nunca
+abra outro escritor sobre um serviço vivo. `capacity --set 1` reduz concorrência,
+mas não substitui manutenção nem fecha toda a admissão.
+
+Sem socket disponível, `task list/status/history` abre o ledger existente em
+modo somente leitura e identifica `source=local_ledger`. Essa consulta não cria
+banco nem executa migrações de schema, mesmo que outro processo detenha a escrita.
+Ledger ausente, incompatível ou ilegível produz erro explícito.
+
+A parada aguarda remoção de launchd, término do PID anterior e desaparecimento
+do socket com prazo finito. Timeout exige recuperação; não use sleep fixo como
+prova, nem apague socket/recibos para forçar bootstrap. Journals de runtime e
+serviço ficam privados no root de instalação. Preserve-os após falha.
+
+Para rollback, use `runtime rollback --dry-run` e `runtime rollback` conforme o
+procedimento de recuperação em [INSTALACAO.md](INSTALACAO.md). O código anterior
+precisa aceitar o schema atual. Não restaure SQLite antigo sobre execuções ou
+efeitos posteriores; capacidade, IDs e recibos devem permanecer preservados.
+Instalações legadas sem manifesto precisam da migração explícita documentada;
+não ganham integridade verificável só por receber um manifesto novo.
+
+Admissão compartilhada cobre scheduler e tarefas que entram pelo adapter. A
+capacidade do daemon não prova contagem de filhos lançados diretamente no host.
+Sem recibos dessa contagem, conserve execução serial e trate a expansão paralela
+como bloqueada; não aumente a capacidade nem alegue enforcement global. Skill e
+templates são cooperativos, e suporte por provedor depende da matriz de provas
+em [SKILLS.md](SKILLS.md).

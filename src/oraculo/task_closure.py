@@ -21,6 +21,8 @@ class TaskClosure:
 
     async def policy(self, task_id: str, policy: dict, actor: dict):
         task = self.store.get(task_id)
+        if task.get("deliverable_kind") == "plan":
+            raise StateError("plan_not_publishable")
         if actor["thread_id"] != task["origin"]["thread_id"]:
             raise StateError("merge_policy_requires_origin")
         if not isinstance(policy, dict) or policy.get("merge_authorized") is not True:
@@ -37,6 +39,8 @@ class TaskClosure:
         )
 
     def _requirements(self, task):
+        if task.get("deliverable_kind") == "plan":
+            raise StateError("plan_not_publishable")
         if not task.get("publication") or not task.get("publication_spec"):
             raise StateError("publication_required_before_merge")
         specification = task["publication_spec"]
@@ -55,6 +59,8 @@ class TaskClosure:
 
     async def watch(self, task_id):
         task = self.store.get(task_id)
+        if task.get("deliverable_kind") == "plan":
+            raise StateError("plan_not_publishable")
         origin = await self.engine._thread(task["origin"]["thread_id"])
         if origin.get("parentThreadId"):
             raise StateError("pr_watch_requires_root_origin")
@@ -79,6 +85,8 @@ class TaskClosure:
 
     async def check(self, task_id, *, merge=False):
         task = self.store.get(task_id)
+        if task.get("deliverable_kind") == "plan":
+            raise StateError("plan_not_publishable")
         self._requirements(task)
         receipt = self.lifecycle.inspect(
             task["publication"], task["merge_policy"], task["publication_spec"]["cwd"]
@@ -166,6 +174,8 @@ class TaskClosure:
 
     async def finalize(self, task_id):
         task = self.store.get(task_id)
+        if task.get("deliverable_kind") == "plan":
+            raise StateError("plan_not_publishable")
         merged = task.get("merge_receipt")
         if not merged or not task["merged"]:
             raise StateError("verified_merge_required")

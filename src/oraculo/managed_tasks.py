@@ -53,11 +53,19 @@ def workspace(path: str | Path) -> dict:
 
 class ManagedTasks:
     def __init__(
-        self, config, store: TaskStore, host, memory, publisher=None, lifecycle=None
+        self,
+        config,
+        store: TaskStore,
+        host,
+        memory,
+        publisher=None,
+        lifecycle=None,
+        admission=None,
     ):
         self.config, self.store = config, store
         self.host, self.memory, self.publisher = host, memory, publisher
         self.lifecycle = lifecycle
+        self.admission = admission
 
     async def _identity(self) -> tuple[dict, dict]:
         caps = await self.host.call("orchestrator_capabilities", {})
@@ -110,7 +118,8 @@ class ManagedTasks:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if not getattr(self.store, "authority_owned", False):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise StateError("managed_adapter_busy_retry_same_key") from None
             actor, caps = await self._identity()
@@ -130,6 +139,16 @@ class ManagedTasks:
                 text = payload.get("text")
                 if not isinstance(text, str) or not text.strip() or len(text) > 32000:
                     raise StateError("task_brief_required")
+                if payload.get("approved_plan"):
+                    reference = payload["approved_plan"]
+                    plan = self.store.get(reference["task_id"])
+                    if (
+                        plan.get("deliverable_kind") != "plan"
+                        or plan.get("approval_state") != "approved"
+                        or plan["origin"]["thread_id"] != actor["thread_id"]
+                        or plan["report"].get("commit") != reference.get("commit")
+                    ):
+                        raise StateError("approved_plan_binding_required")
                 task = self.store.create(actor, payload["key"], payload)
             else:
                 task = self.store.get(payload["task_id"])
@@ -155,6 +174,27 @@ class ManagedTasks:
                     pass
                 elif action in {"start", "resume"}:
                     await self._advance(task_id, actor, caps)
+                elif action == "approve":
+                    if (
+                        actor["thread_id"] != task["origin"]["thread_id"]
+                        or task.get("deliverable_kind") != "plan"
+                        or not self._saved(task.get("memory") or {})
+                        or payload.get("commit")
+                        != (task.get("report") or {}).get("commit")
+                        or not isinstance(payload.get("evidence"), str)
+                        or not payload["evidence"].strip()
+                    ):
+                        raise StateError("plan_approval_binding_required")
+                    self.store.update(
+                        task_id,
+                        "plan_approved",
+                        {
+                            "approval": payload["evidence"][:2000],
+                            "commit": payload["commit"],
+                            "actor": actor,
+                        },
+                        approval_state="approved",
+                    )
                 elif action == "continue":
                     await self._continue(task_id, payload)
                 elif action == "progress":
@@ -164,6 +204,7 @@ class ManagedTasks:
                         {"progress": str(payload["message"])[:1000]},
                     )
                 elif action == "finish":
+                    self._report_kind(task, payload["report"])
                     if actor["thread_id"] == (task.get("child") or {}).get(
                         "childThreadId"
                     ):
@@ -182,6 +223,8 @@ class ManagedTasks:
                     else:
                         await self._finish(task_id, payload["report"], actor)
                 elif action in {"pr-check", "merge", "settle", "unwatch"}:
+                    if task.get("deliverable_kind") == "plan":
+                        raise StateError("plan_not_publishable")
                     from oraculo.task_closure import TaskClosure
 
                     if self.lifecycle is None:
@@ -269,6 +312,8 @@ class ManagedTasks:
                 "pr_ready",
                 "merged",
                 "settled",
+                "awaiting_approval",
+                "plan_approved",
             }:
                 return
             report = task.get("submitted_report") or task.get("report")
@@ -277,11 +322,27 @@ class ManagedTasks:
                 publication = task.get("publication_request") or task.get(
                     "publication_spec"
                 )
-                if publication:
+                if (
+                    publication
+                    and self.store.get(task_id).get("deliverable_kind") != "plan"
+                ):
                     await self._publish(task_id, publication, task["origin"])
             elif task["work_status"] == "pending":
                 await self._observe(task)
             return
+        if self.admission is not None:
+            provider = (req.get("target") or {}).get("providerInstanceId") or caps.get(
+                "inheritedProviderInstanceId"
+            )
+            reservation = self.admission.reserve_managed(
+                task_id, provider, req.get("executor_slots", 1)
+            )
+            self.store.update(
+                task_id,
+                task["phase"],
+                {"admission": reservation},
+                admission=reservation,
+            )
         if task.get("launch_attempted"):
             if task["transport_mode"] == "native_child":
                 caller = await self._thread(actor["thread_id"])
@@ -377,7 +438,7 @@ class ManagedTasks:
                     "Use the caller-bound managed adapter with this task_id for status, progress, finish and publish; do not create this task again.",
                     "Finish with structured checks (command/status), decisions, changes, limitations and commit; publish only via the explicit safe repository binding.",
                     "Report host/adapter blockers to the origin through the persisted outbox. Do not require a user continue to carry out authorized work.",
-                    "Optional implementation/test/review children use delegate_task; wait for their results before reporting validation.",
+                    "Additional implementation/test/review children must enter through oraculo task start with their own stable key and shared service admission; direct delegate_task bypasses capacity and is not covered. Wait for all children before reporting validation.",
                 ],
             }
             branch = "oraculo/task-" + task_id.removeprefix("task-")[:16]
@@ -478,6 +539,8 @@ class ManagedTasks:
         )
 
     async def _accept_launch(self, task: dict, receipt: dict):
+        if self.admission is not None:
+            self.admission.bind_managed(task["id"], receipt)
         native = task["transport_mode"] == "native_child"
         thread_id = receipt.get("childThreadId") if native else receipt.get("threadId")
         if (
@@ -680,6 +743,49 @@ class ManagedTasks:
         )
         self.store.state.set_meta(key, {"sha256": digest, "receipt": receipt})
 
+    @staticmethod
+    def _report_kind(task, report):
+        if not isinstance(report, dict):
+            raise StateError("structured_report_required")
+        kind = task["request"].get("deliverable_kind", "implementation")
+        if kind not in {"plan", "implementation"}:
+            raise StateError("invalid_deliverable_kind")
+        if report.get("deliverable_kind", kind) != kind:
+            raise StateError("deliverable_kind_conflict")
+        if kind == "plan" and report.get("approval_state", "pending") != "pending":
+            raise StateError("plan_requires_separate_origin_approval")
+        return kind
+
+    async def _terminal_gate(self, task):
+        """Release capacity only after original run and all descendants are idle.
+
+        Failure is terminal for occupancy, but cannot certify successful work.
+        """
+        from oraculo.t3.contracts import TERMINAL_STATUSES
+
+        client = T3Client("http://127.0.0.1/mcp")
+        client.call = self.host.call
+        snapshot = await client.settlement_snapshot(
+            task["child"]["childThreadId"], terminal_only=True
+        )
+        thread = snapshot["thread"]
+        if (
+            thread["threadId"] != task["child"]["childThreadId"]
+            or thread["projectId"] != task["project"]["project_id"]
+            or thread["latestRunId"] != task["child"]["childRunId"]
+            or thread["activeRunId"] is not None
+            or thread["pendingRequestCount"] != 0
+            or thread["status"] not in TERMINAL_STATUSES
+            or snapshot["hasPendingChildRuns"] is not False
+            or snapshot["childrenObserved"] is not True
+            or not any(
+                run["runId"] == task["child"]["childRunId"]
+                and run["status"] in TERMINAL_STATUSES
+                for run in snapshot["recentRuns"]
+            )
+        ):
+            raise StateError("terminal_execution_or_descendants_unproven")
+
     async def _execution_gate(self, task):
         """Require successful original/current execution and verified descendants."""
         client = T3Client("http://127.0.0.1/mcp")
@@ -702,12 +808,19 @@ class ManagedTasks:
             raise StateError("finish_requires_task_or_origin")
         if not task.get("child"):
             raise StateError("child_not_launched")
+        if not isinstance(report, dict):
+            raise StateError("structured_report_required")
+        kind = self._report_kind(task, report)
         observed = await self._observe(task)
         if (
             observed.get("workState") != "result_available"
             or observed.get("hasPendingChildRuns") is not False
         ):
             raise StateError("children_still_running")
+        if self.admission is not None:
+            # Complete descendant verification precedes slot release.
+            await self._terminal_gate(self.store.get(task_id))
+            self.admission.release_managed(task_id, observed)
         if task.get("report") and task["report"] != report:
             raise StateError("terminal_report_reused")
         succeeded = observed.get("status") == "completed"
@@ -743,6 +856,8 @@ class ManagedTasks:
             {"work_status": status, "report_sha256": content_hash(report)},
             report=report,
             work_status=status,
+            deliverable_kind=kind,
+            approval_state="pending" if kind == "plan" else "not_required",
         )
         cycle = await self.memory.finish(
             task["project"]["project_id"],
@@ -753,7 +868,9 @@ class ManagedTasks:
         )
         self.store.update(
             task_id,
-            "pr_pending" if self._saved(cycle) and succeeded else "memory_pending",
+            ("awaiting_approval" if kind == "plan" else "pr_pending")
+            if self._saved(cycle) and succeeded
+            else "memory_pending",
             {
                 "memory_cycle_id": cycle["id"],
                 "write_state": cycle["write_state"],
@@ -778,6 +895,8 @@ class ManagedTasks:
 
     async def _publish(self, task_id: str, spec: dict, actor: dict):
         task = self.store.get(task_id)
+        if task.get("deliverable_kind") == "plan":
+            raise StateError("plan_not_publishable")
         if task["work_status"] != "succeeded" or not self._saved(task["memory"]):
             raise StateError("work_and_memory_required_before_pr")
         if not self.publisher:
@@ -968,7 +1087,7 @@ class ManagedTasks:
                     "t3_thread_send",
                     dict(
                         threadId=task["origin"]["thread_id"],
-                        message=canonical_json(event["payload"]),
+                        message=canonical_json(self.store.delivery(event)),
                         mode="auto",
                         clientRequestId=event["id"],
                     ),
