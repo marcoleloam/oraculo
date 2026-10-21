@@ -9,13 +9,22 @@ Use macOS, Python 3.12, `uv`, Git e um T3 acessível por MCP. O LaunchAgent func
 [Instalação e manutenção](INSTALACAO.md) para construir o bundle, instalar,
 ativar e recuperar; o daemon instalado não depende de manter o checkout.
 
+Para uma instalação existente, siga diretamente o upgrade ou a migração legada
+em [INSTALACAO.md](INSTALACAO.md). Não execute `init` para atualizar estado.
+Para uma instalação **nova**, após instalar e selecionar a release:
+
 ```bash
-uv sync --locked --python 3.12
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" init
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" doctor
+oraculo --config "$HOME/.config/oraculo/config.toml" init
+oraculo --config "$HOME/.config/oraculo/config.toml" doctor
 ```
 
-`init` cria a configuração quando ausente e inicializa estado e vault. Leia [config/oraculo.example.toml](../config/oraculo.example.toml). `--config` fica **antes** do subcomando em todos os comandos CLI. Os exemplos seguintes usam o caminho padrão; IDs em maiúsculas são valores a substituir pelo resultado real.
+`init` cria a configuração quando ausente e inicializa estado e vault sob locks
+exclusivos. Recusa banco, ledger ou socket existentes, inclusive links quebrados;
+não migra bancos nem substitui o procedimento de manutenção. Se uma inicialização
+parcial deixou estado, preserve-o e diagnostique a falha antes de recuperar.
+Leia [config/oraculo.example.toml](../config/oraculo.example.toml). `--config` fica
+**antes** do subcomando. Os exemplos seguintes usam o caminho padrão; IDs em
+maiúsculas devem ser substituídos pelos valores observados.
 
 Os padrões são:
 
@@ -41,28 +50,33 @@ Perfis padrão: implementação/testes preferem Codex, arquitetura prefere Claud
 
 O Oráculo registra seu próprio cliente OAuth, guarda credenciais no Keychain e usa callback local na porta 8769. Pare o serviço antes de login ou atualização do ambiente. Não copie tokens do T3 ou do plugin para arquivos de configuração.
 
-```bash
-./scripts/install-service.sh --dry-run
-./scripts/install-service.sh --install
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" auth login
-./scripts/install-service.sh --start
-./scripts/install-service.sh --status
-```
-
-Sem argumentos, o script faz somente dry-run de instalação. `--install` sincroniza o lockfile, inicializa dados ausentes e gera `~/Library/LaunchAgents/local.oraculo.plist`; não inicia nem autentica. `--start` executa o diagnóstico local e carrega o LaunchAgent. Esse diagnóstico não comprova login nem cota. O serviço começa a descobrir e executar trabalho quando há provedores elegíveis e conexão disponível.
+Depois da instalação e configuração descritas acima:
 
 ```bash
-./scripts/install-service.sh --stop
-./scripts/install-service.sh --uninstall --dry-run
+oraculo auth login
+oraculo doctor
+oraculo service start
+oraculo service status
 ```
 
-`--stop` descarrega o LaunchAgent e seu reinício automático. Não equivale ao cancelamento dos agentes remotos. `--uninstall` remove somente o LaunchAgent, preservando vault, estado, configuração, credenciais, ambiente e logs. Para configuração em outro caminho, use a variável `ORACULO_CONFIG` com caminho absoluto ao instalar/iniciar; mudar esse caminho exige reinstalação com serviço parado.
-
-Para diagnóstico em primeiro plano, com o LaunchAgent parado:
+O serviço começa a descobrir e executar trabalho quando há provedores elegíveis
+e conexão disponível. O diagnóstico local não comprova login, cota ou conectividade.
 
 ```bash
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" serve
+oraculo service stop
+oraculo service uninstall --dry-run
 ```
+
+A parada exige quiescência e confirma término do job, PID e socket; não cancela
+agentes remotos. Uninstall remove apenas o serviço administrado e preserva dados.
+O wrapper `scripts/install-service.sh` encaminha operações ao CLI instalado;
+sem argumentos consulta status. Ele não oferece `--install`. Para um plist legado
+sem ownership, siga a parada específica e migração de [INSTALACAO.md](INSTALACAO.md),
+sem contornar a validação do controlador novo.
+
+Para diagnóstico em primeiro plano, somente após confirmar o LaunchAgent parado,
+use o CLI da release selecionada com `oraculo serve`. Não execute uma versão nova
+contra um estado legado antes da migração oficial.
 
 ## Objetivos e status
 

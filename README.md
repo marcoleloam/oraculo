@@ -27,27 +27,31 @@ git clone https://github.com/marcoleloam/oraculo.git
 cd oraculo
 ```
 
-Na raiz deste checkout:
+Siga [Instalação e manutenção](docs/INSTALACAO.md) para construir o bundle,
+instalar uma release verificada e selecionar `current`. O bootstrap prepara os
+arquivos; o início do serviço é separado.
+
+**Instalação existente:** use o procedimento de upgrade ou de migração legada
+nesse guia. Não execute `init` com estado existente: esse comando aceita apenas
+um diretório de estado novo e não serve para atualizar bancos.
+
+**Instalação nova**, depois de selecionar a release e configurar o PATH:
 
 ```bash
-uv sync --locked --python 3.12
-uv run --frozen oraculo --help
-./scripts/install-service.sh --dry-run
+oraculo --config "$HOME/.config/oraculo/config.toml" init
+oraculo --config "$HOME/.config/oraculo/config.toml" doctor
 ```
 
-Para preparar configuração, estado, vault e LaunchAgent, sem iniciar o serviço:
+Edite `~/.config/oraculo/config.toml`: substitua a URL MCP de exemplo pelo endereço
+da sua instância T3, confira os IDs de provedores/modelos e as assinaturas.
+Nenhum provedor é elegível enquanto `billing_verified = false` e `models = []`.
+Faça o login OAuth próprio do Oráculo antes de iniciar:
 
 ```bash
-./scripts/install-service.sh --install
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" doctor
-```
-
-Edite `~/.config/oraculo/config.toml`: substitua `https://t3.example.invalid/mcp` pelo endereço MCP da sua instância T3; confirme os IDs reais de provedores/modelos no T3 e a cobertura pelas assinaturas. A configuração inicial contém `billing_verified = false` e `models = []`: nenhum provedor fica elegível até essa configuração. Faça o login OAuth próprio do Oráculo antes de iniciar:
-
-```bash
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" auth login
-./scripts/install-service.sh --start
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" status
+oraculo auth login
+oraculo service start
+oraculo service status
+oraculo status
 ```
 
 A ativação permite descoberta e execução autônomas nos projetos cadastrados no T3 dentro da raiz configurada. `doctor` verifica condições locais; não comprova autenticação, cota ou conectividade. O aceite funcional da V1 está registrado no resumo de validação; cada instalação requer configuração e ativação próprias.

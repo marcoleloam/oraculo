@@ -374,7 +374,11 @@ def main(argv: list[str] | None = None) -> int:
             print_json(result)
             return 0 if result["ok"] else 1
         if args.command == "init":
+            import fcntl
+            import os
+
             from oraculo.memory.publish import Publisher
+            from oraculo.service import Singleton
             from oraculo.state import State
 
             if not args.config.exists():
@@ -385,9 +389,32 @@ def main(argv: list[str] | None = None) -> int:
                 args.config.chmod(0o600)
             config = Config.load(args.config)
             config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            state = State(config.db_path)
-            state.close()
-            Publisher(config.vault_root, config.state_dir).initialize()
+            # Initialization must never open/migrate an existing database. Take
+            # both writer locks before checking, including for the first start.
+            with Singleton(config.state_dir):
+                fd = os.open(
+                    config.state_dir / "managed-tasks.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    existing = (
+                        config.db_path,
+                        Path(str(config.db_path) + "-wal"),
+                        Path(str(config.db_path) + "-shm"),
+                        config.state_dir / "managed-tasks.sqlite3",
+                        config.socket_path,
+                    )
+                    if any(os.path.lexists(path) for path in existing):
+                        raise ValueError(
+                            "init_requires_new_state_use_runtime_migration"
+                        )
+                    state = State(config.db_path, max_executors=config.max_executors)
+                    state.close()
+                    Publisher(config.vault_root, config.state_dir).initialize()
+                finally:
+                    os.close(fd)
             result = {
                 "config": str(args.config),
                 "state": "initialized",

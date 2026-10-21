@@ -90,7 +90,9 @@ consultas; configuração ausente produz diagnóstico.
 
 ## Configurar e iniciar
 
-Inicialização de configuração/vault/estado é separada da instalação:
+Inicialização de configuração/vault/estado é separada da instalação e exclusiva
+de uma instalação nova. `init` recusa estado, ledger ou socket existentes; nunca
+o use como upgrade. Para layout existente, siga a migração ou manutenção abaixo:
 
 ```sh
 oraculo --config "$HOME/.config/oraculo/config.toml" init
@@ -207,6 +209,22 @@ outro programa. Reconcilie trabalho ativo/incerto pela interface oficial antes d
 parar o serviço legado. A parada continua sendo uma ação operacional separada;
 exit 0 de `bootout` não comprova término. Não altere capacidade, reservas ou banco
 para satisfazer a guarda.
+
+Para o label padrão, depois de conferir plist/PID e quiescência, a parada
+legada usa o próprio launchd (ajuste label e caminho apenas conforme os registros):
+
+```sh
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.oraculo.plist"
+launchctl print "gui/$(id -u)/local.oraculo"
+```
+
+A segunda consulta deve confirmar que o job não existe; outro erro não prova
+parada. Aguarde também término do PID registrado e ausência do socket configurado.
+O `migrate-legacy --dry-run` abaixo verifica esses três probes e bloqueia se a
+parada ainda não terminou. Não use o wrapper novo `install-service.sh --stop` para
+esse plist legado: o controlador novo exige ownership e retorna `plist_conflict`.
+Não remova o socket, mate processo desconhecido nem altere o plist para superar
+esse gate. Se o prazo operacional expirar, preserve os registros e investigue.
 
 Execute o novo código pelo Python do candidato **somente depois** da parada.
 Substitua os valores abaixo pelos registros conferidos; `--previous-pid` é o PID
