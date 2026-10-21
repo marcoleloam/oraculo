@@ -347,3 +347,73 @@ Respostas do serviço mostram `admission` consultada na tabela de reservas atual
 `admission_at_launch` conserva o recibo histórico da admissão. `not_reserved`
 significa ausência de reserva atual, não sucesso do executor. No ledger offline,
 a observação armazenada não substitui uma consulta de capacidade ao serviço.
+
+## Parecer negativo e recuperação anterior à migração
+
+`completed` no host significa que o agente terminou; não significa aprovação.
+Um relatório com checks válidos `failed`, `verdict: "FAIL"` ou resumo iniciado
+por `FAIL` registra `work_status=failed`. O ciclo de memória conserva a falha e
+seu recibo confirmado; a resposta permanece `blocked/work_not_successful` e não
+permite publicação, merge ou settlement. Sucesso exige todos os checks `passed`,
+execução original e atual válidas, descendentes concluídos e commit/worktree
+validados. Checks precisam ser uma lista não vazia de objetos com `command`
+textual não vazio e `status` exatamente `passed` ou `failed`; os campos opcionais
+são `result`, `proof` e `layer`. Metadados de revisão existentes são aceitos:
+`reviewed_public_head`, `public_base`, `pull_request`, `task_id`,
+`linked_implementation_task`, `origin`, `memory`, `findings`, `prior_findings`
+e `documentation_observations`. Esses campos preservam proveniência no relatório;
+não concedem aprovação nem ampliam o schema da memória. Outros campos desconhecidos
+no relatório/check ou verdict fora de `PASS`/`FAIL` bloqueiam. O relatório submetido
+e o ciclo são imutáveis.
+
+Uma instalação anterior pode ter um relatório negativo submetido, memória
+`failed/saved` já confirmada pelo serviço e ledger ainda `pending`, impedindo
+`migrate-legacy`. Para esse caso existe uma operação estreita, executada pela
+origem com o **código candidato revisado**, antes de parar o serviço antigo:
+
+```sh
+# arquivo privado de entrada, contendo somente o ID original
+printf '%s\n' '{"task_id":"task-ID-ORIGINAL"}' > /caminho/privado/reconcile.json
+/caminho/candidato/venv/bin/python -m oraculo --config /caminho/config.toml \
+  task reconcile-legacy-failure --file /caminho/privado/reconcile.json \
+  --stdio-host > /caminho/privado/reconcile.out
+```
+
+O agente da origem atende cada frame `ORACULO_HOST_CALL_V1` com a ferramenta
+nativa correspondente e devolve seu resultado real pelo ACK correlacionado em
+stdin. `--transport-command` também aceita a ponte caller-bound já configurada.
+Não executar a ponte com identidades inventadas. O comando usa o thread atual da
+origem e a identidade original do ciclo; não exige que o run atual seja o antigo.
+
+A operação exige serviço legado vivo, lock do daemon ocupado, rejeição específica
+do protocolo gerido novo e resposta válida de `memory.cycle.status`. Exige banco
+principal schema 3 e ledger gerido schema 2, ambos existentes. Socket indisponível,
+timeout, resposta ambígua, schema diferente ou daemon novo bloqueiam. O lock
+`managed-tasks.lock` permanece exclusivo durante as verificações e atualização;
+não há abertura por `State`, migração de schema, novo ciclo ou escrita no vault.
+As operações geridas normais continuam exigindo `managed_service_upgrade_required`
+contra serviço antigo; não há adapter offline geral.
+
+Somente a origem/projeto originais podem reconciliar. O ciclo precisa corresponder
+à chave derivada da tarefa e identidade original, estar `failed/saved` e conter
+recibo `confirmed` correlacionado. O digest do relatório canônico do serviço é
+comparado à reconstrução com o relatório submetido e os metadados consultados.
+Não se aceitam arquivo de recibo, novo relatório, status escolhido pelo operador,
+resultado positivo ou tarefa com publicação tentada. Como o serviço antigo não
+preservava `verdict`, o conteúdo canônico retido deve comprovar a reprovação por
+check `failed` ou resumo iniciado por `FAIL`. Um `verdict: "FAIL"` isolado não
+autoriza recuperação; relatório e metadados originais permanecem intactos.
+Se a memória não estiver confirmada, a origem precisa resolver o ciclo original
+pela interface legada antes; este comando não o reescreve.
+
+O binding/worktree, run original, estado atual e descendentes são consultados
+novamente imediatamente antes da atualização condicional. A cobertura de filhos
+é a visibilidade do projeto no host, sem lock atômico remoto contra novas entradas;
+manter a janela cooperativa sem novas execuções. A gravação altera somente a tarefa
+e acrescenta seu evento/outbox. Relatórios, eventos anteriores, memória e schemas
+são preservados. O JSON final `reconciliation: "confirmed"` indica registro da
+falha; **exit 1 e `work_not_successful` são esperados**, não aprovação do candidato.
+`pending_reconciliation_returns` indica ACK ainda pendente. Repetir exatamente o
+mesmo comando revalida as fontes e reenvia o mesmo evento sem duplicá-lo. Após
+schema 4, esse comando deixa de ser aplicável. Só então continuar o procedimento
+de quiescência e migração; reconciliar uma tarefa não certifica quiescência global.

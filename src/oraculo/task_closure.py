@@ -54,6 +54,8 @@ class TaskClosure:
             raise StateError("confirmed_memory_required_before_merge")
         if task.get("work_status") != "succeeded" or not task.get("merge_policy"):
             raise StateError("validated_work_and_merge_policy_required")
+        if self.engine._report_failed(task.get("report")):
+            raise StateError("work_not_successful")
         if task["merge_policy"]["head_sha"] != task["publication"]["head_sha"]:
             raise StateError("new_head_requires_new_validation_and_publication")
 

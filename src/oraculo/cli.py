@@ -150,6 +150,7 @@ def parser() -> argparse.ArgumentParser:
             "merge",
             "settle",
             "unwatch",
+            "reconcile-legacy-failure",
         ],
     )
     task.add_argument("--file", type=Path, help="JSON payload; stdin when omitted")
@@ -474,6 +475,26 @@ def main(argv: list[str] | None = None) -> int:
                             store.close()
                     print_json(result)
                     return 0
+                if args.action == "reconcile-legacy-failure":
+                    from oraculo.legacy_failure import reconcile
+
+                    transport = (
+                        StdioHostTransport()
+                        if args.stdio_host
+                        else CommandTransport(
+                            json.loads(args.transport_command.read_text())
+                            if args.transport_command
+                            else None
+                        )
+                    )
+                    try:
+                        result = asyncio.run(reconcile(config, payload, transport))
+                        print_json(result)
+                        # The reconciliation succeeded; the reviewed work failed.
+                        return 1
+                    finally:
+                        if args.stdio_host:
+                            transport.close()
                 # Never mutate the ledger locally after negotiating service authority.
                 capabilities = asyncio.run(
                     request(config, make_envelope("managed.capabilities", "*", {}))

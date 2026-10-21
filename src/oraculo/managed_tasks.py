@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -756,6 +757,53 @@ class ManagedTasks:
             raise StateError("plan_requires_separate_origin_approval")
         return kind
 
+    @staticmethod
+    def _report_failed(report):
+        """Validate evidence before interpreting it; completion is not approval."""
+        from oraculo.memory.cycles import REPORT_FIELDS
+
+        # Existing review producers include provenance alongside the canonical
+        # memory fields. Preserve those extensions without treating them as
+        # approval or copying them into the memory schema.
+        review_metadata = {
+            "reviewed_public_head",
+            "public_base",
+            "pull_request",
+            "task_id",
+            "linked_implementation_task",
+            "origin",
+            "memory",
+            "findings",
+            "prior_findings",
+            "documentation_observations",
+        }
+        if (
+            not isinstance(report, dict)
+            or set(report) - REPORT_FIELDS - review_metadata
+        ):
+            raise StateError("invalid_validation_report")
+        checks = report.get("checks")
+        if not isinstance(checks, list) or not checks:
+            raise StateError("structured_validation_checks_required")
+        for check in checks:
+            if (
+                not isinstance(check, dict)
+                or set(check) - {"command", "status", "result", "proof", "layer"}
+                or not isinstance(check.get("command"), str)
+                or not check["command"].strip()
+                or check.get("status") not in ("passed", "failed")
+            ):
+                raise StateError("malformed_validation_check")
+        if "verdict" in report and report["verdict"] not in ("PASS", "FAIL"):
+            raise StateError("invalid_validation_verdict")
+        if "summary" in report and not isinstance(report["summary"], str):
+            raise StateError("invalid_validation_summary")
+        return (
+            report.get("verdict") == "FAIL"
+            or bool(re.match(r"^\s*FAIL\b", report.get("summary", ""), re.I))
+            or any(c["status"] == "failed" for c in checks)
+        )
+
     async def _terminal_gate(self, task):
         """Release capacity only after original run and all descendants are idle.
 
@@ -811,31 +859,28 @@ class ManagedTasks:
         if not isinstance(report, dict):
             raise StateError("structured_report_required")
         kind = self._report_kind(task, report)
+        failed = self._report_failed(report)
+        for field in ("report", "submitted_report"):
+            if task.get(field) is not None and task[field] != report:
+                raise StateError("terminal_report_reused")
         observed = await self._observe(task)
         if (
             observed.get("workState") != "result_available"
             or observed.get("hasPendingChildRuns") is not False
         ):
             raise StateError("children_still_running")
+        # Even a negative result requires fresh terminal/current-run evidence.
+        await self._terminal_gate(self.store.get(task_id))
         if self.admission is not None:
-            # Complete descendant verification precedes slot release.
-            await self._terminal_gate(self.store.get(task_id))
             self.admission.release_managed(task_id, observed)
-        if task.get("report") and task["report"] != report:
-            raise StateError("terminal_report_reused")
-        succeeded = observed.get("status") == "completed"
-        if not isinstance(report, dict):
-            raise StateError("structured_report_required")
-        if succeeded and (
-            not report.get("checks")
-            or any(
-                not isinstance(c, dict)
-                or c.get("status") != "passed"
-                or not c.get("command")
-                for c in report["checks"]
-            )
-        ):
-            raise StateError("passing_validation_evidence_required")
+        if observed.get("status") not in {
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+        }:
+            raise StateError("terminal_execution_unproven")
+        succeeded = observed["status"] == "completed" and not failed
         if succeeded:
             # Failed/stopped original runs still save their legitimate result.
             # Only successful certification requires the complete execution gate.
@@ -899,6 +944,8 @@ class ManagedTasks:
             raise StateError("plan_not_publishable")
         if task["work_status"] != "succeeded" or not self._saved(task["memory"]):
             raise StateError("work_and_memory_required_before_pr")
+        if self._report_failed(task.get("report")):
+            raise StateError("work_not_successful")
         if not self.publisher:
             raise StateError("publication_host_adapter_unavailable")
         if task.get("publication_attempted") and task.get("publication_spec") != spec:

@@ -210,6 +210,13 @@ parar o serviço legado. A parada continua sendo uma ação operacional separada
 exit 0 de `bootout` não comprova término. Não altere capacidade, reservas ou banco
 para satisfazer a guarda.
 
+Se um parecer negativo já tem memória `failed/saved`, mas ficou `pending` no
+ledger antigo, use primeiro o procedimento `task reconcile-legacy-failure` em
+[MANAGED_TASKS.md](MANAGED_TASKS.md#parecer-negativo-e-recuperação-anterior-à-migração).
+Essa operação específica do código candidato exige o serviço legado vivo e não
+instala nem ativa a release. As demais mutações geridas continuam bloqueadas até
+a atualização do daemon.
+
 Para o label padrão, depois de conferir plist/PID e quiescência, a parada
 legada usa o próprio launchd (ajuste label e caminho apenas conforme os registros):
 
@@ -226,7 +233,7 @@ esse plist legado: o controlador novo exige ownership e retorna `plist_conflict`
 Não remova o socket, mate processo desconhecido nem altere o plist para superar
 esse gate. Se o prazo operacional expirar, preserve os registros e investigue.
 
-Execute o novo código pelo Python do candidato **somente depois** da parada.
+Execute `runtime migrate-legacy` pelo Python do candidato **somente depois** da parada.
 Substitua os valores abaixo pelos registros conferidos; `--previous-pid` é o PID
 anterior real, maior que 1, mesmo que ele já tenha terminado:
 
