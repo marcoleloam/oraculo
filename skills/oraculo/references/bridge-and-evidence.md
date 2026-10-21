@@ -18,6 +18,9 @@ actual `request_id` and `result` in one JSON line on stdin. Do not execute a par
 frame. Tool failure and uncertain delivery require the existing operation's
 reconciliation. ACKs, task IDs and deduplication keys must remain correlated.
 The stdio bridge trusts the local operator; it is not cryptographic attestation.
+The bridge waits up to 600 s for each ACK (`ORACULO_BRIDGE_ACK_TIMEOUT` seconds
+overrides it); the daemon relay waits longer. Answer promptly anyway: while a
+frame is open, the daemon serializes every other managed operation.
 
 On an older CLI affected by PTY output backpressure, stdout to a private regular
 file with interactive stdin is a recovery workaround. Consume complete frames
