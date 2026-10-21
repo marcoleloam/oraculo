@@ -147,12 +147,25 @@ class StdioHostTransport:
     The local user/agent is the trust boundary, as for the existing Unix socket.
     """
 
-    def __init__(self, reader=None, writer=None):
+    # An agent answering frames by hand may need minutes to transcribe a large
+    # argument into its native tool call; the daemon relay waits longer still.
+    DEFAULT_ACK_TIMEOUT = 600.0
+
+    def __init__(self, reader=None, writer=None, ack_timeout: float | None = None):
         import sys
 
         self.reader = reader or sys.stdin
         self.writer = writer or sys.stdout
         self.terminal = None
+        if ack_timeout is None:
+            raw = os.environ.get("ORACULO_BRIDGE_ACK_TIMEOUT")
+            try:
+                ack_timeout = float(raw) if raw else self.DEFAULT_ACK_TIMEOUT
+            except ValueError:
+                raise StateError("invalid_bridge_ack_timeout") from None
+        if not ack_timeout > 0:
+            raise StateError("invalid_bridge_ack_timeout")
+        self.ack_timeout = ack_timeout
         # PTY canonical mode truncates long JSON acknowledgements. This adapter
         # owns its interactive terminal while active; restore it at process exit.
         if getattr(self.reader, "isatty", lambda: False)():
@@ -195,7 +208,10 @@ class StdioHostTransport:
             + "\n",
             self.writer,
         )
-        raw = await read_line(self.reader)
+        try:
+            raw = await read_line(self.reader, timeout=self.ack_timeout)
+        except TimeoutError:
+            raise StateError("host_response_uncertain") from None
         try:
             ack = json.loads(raw)
         except (TypeError, ValueError):

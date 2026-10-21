@@ -16,6 +16,11 @@ from oraculo.protocol import MAX_ENVELOPE_BYTES, canonical_json
 from oraculo.state import StateError
 
 PROTOCOL_VERSION = 1
+# The daemon serializes managed operations while a caller-bound bridge answers
+# its frames. These bounds must exceed the bridge's own ACK wait (600 s default)
+# so a slow but honest acknowledgement is not reported as uncertain twice.
+HOST_ACK_TIMEOUT = 900
+HOST_FRAME_TIMEOUT = 1200
 
 
 class ManagedService:
@@ -122,7 +127,7 @@ class ManagedService:
                     raise StateError("managed_host_frame_limit")
                 writer.write(raw)
                 await writer.drain()
-                async with asyncio.timeout(120):
+                async with asyncio.timeout(HOST_ACK_TIMEOUT):
                     ack = json.loads(await reader.readline())
                 if (
                     ack.get("operation_id") != operation
@@ -184,7 +189,7 @@ async def command(config, action, payload, transport):
         writer.write(canonical_json(envelope).encode() + b"\n")
         await writer.drain()
         while True:
-            async with asyncio.timeout(180):
+            async with asyncio.timeout(HOST_FRAME_TIMEOUT):
                 raw = await reader.readline()
             if not raw or len(raw) > MAX_ENVELOPE_BYTES:
                 raise StateError("managed_response_uncertain_resume_same_intent")

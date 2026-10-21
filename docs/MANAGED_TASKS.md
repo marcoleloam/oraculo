@@ -304,6 +304,10 @@ O writer stdio aceita writes parciais e EAGAIN, espera disponibilidade com prazo
 finito e restaura flags. O leitor evita `connect_read_pipe` e preserva os flags do
 TTY. Tanto frames de host quanto JSON final usam escrita exata. Limites: saída
 stdio 16 MiB, ACK stdio 4 MiB, envelope/socket 1 MiB. Fragmentos não são chamadas.
+A ponte stdio espera cada ACK por até 600 s (`ORACULO_BRIDGE_ACK_TIMEOUT`
+em segundos altera o limite); o relay do daemon espera 900 s por ACK e o adapter
+1200 s pelo próximo frame. Enquanto um frame está aberto, o daemon serializa as
+demais operações geridas; responda sem pausas mesmo assim.
 Falha após emissão deixa resultado incerto: retome a mesma tarefa/chave/intenção;
 não lance outro filho porque a impressão final falhou. Até migrar uma instalação
 antiga, stdout em arquivo privado e stdin em PTY continua um workaround observado.

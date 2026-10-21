@@ -159,3 +159,34 @@ def test_native_stdio_pty_accepts_large_ack_without_canonical_truncation():
             process.kill()
             process.wait()
         os.close(master)
+
+
+async def test_native_stdio_bridge_ack_timeout_defaults_and_overrides(monkeypatch):
+    import io
+    import os
+
+    from oraculo.task_transport import StdioHostTransport
+
+    monkeypatch.delenv("ORACULO_BRIDGE_ACK_TIMEOUT", raising=False)
+    assert StdioHostTransport(io.StringIO(), io.StringIO()).ack_timeout == 600.0
+    monkeypatch.setenv("ORACULO_BRIDGE_ACK_TIMEOUT", "45")
+    assert StdioHostTransport(io.StringIO(), io.StringIO()).ack_timeout == 45.0
+    assert (
+        StdioHostTransport(io.StringIO(), io.StringIO(), ack_timeout=7).ack_timeout == 7
+    )
+    for invalid in ("0", "-1", "soon"):
+        monkeypatch.setenv("ORACULO_BRIDGE_ACK_TIMEOUT", invalid)
+        with pytest.raises(StateError, match="invalid_bridge_ack_timeout"):
+            StdioHostTransport(io.StringIO(), io.StringIO())
+    monkeypatch.delenv("ORACULO_BRIDGE_ACK_TIMEOUT", raising=False)
+    # A silent host within the wait is reported as uncertain, never as success.
+    read, write = os.pipe()
+    reader = os.fdopen(read, "rb", buffering=0)
+    try:
+        with pytest.raises(StateError, match="host_response_uncertain"):
+            await StdioHostTransport(reader, io.StringIO(), ack_timeout=0.2).call(
+                "tool", {}
+            )
+    finally:
+        reader.close()
+        os.close(write)

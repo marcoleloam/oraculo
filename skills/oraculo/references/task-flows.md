@@ -67,8 +67,10 @@ checks original run, descendants, checkout and validation before completion.
 `validation_submitted` is only submission. Memory after work needs a correlated
 confirmed write receipt and commit; pending or sent is insufficient.
 
-For a planning-only report, add `deliverable_kind: "plan"` and
-`approval_state: "pending"` inside `report`, plus document/commit and checks.
+A planning-only task must already declare `"deliverable_kind": "plan"` in the
+`task start` request; finish cannot reclassify an implementation task. Its
+report then adds `deliverable_kind: "plan"` and `approval_state: "pending"`,
+plus document/commit and checks.
 The visible state is `awaiting_approval`; do not publish or implement from that
 report alone. Only the original origin records an existing user approval with
 `task approve` and payload `task_id`, `commit` and `evidence` (the nonempty reference
