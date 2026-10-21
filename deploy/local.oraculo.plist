@@ -6,11 +6,12 @@
     <key>ProgramArguments</key>
     <array>
         <string>__PYTHON__</string>
-        <string>-m</string><string>oraculo</string>
+        <string>-B</string><string>-m</string><string>oraculo</string>
         <string>--config</string><string>__CONFIG__</string>
         <string>serve</string>
     </array>
-    <key>WorkingDirectory</key><string>__REPOSITORY__</string>
+    <key>OraculoManagedRoot</key><string>__ROOT__</string>
+    <key>WorkingDirectory</key><string>__RELEASE__</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>ThrottleInterval</key><integer>30</integer>
@@ -19,6 +20,9 @@
     <key>StandardErrorPath</key><string>__STDERR__</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>ORACULO_RELEASE_ID</key><string>__RELEASE_ID__</string>
+        <key>ORACULO_CONFIG_PATH</key><string>__CONFIG__</string>
+        <key>PYTHONDONTWRITEBYTECODE</key><string>1</string>
         <key>PATH</key><string>__PATH__</string>
         <key>PYTHONUNBUFFERED</key><string>1</string>
     </dict>

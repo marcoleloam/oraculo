@@ -411,3 +411,18 @@ async def test_settlement_rechecks_pr_set_after_request(system):
     assert result["merged"] and not result["settled"]
     assert counts["settle"] == 1
     assert result["blocked_reason"] == "linked_pull_request_set_mismatch"
+
+
+async def test_explicit_fail_cannot_merge_even_with_legacy_success_marker(system):
+    task, policy, lifecycle, counts = await setup(system)
+    saved = system.store.get(task["id"])
+    evidence = {**saved["report"], "verdict": "FAIL"}
+    system.store.update(
+        task["id"], "pr_open", {"test": "legacy inconsistent marker"}, report=evidence
+    )
+    result = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": policy}
+    )
+    assert result["blocked_reason"] == "work_not_successful"
+    assert lifecycle.calls == 0
+    assert counts["settle"] == 0

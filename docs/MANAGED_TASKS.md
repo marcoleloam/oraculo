@@ -3,7 +3,7 @@
 O adapter `oraculo task` mantém o pedido ligado à conversa de origem, mesmo quando
 a execução ocorre em outro contexto. A origem recebe título, projeto, estado,
 link direto `t3-thread://v1/<identidade retornada pelo host>`, branch/worktree,
-bloqueios e recibo do PR. `task list` e `task status` consultam o ledger local sem
+bloqueios e recibo do PR. `task list` e `task status` consultam o serviço ou o ledger offline sem
 exigir IDs de ferramentas T3, credenciais ou uma sessão de modelo ativa.
 
 ## Contrato de transporte
@@ -246,3 +246,174 @@ Esse bridge evita depender de um helper externo inexistente, mas continua
 cooperativo. Sua presença não instala um hook em todas as conversas. O prompt de
 origem deve encaminhar pedidos e eventos a essa entrada quando o transporte ACP
 não estiver disponível.
+
+## Protocolo de serviço e compatibilidade
+
+As mutações `task` agora negociam `managed.capabilities` versão 1 e são executadas
+pelo daemon. O CLI conduz somente argumentos, apresentação e chamadas ao host.
+O socket emite `ORACULO_SERVICE_HOST_CALL_V1` com operação e request_id; o CLI
+executa a ferramenta no escopo real da conversa e devolve o ACK correlacionado.
+Não há credencial nem identidade inventada no Markdown. A confiança continua no
+operador local; não se trata de atestado criptográfico contra esse operador.
+
+O daemon conserva o ledger e adquire seu lock exclusivo. Um adapter antigo não
+pode mutar esse ledger simultaneamente. Um daemon anterior não reconhece o
+protocolo: o CLI novo retorna `managed_service_upgrade_required`, sem tentar a
+mesma mutação localmente. Ausência do socket bloqueia mutações. `list`, `status`
+e `history` podem consultar o ledger offline e identificam `source=local_ledger`;
+essa resposta não comprova serviço online. A migração é aditiva (State schema 4),
+e rollback exige runtime cujo intervalo de schemas inclua a versão gravada.
+
+## Planejamento e aprovação vinculada
+
+O pedido de planejamento fixa `deliverable_kind=plan`; finish não pode reclassificá-lo.
+O relatório de plano usa `deliverable_kind=plan`, `approval_state=pending` e o
+commit do documento. Após término real e memória confirmada, o estado passa a
+`awaiting_approval`. `publish`, merge e settlement não aceitam essa entrega.
+A aprovação é registrada pela origem, com referência verificável ao pedido:
+
+```json
+{"task_id":"<plan-task>","commit":"<plan-commit>","evidence":"Referência à aprovação explícita e seu escopo"}
+```
+
+Envie esse payload a `task approve`. O estado passa a `plan_approved`; o relatório
+original permanece imutável. Uma execução autorizada usa uma nova chave e
+`approved_plan={"task_id":"<plan-task>","commit":"<plan-commit>"}` em `task start`.
+O serviço confere origem, commit e aprovação. O adapter não consegue provar a
+intenção humana independentemente do operador; não infere aprovação por sucesso.
+
+## Recibos, histórico e recuperação
+
+Notificações v2 contêm sequência por tarefa, event_id, occurred_at e revisão do
+snapshot. A primeira tentativa de entrega congela delivered_at e snapshot junto
+à chave de envio; retry reenvia bytes idênticos, inclusive após ACK perdido.
+O consumidor conserva a maior revisão, marca eventos anteriores como históricos
+e consulta status antes de apresentar estado atual. Novos eventos carregam
+`refresh_required=true`: o snapshot é uma observação na primeira tentativa,
+não uma garantia de frescor no recebimento. Essa regra também vale para entregas
+legadas já congeladas com false. `replay_semantics=immutable_delivery_may_repeat`
+explicita que os mesmos bytes podem chegar novamente; `replayed=false` descreve
+a primeira emissão, não certifica entrega única. Uma notificação antiga não prova
+um bloqueio atual. Eventos e entregas não são apagados.
+
+Status inclui os últimos 100 eventos e `history_truncated/event_count`.
+`task history` recebe `task_id` e `offset` (inicial 0), devolve até 50 eventos e
+`next_offset/total`. Outbox pendente é mostrada separadamente do resultado.
+
+O writer stdio aceita writes parciais e EAGAIN, espera disponibilidade com prazo
+finito e restaura flags. O leitor evita `connect_read_pipe` e preserva os flags do
+TTY. Tanto frames de host quanto JSON final usam escrita exata. Limites: saída
+stdio 16 MiB, ACK stdio 4 MiB, envelope/socket 1 MiB. Fragmentos não são chamadas.
+Falha após emissão deixa resultado incerto: retome a mesma tarefa/chave/intenção;
+não lance outro filho porque a impressão final falhou. Até migrar uma instalação
+antiga, stdout em arquivo privado e stdin em PTY continua um workaround observado.
+
+## Admissão e manutenção
+
+Reservas persistentes de tarefas geridas e grants do scheduler compartilham o
+mesmo State e limite de provedor. A reserva precede lançamento, sobrevive a crash
+e resposta perdida e só é liberada por término/descendentes confirmados. Estado
+incerto mantém ocupação. `executor_slots` pode reservar um orçamento maior para
+uma tarefa; não aumenta o teto configurado. Consultas não reservam executor.
+
+Cobertura é cooperativa: filhos/revisores adicionais precisam ingressar pelo
+adapter. Chamadas diretas de delegação no T3 não são interceptadas. Portanto o
+valor `capacity.occupied` não é inventário global de todas as conversas T3. Sem
+admissão cruzada comprovada, o operador deve manter execução conservadora; nenhum
+hook ou alteração do host é instalado por este pacote.
+
+`maintenance.begin/status/end` são operações locais pelo socket, com operation_id
+e token. Begin exige quiescência e fecha admissão persistentemente; end confere
+ambos e reabre somente com estado ainda quiescente. Sem daemon, a interface oficial
+`oraculo.maintenance.maintenance_guard` toma os locks de daemon/ledger, valida o
+estado e mantém o bloqueio após sair do contexto. `end_maintenance` o encerra
+explicitamente. Desconhecido, processo ativo e schema futuro bloqueiam a troca.
+
+A reconciliação em segundo plano usa a mesma autoridade do serviço, serializada
+com sessões caller-bound. Ela finaliza threads independentes e reenvia retornos
+persistidos. Filhos nativos continuam exigindo `task_status` no contexto real da
+origem após o callback; o daemon não se passa pelo pai. Falhas/cancelamentos
+terminais com descendentes parados liberam a reserva e salvam o resultado de
+falha. Isso não satisfaz os gates de sucesso, publicação ou settlement.
+
+Ao abrir um ledger legado, o serviço identifica execuções ainda não terminais
+sem reserva correspondente. `capacity.available` fica zero e lista
+`untracked_managed_tasks`; scheduler e novos pedidos ficam bloqueados por
+`managed_legacy_execution_requires_reconciliation`. Não se inventa ocupação
+observada. A origem deve reconciliar esses IDs com prova terminal real; só então
+a admissão reabre. Reiniciar não apaga esse bloqueio.
+
+Respostas do serviço mostram `admission` consultada na tabela de reservas atual;
+`admission_at_launch` conserva o recibo histórico da admissão. `not_reserved`
+significa ausência de reserva atual, não sucesso do executor. No ledger offline,
+a observação armazenada não substitui uma consulta de capacidade ao serviço.
+
+## Parecer negativo e recuperação anterior à migração
+
+`completed` no host significa que o agente terminou; não significa aprovação.
+Um relatório com checks válidos `failed`, `verdict: "FAIL"` ou resumo iniciado
+por `FAIL` registra `work_status=failed`. O ciclo de memória conserva a falha e
+seu recibo confirmado; a resposta permanece `blocked/work_not_successful` e não
+permite publicação, merge ou settlement. Sucesso exige todos os checks `passed`,
+execução original e atual válidas, descendentes concluídos e commit/worktree
+validados. Checks precisam ser uma lista não vazia de objetos com `command`
+textual não vazio e `status` exatamente `passed` ou `failed`; os campos opcionais
+são `result`, `proof` e `layer`. Metadados de revisão existentes são aceitos:
+`reviewed_public_head`, `public_base`, `pull_request`, `task_id`,
+`linked_implementation_task`, `origin`, `memory`, `findings`, `prior_findings`
+e `documentation_observations`. Esses campos preservam proveniência no relatório;
+não concedem aprovação nem ampliam o schema da memória. Outros campos desconhecidos
+no relatório/check ou verdict fora de `PASS`/`FAIL` bloqueiam. O relatório submetido
+e o ciclo são imutáveis.
+
+Uma instalação anterior pode ter um relatório negativo submetido, memória
+`failed/saved` já confirmada pelo serviço e ledger ainda `pending`, impedindo
+`migrate-legacy`. Para esse caso existe uma operação estreita, executada pela
+origem com o **código candidato revisado**, antes de parar o serviço antigo:
+
+```sh
+# arquivo privado de entrada, contendo somente o ID original
+printf '%s\n' '{"task_id":"task-ID-ORIGINAL"}' > /caminho/privado/reconcile.json
+/caminho/candidato/venv/bin/python -m oraculo --config /caminho/config.toml \
+  task reconcile-legacy-failure --file /caminho/privado/reconcile.json \
+  --stdio-host > /caminho/privado/reconcile.out
+```
+
+O agente da origem atende cada frame `ORACULO_HOST_CALL_V1` com a ferramenta
+nativa correspondente e devolve seu resultado real pelo ACK correlacionado em
+stdin. `--transport-command` também aceita a ponte caller-bound já configurada.
+Não executar a ponte com identidades inventadas. O comando usa o thread atual da
+origem e a identidade original do ciclo; não exige que o run atual seja o antigo.
+
+A operação exige serviço legado vivo, lock do daemon ocupado, rejeição específica
+do protocolo gerido novo e resposta válida de `memory.cycle.status`. Exige banco
+principal schema 3 e ledger gerido schema 2, ambos existentes. Socket indisponível,
+timeout, resposta ambígua, schema diferente ou daemon novo bloqueiam. O lock
+`managed-tasks.lock` permanece exclusivo durante as verificações e atualização;
+não há abertura por `State`, migração de schema, novo ciclo ou escrita no vault.
+As operações geridas normais continuam exigindo `managed_service_upgrade_required`
+contra serviço antigo; não há adapter offline geral.
+
+Somente a origem/projeto originais podem reconciliar. O ciclo precisa corresponder
+à chave derivada da tarefa e identidade original, estar `failed/saved` e conter
+recibo `confirmed` correlacionado. O digest do relatório canônico do serviço é
+comparado à reconstrução com o relatório submetido e os metadados consultados.
+Não se aceitam arquivo de recibo, novo relatório, status escolhido pelo operador,
+resultado positivo ou tarefa com publicação tentada. Como o serviço antigo não
+preservava `verdict`, o conteúdo canônico retido deve comprovar a reprovação por
+check `failed` ou resumo iniciado por `FAIL`. Um `verdict: "FAIL"` isolado não
+autoriza recuperação; relatório e metadados originais permanecem intactos.
+Se a memória não estiver confirmada, a origem precisa resolver o ciclo original
+pela interface legada antes; este comando não o reescreve.
+
+O binding/worktree, run original, estado atual e descendentes são consultados
+novamente imediatamente antes da atualização condicional. A cobertura de filhos
+é a visibilidade do projeto no host, sem lock atômico remoto contra novas entradas;
+manter a janela cooperativa sem novas execuções. A gravação altera somente a tarefa
+e acrescenta seu evento/outbox. Relatórios, eventos anteriores, memória e schemas
+são preservados. O JSON final `reconciliation: "confirmed"` indica registro da
+falha; **exit 1 e `work_not_successful` são esperados**, não aprovação do candidato.
+`pending_reconciliation_returns` indica ACK ainda pendente. Repetir exatamente o
+mesmo comando revalida as fontes e reenvia o mesmo evento sem duplicá-lo. Após
+schema 4, esse comando deixa de ser aplicável. Só então continuar o procedimento
+de quiescência e migração; reconciliar uma tarefa não certifica quiescência global.

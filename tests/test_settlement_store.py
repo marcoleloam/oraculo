@@ -57,7 +57,7 @@ def test_additive_migration_preserves_legacy_live_grant(prepared):
     versions = state.connection.execute(
         "SELECT version FROM schema_migrations"
     ).fetchall()
-    assert [r[0] for r in versions] == [1, 2, 3]
+    assert [r[0] for r in versions] == [1, 2, 3, 4]
 
 
 def test_binding_is_idempotent_and_detached_from_callers(prepared):

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import tomllib
 from pathlib import Path
 from typing import Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -28,6 +36,7 @@ class MemoryConfig(StrictModel):
 
 
 class Config(StrictModel):
+    _loaded_sha256: str | None = PrivateAttr(default=None)
     schema_version: Literal[1] = 1
     projects_root: Path = Path.home() / "projects/work"
     # None preserves root-based discovery; [] authorizes no project.
@@ -126,8 +135,10 @@ class Config(StrictModel):
 
     @classmethod
     def load(cls, path: Path | str) -> Config:
-        with Path(path).expanduser().open("rb") as stream:
-            return cls.model_validate(tomllib.load(stream))
+        raw = Path(path).expanduser().read_bytes()
+        config = cls.model_validate(tomllib.loads(raw.decode("utf-8")))
+        config._loaded_sha256 = hashlib.sha256(raw).hexdigest()
+        return config
 
 
 def load_config(path: Path | str) -> Config:

@@ -55,4 +55,6 @@ async def running_service(service_config):
     )
     async with server:
         yield service
+    if service.managed_service is not None:
+        service.managed_service.close()
     service.state.close()

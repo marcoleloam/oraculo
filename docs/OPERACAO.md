@@ -4,15 +4,27 @@ Este guia descreve a implementação do checkout. A instalação e os cenários 
 
 ## Configuração e instalação
 
-Use macOS, Python 3.12, `uv`, Git e um T3 acessível por MCP. O LaunchAgent funciona na sessão do usuário enquanto o Mac estiver ligado e acordado. O runtime é o Python absoluto da `.venv` deste checkout: mover ou apagar o checkout exige reinstalar o LaunchAgent.
+Use macOS, Python 3.12, `uv`, Git e um T3 acessível por MCP. O LaunchAgent funciona na sessão do usuário enquanto o Mac estiver ligado e acordado. O launcher instalado usa o Python absoluto de uma release verificada em
+`~/.local/share/oraculo/releases`, selecionada por `current`. Siga
+[Instalação e manutenção](INSTALACAO.md) para construir o bundle, instalar,
+ativar e recuperar; o daemon instalado não depende de manter o checkout.
+
+Para uma instalação existente, siga diretamente o upgrade ou a migração legada
+em [INSTALACAO.md](INSTALACAO.md). Não execute `init` para atualizar estado.
+Para uma instalação **nova**, após instalar e selecionar a release:
 
 ```bash
-uv sync --locked --python 3.12
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" init
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" doctor
+oraculo --config "$HOME/.config/oraculo/config.toml" init
+oraculo --config "$HOME/.config/oraculo/config.toml" doctor
 ```
 
-`init` cria a configuração quando ausente e inicializa estado e vault. Leia [config/oraculo.example.toml](../config/oraculo.example.toml). `--config` fica **antes** do subcomando em todos os comandos CLI. Os exemplos seguintes usam o caminho padrão; IDs em maiúsculas são valores a substituir pelo resultado real.
+`init` cria a configuração quando ausente e inicializa estado e vault sob locks
+exclusivos. Recusa banco, ledger ou socket existentes, inclusive links quebrados;
+não migra bancos nem substitui o procedimento de manutenção. Se uma inicialização
+parcial deixou estado, preserve-o e diagnostique a falha antes de recuperar.
+Leia [config/oraculo.example.toml](../config/oraculo.example.toml). `--config` fica
+**antes** do subcomando. Os exemplos seguintes usam o caminho padrão; IDs em
+maiúsculas devem ser substituídos pelos valores observados.
 
 Os padrões são:
 
@@ -38,28 +50,33 @@ Perfis padrão: implementação/testes preferem Codex, arquitetura prefere Claud
 
 O Oráculo registra seu próprio cliente OAuth, guarda credenciais no Keychain e usa callback local na porta 8769. Pare o serviço antes de login ou atualização do ambiente. Não copie tokens do T3 ou do plugin para arquivos de configuração.
 
-```bash
-./scripts/install-service.sh --dry-run
-./scripts/install-service.sh --install
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" auth login
-./scripts/install-service.sh --start
-./scripts/install-service.sh --status
-```
-
-Sem argumentos, o script faz somente dry-run de instalação. `--install` sincroniza o lockfile, inicializa dados ausentes e gera `~/Library/LaunchAgents/local.oraculo.plist`; não inicia nem autentica. `--start` executa o diagnóstico local e carrega o LaunchAgent. Esse diagnóstico não comprova login nem cota. O serviço começa a descobrir e executar trabalho quando há provedores elegíveis e conexão disponível.
+Depois da instalação e configuração descritas acima:
 
 ```bash
-./scripts/install-service.sh --stop
-./scripts/install-service.sh --uninstall --dry-run
+oraculo auth login
+oraculo doctor
+oraculo service start
+oraculo service status
 ```
 
-`--stop` descarrega o LaunchAgent e seu reinício automático. Não equivale ao cancelamento dos agentes remotos. `--uninstall` remove somente o LaunchAgent, preservando vault, estado, configuração, credenciais, ambiente e logs. Para configuração em outro caminho, use a variável `ORACULO_CONFIG` com caminho absoluto ao instalar/iniciar; mudar esse caminho exige reinstalação com serviço parado.
-
-Para diagnóstico em primeiro plano, com o LaunchAgent parado:
+O serviço começa a descobrir e executar trabalho quando há provedores elegíveis
+e conexão disponível. O diagnóstico local não comprova login, cota ou conectividade.
 
 ```bash
-uv run --frozen oraculo --config "$HOME/.config/oraculo/config.toml" serve
+oraculo service stop
+oraculo service uninstall --dry-run
 ```
+
+A parada exige quiescência e confirma término do job, PID e socket; não cancela
+agentes remotos. Uninstall remove apenas o serviço administrado e preserva dados.
+O wrapper `scripts/install-service.sh` encaminha operações ao CLI instalado;
+sem argumentos consulta status. Ele não oferece `--install`. Para um plist legado
+sem ownership, siga a parada específica e migração de [INSTALACAO.md](INSTALACAO.md),
+sem contornar a validação do controlador novo.
+
+Para diagnóstico em primeiro plano, somente após confirmar o LaunchAgent parado,
+use o CLI da release selecionada com `oraculo serve`. Não execute uma versão nova
+contra um estado legado antes da migração oficial.
 
 ## Objetivos e status
 
@@ -309,3 +326,62 @@ já admitidos. Escritas conflitantes continuam serializadas.
 
 O [encerramento verificado](ENCERRAMENTO.md) distingue PR aberto, merge observado,
 memória confirmada e conversa fechada. Merge não comprova implantação.
+
+## Instalação, ativação e rollback
+
+Código validado e release instalada são evidências distintas da versão ativa.
+`runtime install`/`upgrade` preparam arquivos; `runtime activate` seleciona a
+release. Uma primeira seleção não inicia o serviço. Use `service start` quando
+configuração e credenciais estiverem prontas. Operações sobre serviço já ativo
+exigem quiescência e fecham admissão durante a troca.
+
+```sh
+oraculo status
+oraculo capacity
+oraculo runtime status
+oraculo service status
+oraculo runtime upgrade --bundle /caminho/bundle --dry-run
+oraculo runtime upgrade --bundle /caminho/bundle
+oraculo runtime activate RELEASE --dry-run
+oraculo runtime activate RELEASE
+oraculo service status
+oraculo capacity
+```
+
+`status.runtime` identifica PID, release, caminho/hash da configuração carregada
+e protocolo. Alterar o TOML não muda a configuração já carregada: divergência
+com o arquivo bloqueia confirmação de identidade. `service status` exige PID e
+socket correspondentes; loaded não equivale a online. `doctor` aceita `--root`,
+`--bin-dir`, `--label`, `--plist-dir`, `--provider` e `--skill-root` para identificar
+os alvos de ensaios isolados. A configuração é sempre opção global `--config`.
+
+`maintenance.begin` fecha admissão e devolve operation_id/token somente após
+provar quiescência. Trabalho ativo/incerto, operação de memória ou sessão gerida
+em andamento bloqueia a manutenção. `maintenance.end` exige a mesma operação e
+token. O caminho offline oficial adquire o lock do daemon e do ledger; nunca
+abra outro escritor sobre um serviço vivo. `capacity --set 1` reduz concorrência,
+mas não substitui manutenção nem fecha toda a admissão.
+
+Sem socket disponível, `task list/status/history` abre o ledger existente em
+modo somente leitura e identifica `source=local_ledger`. Essa consulta não cria
+banco nem executa migrações de schema, mesmo que outro processo detenha a escrita.
+Ledger ausente, incompatível ou ilegível produz erro explícito.
+
+A parada aguarda remoção de launchd, término do PID anterior e desaparecimento
+do socket com prazo finito. Timeout exige recuperação; não use sleep fixo como
+prova, nem apague socket/recibos para forçar bootstrap. Journals de runtime e
+serviço ficam privados no root de instalação. Preserve-os após falha.
+
+Para rollback, use `runtime rollback --dry-run` e `runtime rollback` conforme o
+procedimento de recuperação em [INSTALACAO.md](INSTALACAO.md). O código anterior
+precisa aceitar o schema atual. Não restaure SQLite antigo sobre execuções ou
+efeitos posteriores; capacidade, IDs e recibos devem permanecer preservados.
+Instalações legadas sem manifesto precisam da migração explícita documentada;
+não ganham integridade verificável só por receber um manifesto novo.
+
+Admissão compartilhada cobre scheduler e tarefas que entram pelo adapter. A
+capacidade do daemon não prova contagem de filhos lançados diretamente no host.
+Sem recibos dessa contagem, conserve execução serial e trate a expansão paralela
+como bloqueada; não aumente a capacidade nem alegue enforcement global. Skill e
+templates são cooperativos, e suporte por provedor depende da matriz de provas
+em [SKILLS.md](SKILLS.md).

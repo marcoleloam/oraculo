@@ -685,7 +685,7 @@ async def test_pr_memory_failure_preserves_pr_and_retry_does_not_duplicate(
     assert github.created == 1
 
 
-@pytest.mark.parametrize("invalid", ["commit", "dirty", "checks"])
+@pytest.mark.parametrize("invalid", ["commit", "dirty"])
 async def test_finish_requires_actual_clean_validated_commit(system, invalid):
     task = await start(system)
     system.host.complete(task["child"]["childThreadId"])
@@ -694,19 +694,13 @@ async def test_finish_requires_actual_clean_validated_commit(system, invalid):
         evidence["commit"] = "f" * 40
     elif invalid == "dirty":
         (Path(task["child_workspace"]["path"]) / "uncommitted").write_text("unfinished")
-    else:
-        evidence["checks"] = [{"command": "pytest", "status": "failed"}]
     rejected = await system.engine.command(
         "finish", {"task_id": task["id"], "report": evidence}
     )
     assert rejected["phase"] == "blocked"
     assert rejected["work_status"] == "pending"
     assert rejected["memory"]["write_state"] == "not_requested"
-    assert rejected["blocked_reason"] == (
-        "passing_validation_evidence_required"
-        if invalid == "checks"
-        else "validated_commit_or_clean_workspace_required"
-    )
+    assert rejected["blocked_reason"] == "validated_commit_or_clean_workspace_required"
 
 
 async def test_active_child_report_is_submitted_without_faking_terminal_success(system):
@@ -888,3 +882,194 @@ async def test_service_background_reconciliation_does_not_block_socket(
         if service.managed_flush is not None:
             await asyncio.wait_for(service.managed_flush, timeout=2)
     assert released == [True]
+
+
+@pytest.mark.parametrize("negative", ["checks", "verdict", "summary"])
+async def test_completed_negative_review_saves_failed_memory_without_publication(
+    system, negative
+):
+    task = await start(system)
+    evidence = report(task)
+    if negative == "checks":
+        evidence["checks"][0]["status"] = "failed"
+    elif negative == "verdict":
+        evidence["verdict"] = "FAIL"
+    else:
+        evidence["summary"] = "FAIL — candidate rejected"
+    system.host.caller = task["child"]["childThreadId"]
+    await system.engine.command("finish", {"task_id": task["id"], "report": evidence})
+    system.host.caller = "origin"
+    system.host.complete(task["child"]["childThreadId"])
+    result = await system.engine.command("resume", {"task_id": task["id"]})
+    assert result["blocked_reason"] == "work_not_successful"
+    assert result["work_status"] == "failed"
+    assert system.engine._saved(result["memory"])
+    assert result["publication"] is None
+    canonical = system.service.memory_cycles.get(result["memory"]["id"])
+    assert canonical["report"]["evidence"] == evidence
+    original_cycle = copy.deepcopy(result["memory"])
+    replay = await system.engine.command("resume", {"task_id": task["id"]})
+    assert replay["memory"]["write_receipt"] == original_cycle["write_receipt"]
+    assert system.store.get(task["id"])["report"] == evidence
+    publication = await system.engine.command(
+        "publish", {"task_id": task["id"], "publication": {}}
+    )
+    assert publication["blocked_reason"] == "work_and_memory_required_before_pr"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        {},
+        [],
+        "passed",
+        ["passed"],
+        [{"command": "pytest", "status": "skip"}],
+        [{"command": 1, "status": "passed"}],
+        [{"command": " ", "status": "passed"}],
+        [{"command": "pytest", "status": "passed", "verdict": "FAIL"}],
+    ],
+)
+async def test_malformed_checks_block_memory(system, bad):
+    task = await start(system)
+    system.host.complete(task["child"]["childThreadId"])
+    evidence = report(task)
+    evidence["checks"] = bad
+    result = await system.engine.command(
+        "finish", {"task_id": task["id"], "report": evidence}
+    )
+    assert result["phase"] == "blocked"
+    assert result["work_status"] == "pending"
+    assert result["memory"]["write_state"] == "not_requested"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"verdict": "UNKNOWN"}, {"status": "FAIL"}, {"summary": {}}, {"approved": True}],
+)
+async def test_unknown_report_fields_fail_closed(system, extra):
+    task = await start(system)
+    system.host.complete(task["child"]["childThreadId"])
+    result = await system.engine.command(
+        "finish", {"task_id": task["id"], "report": {**report(task), **extra}}
+    )
+    assert result["phase"] == "blocked"
+    assert result["work_status"] == "pending"
+    assert result["memory"]["write_state"] == "not_requested"
+
+
+@pytest.mark.parametrize("negative", [True, False])
+async def test_existing_review_provenance_does_not_change_validation(system, negative):
+    task = await start(system)
+    system.host.complete(task["child"]["childThreadId"])
+    evidence = report(task)
+    evidence.update(
+        reviewed_public_head="a" * 40,
+        public_base="b" * 40,
+        pull_request="https://github.com/example/project/pull/2",
+        findings=[],
+        prior_findings=[],
+        task_id=task["id"],
+        linked_implementation_task="prior-task",
+        origin={},
+        memory={},
+        documentation_observations=[],
+        verdict="FAIL" if negative else "PASS",
+    )
+    if negative:
+        evidence["checks"][0]["status"] = "failed"
+    result = await system.engine.command(
+        "finish", {"task_id": task["id"], "report": evidence}
+    )
+    assert result["work_status"] == ("failed" if negative else "succeeded")
+    assert result["memory"]["write_state"] == "saved"
+    assert system.store.get(task["id"])["report"] == evidence
+
+
+async def test_negative_report_memory_failure_and_lost_ack_are_honest(
+    system, monkeypatch
+):
+    task = await start(system)
+    system.host.complete(task["child"]["childThreadId"])
+    evidence = report(task)
+    evidence["checks"][0]["status"] = "failed"
+    finish = system.memory.finish
+
+    async def unavailable(*args):
+        raise TimeoutError()
+
+    monkeypatch.setattr(system.memory, "finish", unavailable)
+    result = await system.engine.command(
+        "finish", {"task_id": task["id"], "report": evidence}
+    )
+    assert result["work_status"] == "failed"
+    assert not system.engine._saved(result["memory"])
+    monkeypatch.setattr(system.memory, "finish", finish)
+    system.host.fail_send_once = True
+    result = await system.engine.command("resume", {"task_id": task["id"]})
+    assert result["blocked_reason"] == "work_not_successful"
+    assert system.engine._saved(result["memory"])
+    assert result["pending_returns"] > 0
+    result = await system.engine.command("status", {"task_id": task["id"]})
+    assert result["pending_returns"] == 0
+
+
+async def test_submitted_report_cannot_be_replaced_by_origin(system):
+    task = await start(system)
+    evidence = report(task)
+    evidence["checks"][0]["status"] = "failed"
+    system.host.caller = task["child"]["childThreadId"]
+    await system.engine.command("finish", {"task_id": task["id"], "report": evidence})
+    system.host.caller = "origin"
+    system.host.complete(task["child"]["childThreadId"])
+    result = await system.engine.command(
+        "finish", {"task_id": task["id"], "report": report(task)}
+    )
+    assert result["blocked_reason"] == "terminal_report_reused"
+    assert result["work_status"] == "pending"
+
+
+async def test_explicit_fail_cannot_publish_with_legacy_success_marker(system):
+    task, spec, github = await publication_setup(system)
+    saved = system.store.get(task["id"])
+    system.store.update(
+        task["id"],
+        "pr_pending",
+        {"test": "legacy inconsistent marker"},
+        report={**saved["report"], "verdict": "FAIL"},
+    )
+    result = await system.engine.command(
+        "publish", {"task_id": task["id"], "publication": spec}
+    )
+    assert result["blocked_reason"] == "work_not_successful"
+    assert github.created == 0
+
+
+@pytest.mark.parametrize("current", ["failed", "failed_descendant"])
+async def test_completed_native_snapshot_cannot_certify_current_failure(
+    system, current
+):
+    task = await start(system)
+    child_id = task["child"]["childThreadId"]
+    system.host.complete(child_id)
+    if current == "failed":
+        system.host.threads[child_id]["status"] = "failed"
+    else:
+        system.host.threads["failed-review"] = {
+            "threadId": "failed-review",
+            "projectId": "alpha",
+            "parentThreadId": child_id,
+            "status": "failed",
+            "activeRunId": None,
+            "latestRunId": "failed-review-run",
+            "pendingRequestCount": 0,
+            "title": "Failed review",
+        }
+    result = await system.engine.command(
+        "finish", {"task_id": task["id"], "report": report(task)}
+    )
+    assert result["phase"] == "blocked"
+    assert result["work_status"] == "pending"
+    assert result["memory"]["write_state"] == "not_requested"
+    assert result["publication"] is None

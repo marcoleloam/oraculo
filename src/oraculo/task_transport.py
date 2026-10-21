@@ -152,8 +152,7 @@ class StdioHostTransport:
 
         self.reader = reader or sys.stdin
         self.writer = writer or sys.stdout
-        self.stream = None
-        self.pipe = None
+        self.terminal = None
         # PTY canonical mode truncates long JSON acknowledgements. This adapter
         # owns its interactive terminal while active; restore it at process exit.
         if getattr(self.reader, "isatty", lambda: False)():
@@ -164,13 +163,27 @@ class StdioHostTransport:
             fd = self.reader.fileno()
             previous = termios.tcgetattr(fd)
             tty.setraw(fd)
-            atexit.register(termios.tcsetattr, fd, termios.TCSADRAIN, previous)
+            self.terminal = (fd, previous)
+            atexit.register(self.close)
+
+    def close(self):
+        if self.terminal:
+            import termios
+
+            fd, previous = self.terminal
+            self.terminal = None
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, previous)
+            except (OSError, termios.error):
+                pass
 
     async def call(self, name: str, arguments: dict) -> dict:
         import uuid
 
         request_id = uuid.uuid4().hex
-        self.writer.write(
+        from oraculo.stdio import read_line, write_async
+
+        await write_async(
             canonical_json(
                 {
                     "marker": "ORACULO_HOST_CALL_V1",
@@ -179,22 +192,10 @@ class StdioHostTransport:
                     "arguments": arguments,
                 }
             )
-            + "\n"
+            + "\n",
+            self.writer,
         )
-        self.writer.flush()
-        try:
-            self.reader.fileno()
-        except (AttributeError, OSError):
-            raw = self.reader.readline()  # In-memory test bridge only.
-        else:
-            if self.stream is None:
-                self.stream = asyncio.StreamReader(limit=4 * 1024 * 1024)
-                protocol = asyncio.StreamReaderProtocol(self.stream)
-                self.pipe, _ = await asyncio.get_running_loop().connect_read_pipe(
-                    lambda: protocol, self.reader
-                )
-            async with asyncio.timeout(60):
-                raw = await self.stream.readline()
+        raw = await read_line(self.reader)
         try:
             ack = json.loads(raw)
         except (TypeError, ValueError):
