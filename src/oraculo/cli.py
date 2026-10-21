@@ -148,6 +148,7 @@ def parser() -> argparse.ArgumentParser:
         choices=[
             "start",
             "resume",
+            "cancel",
             "status",
             "list",
             "history",
@@ -504,9 +505,33 @@ def main(argv: list[str] | None = None) -> int:
                         if args.stdio_host:
                             transport.close()
                 # Never mutate the ledger locally after negotiating service authority.
-                capabilities = asyncio.run(
-                    request(config, make_envelope("managed.capabilities", "*", {}))
-                )
+                try:
+                    capabilities = asyncio.run(
+                        request(config, make_envelope("managed.capabilities", "*", {}))
+                    )
+                except (OSError, TimeoutError):
+                    if args.action != "cancel":
+                        raise
+                    # No daemon answers. Cancelling an unlaunched reservation is the
+                    # one mutation allowed offline, under the daemon and ledger locks.
+                    from oraculo.managed_offline import cancel as offline_cancel
+
+                    transport = (
+                        StdioHostTransport()
+                        if args.stdio_host
+                        else CommandTransport(
+                            json.loads(args.transport_command.read_text())
+                            if args.transport_command
+                            else None
+                        )
+                    )
+                    try:
+                        result = asyncio.run(offline_cancel(config, payload, transport))
+                        print_json(result)
+                        return 1 if result.get("phase") == "blocked" else 0
+                    finally:
+                        if args.stdio_host:
+                            transport.close()
                 if (
                     not capabilities.get("ok")
                     or capabilities.get("data", {}).get("protocol_version") != 1

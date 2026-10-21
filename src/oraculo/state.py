@@ -460,6 +460,20 @@ class State:
                 "DELETE FROM managed_reservations WHERE id=?", (task_id,)
             )
 
+    def release_unlaunched(self, task_id: str, proof: dict) -> dict[str, Any]:
+        """Drop a reservation after the origin proved no child ever launched."""
+        if proof.get("child_bound") is not False or proof.get("catalog_matches") != 0:
+            raise StateError("managed_cancel_proof_required")
+        with self.transaction():
+            row = self._one("SELECT * FROM managed_reservations WHERE id=?", (task_id,))
+            if row and row["state"] != "reserved":
+                raise StateError("managed_reservation_executing")
+            self.audit("managed.cancel", {"task_id": task_id, "proof": proof})
+            self.connection.execute(
+                "DELETE FROM managed_reservations WHERE id=?", (task_id,)
+            )
+            return {"released": bool(row), "capacity": self.capacity()}
+
     def set_capacity(self, maximum: int) -> dict[str, Any]:
         if type(maximum) is not int or not 1 <= maximum <= self.max_executors:
             raise StateError("capacity_outside_configured_ceiling")

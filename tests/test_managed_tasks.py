@@ -19,7 +19,7 @@ from test_service import command as service_command
 
 from oraculo.managed_tasks import ManagedTasks
 from oraculo.publication import GitHubPublisher, command_runner
-from oraculo.state import DedupeConflict
+from oraculo.state import DedupeConflict, State, StateError
 from oraculo.task_store import TaskStore
 from oraculo.task_transport import SocketMemory
 
@@ -1073,3 +1073,122 @@ async def test_completed_native_snapshot_cannot_certify_current_failure(
     assert result["work_status"] == "pending"
     assert result["memory"]["write_state"] == "not_requested"
     assert result["publication"] is None
+
+
+async def test_cancel_releases_unlaunched_reservation_only_without_candidate(system):
+    system.engine.admission = system.service.state
+    system.host.fail_launch_once = True
+    target = {"providerInstanceId": "codex"}
+    first = await start(system, independent=True, target=target)
+    assert first["phase"] == "blocked" and first["launch_attempted"] is True
+    assert system.service.state.capacity()["occupied"] == 1
+    system.host.list_visible = True
+    refused = await system.engine.command("cancel", {"task_id": first["id"]})
+    assert refused["blocked_reason"] == "managed_cancel_candidate_child_exists_resume"
+    assert system.service.state.capacity()["occupied"] == 1
+    # The host catalog proves the lost launch never created a conversation.
+    system.host.threads = {"origin": system.host.threads["origin"]}
+    cancelled = await system.engine.command("cancel", {"task_id": first["id"]})
+    assert cancelled["phase"] == "cancelled", cancelled
+    assert cancelled["work_status"] == "cancelled"
+    assert cancelled["events"][-1]["proof"]["released"]["released"] is True
+    assert system.service.state.capacity()["occupied"] == 0
+    audits = [
+        json.loads(r[0])
+        for r in system.service.state.connection.execute(
+            "SELECT payload FROM audit_events WHERE kind='managed.cancel'"
+        )
+    ]
+    assert audits and audits[0]["task_id"] == first["id"]
+    resumed = await system.engine.command("resume", {"task_id": first["id"]})
+    assert resumed["blocked_reason"] == "managed_task_cancelled"
+    assert len([1 for n, _ in system.host.calls if n == "t3_thread_launch"]) == 1
+    assert system.service.state.capacity()["occupied"] == 0
+    await system.engine.reconcile(first["id"])
+    assert system.store.get(first["id"])["work_status"] == "cancelled"
+
+
+async def test_cancel_requires_origin_and_refuses_bound_child(system):
+    system.engine.admission = system.service.state
+    target = {"providerInstanceId": "codex"}
+    task = await start(system, target=target)
+    assert task["child"]
+    refused = await system.engine.command("cancel", {"task_id": task["id"]})
+    assert refused["blocked_reason"] == "managed_cancel_child_bound_use_finish"
+    system.service.config.max_executors = 2
+    system.service.state.max_executors = 2
+    system.host.fail_delegate_once = True
+    system.host.caller = "origin"
+    await start(system, key="second", target=target)
+    second = [
+        system.store.get(r[0])
+        for r in system.store.db.execute("SELECT id FROM managed_tasks")
+    ]
+    pending = next(t for t in second if t["request"]["key"] == "second")
+    assert pending.get("child") is None and pending["launch_attempted"] is True
+    system.host.threads["intruder"] = dict(
+        system.host.threads["origin"], threadId="intruder", activeRunId="x"
+    )
+    system.host.caller = "intruder"
+    with pytest.raises(StateError, match="managed_task_origin_mismatch"):
+        await system.engine.command("cancel", {"task_id": pending["id"]})
+    assert system.service.state.capacity()["occupied"] >= 1
+
+
+async def test_offline_cancel_releases_reservation_only_without_daemon(
+    service_config,
+):
+    from oraculo.managed_offline import cancel as offline_cancel
+    from oraculo.service import Singleton
+
+    config, _ = service_config
+    initialize(config.projects_root / "alpha")
+    state = State(config.db_path, max_executors=1)
+    state.register_project("alpha", str(config.projects_root / "alpha"))
+    store = TaskStore(config.state_dir / "managed-tasks.sqlite3")
+    host = Host(config.projects_root)
+
+    class Memory:
+        async def begin(self, project, actor, key, query):
+            cycle = {
+                "id": "cycle-offline",
+                "project_id": project,
+                "read_state": "empty",
+                "read_receipt": {"sources": []},
+                "write_state": "not_requested",
+            }
+            return {"cycle": cycle, "pages": []}
+
+    try:
+        engine = ManagedTasks(config, store, host, Memory(), admission=state)
+        host.fail_launch_once = True
+        task = await engine.command(
+            "start",
+            {
+                "kind": "work",
+                "key": "offline",
+                "cwd": str(config.projects_root / "alpha"),
+                "text": "Bounded offline example.",
+                "title": "Offline example",
+                "independent": True,
+                "target": {"providerInstanceId": "codex"},
+            },
+        )
+        assert task["phase"] == "blocked" and task["launch_attempted"] is True
+        assert state.capacity()["occupied"] == 1
+    finally:
+        store.close()
+        state.close()
+    with Singleton(config.state_dir):
+        with pytest.raises(StateError, match="live_service_use_socket"):
+            await offline_cancel(config, {"task_id": task["id"]}, host)
+    host.list_visible = False
+    result = await offline_cancel(config, {"task_id": task["id"]}, host)
+    assert result["phase"] == "cancelled" and result["source"] == "offline_ledger"
+    reopened = State(config.db_path, max_executors=1)
+    try:
+        assert reopened.capacity()["occupied"] == 0
+    finally:
+        reopened.close()
+    with pytest.raises(StateError, match="task_id_only"):
+        await offline_cancel(config, {"task_id": task["id"], "x": 1}, host)

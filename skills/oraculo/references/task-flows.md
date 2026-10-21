@@ -27,6 +27,14 @@ file contains `{"task_id":"returned-id"}`; `list` requires no payload. If the
 request is already bound, inspect it before doing anything else. Same key with
 different content is a conflict, not permission to choose another key.
 
+Use `cancel` with `{"task_id": ...}` only from the origin, for a task that never
+bound a child (lost launch response, unresolved reconciliation). The adapter
+rechecks the host catalog first; a visible candidate thread refuses the cancel
+and requires `resume`. A cancelled task frees its reservation and is never
+relaunched. A task with a bound child is closed through finish, not cancel.
+When no daemon answers the socket, `cancel` runs offline under the daemon and
+ledger locks and reports `source: offline_ledger`; a live service refuses it.
+
 For `continue`, send `task_id`, `key` (stable key of this steering message) and
 `text`. The task and executor remain the existing ones. For a returned native
 child, the origin uses `resume`; it does not send a second delegated review to the
