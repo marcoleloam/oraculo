@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import pty
+import secrets
 import select
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import time
 
 import pytest
 
+from oraculo.host_ack import make_ack
 from oraculo.state import StateError
 from oraculo.stdio import write_async, write_text
 
@@ -94,10 +96,16 @@ asyncio.run(main())
             assert frame["arguments"] == {"large": "á" * 150000, "sequence": i}
             raw = (
                 json.dumps(
-                    {
-                        "request_id": frame["request_id"],
-                        "result": {"ack": "ü" * 100000},
-                    },
+                    make_ack(
+                        frame,
+                        json.dumps(
+                            {
+                                "ack": "ü" * 100000,
+                                "incompressible": secrets.token_hex(100000),
+                            },
+                            ensure_ascii=False,
+                        ).encode(),
+                    ),
                     ensure_ascii=False,
                 )
                 + "\n"

@@ -19,6 +19,7 @@ import pytest
 from test_managed_tasks import report, start
 from test_managed_tasks import system as system_fixture
 
+from oraculo.host_ack import make_ack
 from oraculo.legacy_failure import reconcile
 from oraculo.maintenance import check_legacy_tasks
 from oraculo.protocol import canonical_json
@@ -458,7 +459,7 @@ async def test_cli_stdio_command_reports_confirmed_failure_exit_one(legacy, tmp_
                     process.stdin.write(
                         (
                             canonical_json(
-                                {"request_id": item["request_id"], "result": response}
+                                make_ack(item, json.dumps(response).encode())
                             )
                             + "\n"
                         ).encode()

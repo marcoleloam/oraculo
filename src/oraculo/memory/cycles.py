@@ -50,6 +50,28 @@ REPORT_FIELDS = frozenset(
 )
 
 
+def report_projection(evidence):
+    """The exact retained evidence, UTF-8 bytes and size/shape rejection.
+
+    Pure so managed submissions can reject before freezing their report.
+    Keep MemoryCycles' existing rejection receipt behavior for direct callers.
+    """
+    selected = (
+        {key: value for key, value in evidence.items() if key in REPORT_FIELDS}
+        if isinstance(evidence, dict)
+        else evidence
+    )
+    serialized = _json(selected).encode()
+    rejection = (
+        "memory_report_must_be_structured"
+        if not isinstance(evidence, dict)
+        else "memory_report_too_large"
+        if len(serialized) > 256 * 1024
+        else None
+    )
+    return selected, serialized, rejection
+
+
 class MemoryCycles:
     def __init__(self, state: State, publisher: Publisher | None) -> None:
         self.state = state
@@ -301,19 +323,7 @@ class MemoryCycles:
     def finish(self, cycle_id: str, status: str, evidence: dict) -> dict:
         if status not in {"succeeded", "failed", "stopped"}:
             raise MemoryError("invalid_memory_work_status")
-        selected = (
-            {key: value for key, value in evidence.items() if key in REPORT_FIELDS}
-            if isinstance(evidence, dict)
-            else evidence
-        )
-        serialized = _json(selected).encode()
-        rejection = (
-            "memory_report_must_be_structured"
-            if not isinstance(evidence, dict)
-            else "memory_report_too_large"
-            if len(serialized) > 256 * 1024
-            else None
-        )
+        selected, serialized, rejection = report_projection(evidence)
         with self.state.transaction():
             item = self.get(cycle_id)
             if "report" in item:

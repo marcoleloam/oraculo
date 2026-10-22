@@ -172,6 +172,11 @@ class Service:
         if lease:
             lease = dict(lease, attempt=self.state.get_attempt(lease["attempt_id"]))
         return {
+            "managed_adapter": (
+                self.managed_service.diagnostic()
+                if self.managed_service
+                else {"state": "idle", "busy": False}
+            ),
             "runtime": {
                 "pid": os.getpid(),
                 "release_id": os.environ.get("ORACULO_RELEASE_ID"),
@@ -938,6 +943,7 @@ class Service:
                     "authority": "service",
                     "coverage": "cooperative",
                     "global_host_enforcement": False,
+                    "invalid_report_recovery": True,
                 }
             else:
                 if self.managed_service is None:
@@ -1067,6 +1073,16 @@ class Service:
     async def connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        try:
+            await self._connection(reader, writer)
+        finally:
+            # Cancellation also closes the socket. It must not bypass cleanup
+            # before the ordinary response-writing block is reached.
+            from oraculo.managed_service import close_writer
+
+            await close_writer(writer)
+
+    async def _connection(self, reader, writer):
         request_id = "unknown"
         try:
             async with asyncio.timeout(5):
@@ -1098,17 +1114,15 @@ class Service:
                     "retryable": False,
                 },
             }
+            if str(exc) == "managed_adapter_busy_retry_same_key":
+                response["error"]["retryable"] = True
+                response["error"]["adapter"] = self.managed_service.diagnostic()
         try:
-            writer.write(canonical_json(response).encode() + b"\n")
-            await writer.drain()
-        except (ConnectionError, OSError):
+            async with asyncio.timeout(5):
+                writer.write(canonical_json(response).encode() + b"\n")
+                await writer.drain()
+        except (OSError, TimeoutError):
             pass
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except (ConnectionError, OSError):
-                pass
 
     def prompt(self, name: str) -> str:
         path = resources_root() / "prompts" / f"{name}.md"
@@ -1598,7 +1612,7 @@ class Service:
         """Bounded background recovery; slow Git/GitHub never blocks admission."""
         if self.managed_flush is not None and not self.managed_flush.done():
             return
-        if self.managed_flush is not None:
+        if self.managed_flush is not None and not self.managed_flush.cancelled():
             try:
                 self.managed_flush.result()
             except Exception as exc:
@@ -1616,21 +1630,36 @@ class Service:
         if self.managed_service.busy:
             return
         facade = self.managed_service
-        facade.busy = True
+        from oraculo.managed_service import BACKGROUND_HOST_TIMEOUT
+
+        facade.begin("background", uuid.uuid4().hex, action="reconcile")
         loop = asyncio.get_running_loop()
 
         class HostProxy:
+            failed = False
+
             async def call(self, name, arguments):
+                if self.failed:
+                    raise StateError("managed_background_host_uncertain")
+                facade.phase(
+                    "host_call", tool=name, timeout_seconds=BACKGROUND_HOST_TIMEOUT
+                )
                 future = asyncio.run_coroutine_threadsafe(
                     client.call(name, arguments), loop
                 )
-                return await asyncio.wrap_future(future)
+                try:
+                    async with asyncio.timeout(BACKGROUND_HOST_TIMEOUT):
+                        return await asyncio.wrap_future(future)
+                except TimeoutError:
+                    self.failed = True
+                    raise StateError("managed_background_host_timeout") from None
+                finally:
+                    facade.phase("adapter", tool=None, timeout_seconds=None)
 
         def reconcile_batch():
             from oraculo.managed_tasks import ManagedTasks
             from oraculo.publication import GitHubPublisher
             from oraculo.task_store import TaskStore
-            from oraculo.task_transport import SocketMemory
 
             store = admission = None
             try:
@@ -1644,11 +1673,12 @@ class Service:
                     max_executors=self.config.max_executors,
                     provider_limits=self.state.provider_limits,
                 )
+                host = HostProxy()
                 adapter = ManagedTasks(
                     self.config,
                     store,
-                    HostProxy(),
-                    SocketMemory(self.config),
+                    host,
+                    facade.memory(),
                     GitHubPublisher(),
                     admission=admission,
                 )
@@ -1661,28 +1691,49 @@ class Service:
                     store.state.set_meta("managed_reconcile_cursor", 0)
 
                 async def run_batch():
+                    last = cursor
                     for row in rows:
+                        facade.phase("adapter", task_id=row["id"])
                         try:
                             await adapter.reconcile(row["id"])
                         except Exception as exc:
                             self.log.warning(
                                 "managed_reconcile_failed:%s", type(exc).__name__
                             )
+                        last = row["rowid"]
+                        if host.failed:
+                            break
+                    return last
 
-                asyncio.run(run_batch())
+                last = asyncio.run(run_batch())
                 if rows:
-                    store.state.set_meta("managed_reconcile_cursor", rows[-1]["rowid"])
+                    store.state.set_meta("managed_reconcile_cursor", last)
             finally:
                 if store:
                     store.close()
                 if admission:
                     admission.close()
 
+        # Own the executor Future, not its cancellable asyncio waiter. Cancelling
+        # a to_thread waiter cannot stop SQLite/Git work already in that thread.
+        try:
+            worker = loop.run_in_executor(None, reconcile_batch)
+        except BaseException:
+            facade.end()
+            raise
+        facade.owner = facade.background_worker = worker
+
+        def completed(future):
+            facade.end()
+            if not future.cancelled() and future.exception():
+                self.log.warning(
+                    "managed_reconcile_failed:%s", type(future.exception()).__name__
+                )
+
+        worker.add_done_callback(completed)
+
         async def serialized_batch():
-            try:
-                await asyncio.to_thread(reconcile_batch)
-            finally:
-                facade.busy = False
+            await asyncio.shield(worker)
 
         self.managed_flush = asyncio.create_task(serialized_batch())
 
@@ -2018,6 +2069,11 @@ async def serve(config: Config, config_path: Path) -> None:
                 # Keep writer ownership until the worker has persisted its final
                 # observation; do not release the lock under a live thread.
                 await asyncio.gather(service.managed_flush, return_exceptions=True)
+            if service.managed_service and service.managed_service.background_worker:
+                await asyncio.gather(
+                    asyncio.shield(service.managed_service.background_worker),
+                    return_exceptions=True,
+                )
             if service.memory_flush is not None:
                 await asyncio.gather(service.memory_flush, return_exceptions=True)
             config.socket_path.unlink(missing_ok=True)

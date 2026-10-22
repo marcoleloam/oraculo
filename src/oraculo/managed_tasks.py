@@ -15,10 +15,15 @@ from pathlib import Path
 
 from oraculo.projects import resolve_project
 from oraculo.protocol import canonical_json, content_hash
+from oraculo.run_continuity import report_link, terminal_chain
 from oraculo.settlement import Settlements
 from oraculo.state import StateError
 from oraculo.t3.client import T3Client
 from oraculo.task_store import TaskStore
+
+
+class ReportValidationError(StateError):
+    """Correctable input/preflight failure; never persist a blocked transition."""
 
 
 def git(cwd: str | Path, *args: str) -> str:
@@ -154,6 +159,18 @@ class ManagedTasks:
             else:
                 task = self.store.get(payload["task_id"])
             task_id = task["id"]
+            if action == "finish":
+                if actor["thread_id"] not in {
+                    task["origin"]["thread_id"],
+                    (task.get("child") or {}).get("childThreadId"),
+                }:
+                    raise StateError("finish_requires_task_or_origin")
+                try:
+                    # Reject malformed content even before launch reconciliation,
+                    # scope/cancellation transitions or outbox retries.
+                    self._validate_report(task, payload.get("report"))
+                except ReportValidationError as exc:
+                    return self._report_rejection(task_id, str(exc))
             if (
                 not task.get("child")
                 and task.get("launch_attempted")
@@ -208,25 +225,31 @@ class ManagedTasks:
                         task["phase"],
                         {"progress": str(payload["message"])[:1000]},
                     )
+                elif action == "recover-report":
+                    await self._recover_report(task, payload, actor)
                 elif action == "finish":
-                    self._report_kind(task, payload["report"])
                     if actor["thread_id"] == (task.get("child") or {}).get(
                         "childThreadId"
                     ):
+                        await self._prevalidate_report(task, payload.get("report"))
                         # An executing task cannot certify its own terminal host run.
                         # Persist the report; the daemon/origin confirms after return.
-                        prior = task.get("submitted_report")
-                        if prior is not None and prior != payload["report"]:
-                            raise StateError("terminal_report_reused")
+                        for field in ("report", "submitted_report"):
+                            prior = task.get(field)
+                            if prior is not None and prior != payload["report"]:
+                                raise StateError("terminal_report_reused")
                         self.store.update(
                             task_id,
                             "validation_submitted",
-                            {"report_sha256": content_hash(payload["report"])},
+                            {
+                                "report_sha256": content_hash(payload["report"]),
+                                "submission": actor,
+                            },
                             submitted_report=payload["report"],
                             publication_request=payload.get("publication"),
                         )
                     else:
-                        await self._finish(task_id, payload["report"], actor)
+                        await self._finish(task_id, payload.get("report"), actor)
                 elif action in {"pr-check", "merge", "settle", "unwatch"}:
                     if task.get("deliverable_kind") == "plan":
                         raise StateError("plan_not_publishable")
@@ -256,6 +279,8 @@ class ManagedTasks:
                     await self._publish(task_id, payload["publication"], actor)
                 else:
                     raise StateError("unknown_managed_action")
+            except ReportValidationError as exc:
+                return self._report_rejection(task_id, str(exc))
             except Exception as exc:
                 # Do not return raw tool errors, prompts, stderr or private path dumps.
                 code = (
@@ -275,6 +300,30 @@ class ManagedTasks:
             return self.store.describe(task_id)
         finally:
             os.close(fd)
+
+    def _report_rejection(self, task_id, reason):
+        # A response, not a persisted task transition or origin notification.
+        hint = {
+            "malformed_validation_check": (
+                "checks require command and status passed|failed; optional keys: "
+                "result, proof, layer. Put unexecuted checks in limitations."
+            ),
+            "memory_report_too_large": "Retained report must fit 262144 canonical UTF-8 bytes.",
+            "validated_commit_or_clean_workspace_required": (
+                "Supply the full validated HEAD SHA from the bound clean checkout."
+            ),
+        }.get(reason, "Correct the input or binding and retry the same task ID.")
+        return dict(
+            self.store.describe(task_id),
+            phase="blocked",
+            blocked_reason=reason,
+            rejection={
+                "persisted": False,
+                "correctable": True,
+                "reason": reason,
+                "hint": hint,
+            },
+        )
 
     async def _scope(self, task: dict):
         project = task["project"]
@@ -440,6 +489,9 @@ class ManagedTasks:
                     "This is a managed task. Use the supplied origin identity; native parentage applies only in native_child transport.",
                     "Before edits verify host-bound isolated workspace, requested branch, base SHA, and the SHA256 of the supplied private memory artifact. Read the whole artifact.",
                     "Implement and validate; preserve unrelated changes. Never push private history or commit unselected files.",
+                    "Run long test suites in the foreground and wait for completion; never background/nohup them or create sessions that automatically reinvoke this executor.",
+                    "Every host ACK must relay this frame's literal fresh tool output programmatically (ACP or bridge ack --from-file); never summarize, edit, synthesize or reuse snapshots.",
+                    "Continuations require the complete terminal run chain, a report bound to its latest run, no live descendants and fresh post-memory gates. Never overwrite childRunId or bypass closure gates.",
                     "Use the caller-bound managed adapter with this task_id for status, progress, finish and publish; do not create this task again.",
                     "Finish with structured checks (command/status), decisions, changes, limitations and commit; publish only via the explicit safe repository binding.",
                     "Report host/adapter blockers to the origin through the persisted outbox. Do not require a user continue to carry out authorized work.",
@@ -865,47 +917,348 @@ class ManagedTasks:
             or any(c["status"] == "failed" for c in checks)
         )
 
-    async def _terminal_gate(self, task):
-        """Release capacity only after original run and all descendants are idle.
+    @classmethod
+    def _validate_report(cls, task, report):
+        """One canonical content validator for submission, completion and recovery."""
+        from oraculo.memory.cycles import report_projection
 
-        Failure is terminal for occupancy, but cannot certify successful work.
+        try:
+            kind = cls._report_kind(task, report)
+            failed = cls._report_failed(report)
+            # All persisted fields (including inert review metadata) must be JSON.
+            canonical_json(report).encode()
+            _, _, rejection = report_projection(report)
+            if rejection:
+                raise StateError(rejection)
+            commit = report.get("commit")
+            if (not failed or commit is not None) and (
+                not isinstance(commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) is None
+            ):
+                raise StateError("validated_commit_or_clean_workspace_required")
+            return kind, failed
+        except StateError as exc:
+            raise ReportValidationError(str(exc)) from None
+        except (TypeError, ValueError, UnicodeError):
+            raise ReportValidationError("invalid_validation_report") from None
+
+    async def _prevalidate_report(self, task, report):
+        result = self._validate_report(task, report)
+        if not task.get("child"):
+            raise ReportValidationError("child_not_launched")
+        if not result[1]:
+            try:
+                thread = await self._thread(task["child"]["childThreadId"])
+                ws = self._report_workspace(task, thread)
+                if ws["dirty"] or report["commit"] != ws["head"]:
+                    raise StateError("validated_commit_or_clean_workspace_required")
+            except StateError as exc:
+                raise ReportValidationError(str(exc)) from None
+        return result
+
+    @staticmethod
+    def _report_workspace(task, thread):
+        expected_parent = (
+            task["origin"]["thread_id"]
+            if task["transport_mode"] == "native_child"
+            else None
+        )
+        if (
+            thread.get("threadId") != task["child"]["childThreadId"]
+            or thread.get("projectId") != task["project"]["project_id"]
+            or thread.get("parentThreadId") != expected_parent
+        ):
+            raise StateError("task_thread_binding_mismatch")
+        if not thread.get("worktreePath"):
+            raise StateError("child_workspace_not_ready")
+        ws = workspace(thread["worktreePath"])
+        parent = task["parent_workspace"]
+        if (
+            ws["path"] == parent["path"]
+            or ws["common_dir"] != parent["common_dir"]
+            or ws["branch"] == parent["branch"]
+            or (task["expected_branch"] and ws["branch"] != task["expected_branch"])
+            or (
+                task.get("child_workspace")
+                and ws["path"] != task["child_workspace"]["path"]
+            )
+        ):
+            raise StateError("child_workspace_not_isolated")
+        git(ws["path"], "merge-base", "--is-ancestor", task["base_sha"], "HEAD")
+        return ws
+
+    async def _recover_report(self, task, payload, actor):
+        """Replace only malformed, uncertified legacy submissions, with an audit.
+
+        This service-owned action does not finish memory or release capacity.
+        Origin resumes the same task after inspecting the replacement receipt.
         """
+        try:
+            if actor["thread_id"] != task["origin"]["thread_id"] or actor[
+                "project_id"
+            ] != task["origin"].get("project_id"):
+                raise StateError("report_recovery_requires_origin")
+            if (
+                set(payload)
+                != {"task_id", "report", "expected_report_sha256", "reason"}
+                or not isinstance(payload.get("reason"), str)
+                or not payload["reason"].strip()
+                or len(payload["reason"]) > 2000
+            ):
+                raise StateError("report_recovery_payload_required")
+            audit = task.get("report_recovery")
+            original = (
+                audit["original_report"] if audit else task.get("submitted_report")
+            )
+            if original is None or not task.get("child"):
+                raise StateError("invalid_legacy_submission_required")
+            digest = content_hash(original)
+            if payload["expected_report_sha256"] != digest:
+                raise StateError("report_recovery_digest_mismatch")
+            submissions = [
+                e["proof"].get("report_sha256")
+                for e in task["events"]
+                if e["phase"] == "validation_submitted"
+            ]
+            if not submissions or submissions[-1] != digest:
+                raise StateError("report_recovery_submission_digest_mismatch")
+            try:
+                self._validate_report(task, original)
+            except ReportValidationError as exc:
+                invalid_reason = str(exc)
+            else:
+                raise StateError("valid_submitted_report_immutable")
+            replacement = payload["report"]
+            _, failed = await self._prevalidate_report(task, replacement)
+            if audit and (
+                audit["original_sha256"] != digest
+                or audit["replacement_sha256"] != content_hash(replacement)
+                or audit["reason"] != payload["reason"]
+                or task.get("submitted_report") != replacement
+            ):
+                raise StateError("report_recovery_reused")
+            if isinstance(original, dict):
+                negative_checks = (
+                    [
+                        c
+                        for c in original.get("checks", [])
+                        if isinstance(c, dict) and c.get("status") == "failed"
+                    ]
+                    if isinstance(original.get("checks"), list)
+                    else []
+                )
+                negative = (
+                    original.get("verdict") == "FAIL"
+                    or (
+                        isinstance(original.get("summary"), str)
+                        and re.match(r"^\s*FAIL\b", original["summary"], re.I)
+                    )
+                    or negative_checks
+                )
+                if (negative and not failed) or any(
+                    c not in replacement["checks"] for c in negative_checks
+                ):
+                    raise StateError("report_recovery_negative_evidence_required")
+            # A replay after completion may acknowledge the existing audit only.
+            # A first recovery must not replace any memory/report certification.
+            if not audit:
+                if (
+                    task.get("report") is not None
+                    or task.get("work_status") != "pending"
+                    or task.get("publication")
+                    or task.get("merged")
+                    or task.get("settled")
+                    or (task.get("memory") or {}).get("write_state") != "not_requested"
+                ):
+                    raise StateError("report_recovery_already_certified")
+                cycle = await self.memory.status(
+                    task["project"]["project_id"], task["parent"], task["memory"]["id"]
+                )
+                if (
+                    cycle.get("id") != task["memory"]["id"]
+                    or cycle.get("project_id") != task["project"]["project_id"]
+                    or any(
+                        cycle.get("identity", {}).get(k) != task["parent"][k]
+                        for k in ("thread_id", "run_id")
+                    )
+                    or cycle.get("work_status") != "running"
+                    or cycle.get("write_state") != "not_requested"
+                    or cycle.get("write_receipt") is not None
+                    or cycle.get("report_sha256") is not None
+                ):
+                    raise StateError("report_recovery_memory_not_pristine")
+            # Fresh real bridge reads; the report and stored observations alone
+            # are never evidence that the executor or descendants have stopped.
+            snapshot = await self._terminal_gate(task)
+            runs = snapshot["recentRuns"]
+            if (
+                len({r["runId"] for r in runs}) != len(runs)
+                or any(
+                    r["status"]
+                    not in {"completed", "failed", "cancelled", "interrupted"}
+                    for r in runs
+                )
+                or any(
+                    r["status"] != snapshot["thread"]["status"]
+                    for r in runs
+                    if r["runId"] == snapshot["thread"]["latestRunId"]
+                )
+            ):
+                raise StateError("terminal_execution_or_descendants_unproven")
+            ws = self._report_workspace(task, snapshot["thread"])
+            if not failed and (ws["dirty"] or replacement["commit"] != ws["head"]):
+                raise StateError("validated_commit_or_clean_workspace_required")
+            if task["transport_mode"] == "native_child":
+                observed = await self.host.call(
+                    "task_status", {"taskId": task["child"]["taskId"]}
+                )
+                if (
+                    any(
+                        observed.get(k) != task["child"].get(k)
+                        for k in ("taskId", "childThreadId", "childRunId")
+                    )
+                    or observed.get("workState") != "result_available"
+                    or observed.get("hasPendingChildRuns") is not False
+                    or observed.get("status")
+                    != next(
+                        r["status"]
+                        for r in runs
+                        if r["runId"] == task["child"]["childRunId"]
+                    )
+                ):
+                    raise StateError("terminal_execution_or_descendants_unproven")
+            report_link(
+                task
+                if audit
+                else dict(task, report_recovery={"original_sha256": digest}),
+                snapshot,
+                replacement,
+            )
+            if audit:
+                return
+            if cycle != await self.memory.status(
+                task["project"]["project_id"], task["parent"], task["memory"]["id"]
+            ):
+                raise StateError("report_recovery_memory_changed_retry")
+            self.store.recover_report(
+                task,
+                replacement,
+                {
+                    "original_report": original,
+                    "original_sha256": digest,
+                    "replacement_sha256": content_hash(replacement),
+                    "invalid_reason": invalid_reason,
+                    "reason": payload["reason"],
+                    "actor": actor,
+                    "terminal_snapshot": snapshot,
+                },
+            )
+        except Exception as exc:
+            code = str(exc) if isinstance(exc, StateError) else type(exc).__name__
+            raise ReportValidationError(code) from None
+
+    def _terminal_snapshot(self, task, snapshot):
         from oraculo.t3.contracts import TERMINAL_STATUSES
 
-        client = T3Client("http://127.0.0.1/mcp")
-        client.call = self.host.call
-        snapshot = await client.settlement_snapshot(
-            task["child"]["childThreadId"], terminal_only=True
-        )
         thread = snapshot["thread"]
+        expected_parent = (
+            task["origin"]["thread_id"]
+            if task["transport_mode"] == "native_child"
+            else None
+        )
         if (
             thread["threadId"] != task["child"]["childThreadId"]
             or thread["projectId"] != task["project"]["project_id"]
-            or thread["latestRunId"] != task["child"]["childRunId"]
+            or thread.get("parentThreadId") != expected_parent
             or thread["activeRunId"] is not None
             or thread["pendingRequestCount"] != 0
             or thread["status"] not in TERMINAL_STATUSES
             or snapshot["hasPendingChildRuns"] is not False
             or snapshot["childrenObserved"] is not True
-            or not any(
-                run["runId"] == task["child"]["childRunId"]
-                and run["status"] in TERMINAL_STATUSES
-                for run in snapshot["recentRuns"]
-            )
         ):
             raise StateError("terminal_execution_or_descendants_unproven")
+        chain = terminal_chain(snapshot)
+        if task["child"]["childRunId"] not in {r["runId"] for r in chain}:
+            raise StateError("original_task_run_not_observed")
+        if (
+            task["transport_mode"] != "native_child"
+            and thread["latestRunId"] != task["child"]["childRunId"]
+        ):
+            raise StateError("terminal_execution_or_descendants_unproven")
+        self._report_workspace(task, thread)
+        return chain
 
-    async def _execution_gate(self, task):
-        """Require successful original/current execution and verified descendants."""
+    async def _terminal_gate(self, task, *, successful=False):
+        """Preserve original binding and prove every run/descendant terminal."""
         client = T3Client("http://127.0.0.1/mcp")
         client.call = self.host.call
+        snapshot = await client.settlement_snapshot(
+            task["child"]["childThreadId"],
+            terminal_only=not successful,
+            complete_runs=True,
+        )
+        if successful:
+            # Preserve established public error semantics while validating the
+            # exact same snapshot again with the stricter continuity policy.
+            Settlements.remote_gate(
+                {
+                    "thread_id": task["child"]["childThreadId"],
+                    "project_id": task["project"]["project_id"],
+                    "run_id": (task.get("completion_evidence") or {}).get(
+                        "latest_run_id", snapshot["thread"]["latestRunId"]
+                    ),
+                },
+                snapshot,
+            )
+        chain = self._terminal_snapshot(task, snapshot)
+        if task["transport_mode"] == "native_child":
+            observed = await self.host.call(
+                "task_status", {"taskId": task["child"]["taskId"]}
+            )
+            original = next(
+                r for r in chain if r["runId"] == task["child"]["childRunId"]
+            )
+            if (
+                any(
+                    observed.get(k) != task["child"].get(k)
+                    for k in ("taskId", "childThreadId", "childRunId")
+                )
+                or observed.get("status") != original["status"]
+                or observed.get("workState") != "result_available"
+                or observed.get("hasPendingChildRuns") is not False
+                or observed.get("hasPendingQuestion") is not False
+                or (
+                    len(chain) > 1
+                    and (
+                        observed.get("latestTerminalRunId") != chain[-1]["runId"]
+                        or observed.get("latestTerminalStatus") != chain[-1]["status"]
+                    )
+                )
+            ):
+                raise StateError("terminal_execution_or_descendants_unproven")
+        return snapshot
+
+    async def _execution_gate(self, task, report=None, actor=None):
+        """Success may follow a proven continuation; the original is immutable."""
+        snapshot = await self._terminal_gate(task, successful=True)
+        chain = snapshot["recentRuns"]
+        original = next(r for r in chain if r["runId"] == task["child"]["childRunId"])
+        if original["status"] != "completed":
+            raise StateError("expected_run_not_completed")
         binding = {
             "thread_id": task["child"]["childThreadId"],
             "project_id": task["project"]["project_id"],
-            "run_id": task["child"]["childRunId"],
+            "run_id": snapshot["thread"]["latestRunId"],
         }
-        snapshot = await client.settlement_snapshot(binding["thread_id"])
         Settlements.remote_gate(binding, snapshot)
+        report_link(
+            task,
+            snapshot,
+            report or task.get("report") or task.get("submitted_report"),
+            actor=actor,
+        )
+        client = T3Client("http://127.0.0.1/mcp")
+        client.call = self.host.call
         return client, binding, snapshot
 
     async def _finish(self, task_id: str, report: dict, actor: dict):
@@ -917,10 +1270,7 @@ class ManagedTasks:
             raise StateError("finish_requires_task_or_origin")
         if not task.get("child"):
             raise StateError("child_not_launched")
-        if not isinstance(report, dict):
-            raise StateError("structured_report_required")
-        kind = self._report_kind(task, report)
-        failed = self._report_failed(report)
+        kind, failed = await self._prevalidate_report(task, report)
         for field in ("report", "submitted_report"):
             if task.get(field) is not None and task[field] != report:
                 raise StateError("terminal_report_reused")
@@ -931,9 +1281,8 @@ class ManagedTasks:
         ):
             raise StateError("children_still_running")
         # Even a negative result requires fresh terminal/current-run evidence.
-        await self._terminal_gate(self.store.get(task_id))
-        if self.admission is not None:
-            self.admission.release_managed(task_id, observed)
+        snapshot = await self._terminal_gate(self.store.get(task_id))
+        evidence = report_link(task, snapshot, report, actor=actor)
         if observed.get("status") not in {
             "completed",
             "failed",
@@ -941,12 +1290,19 @@ class ManagedTasks:
             "interrupted",
         }:
             raise StateError("terminal_execution_unproven")
-        succeeded = observed["status"] == "completed" and not failed
+        succeeded = (
+            observed["status"] == "completed"
+            and snapshot["thread"]["status"] == "completed"
+            and not failed
+        )
         if succeeded:
             # Failed/stopped original runs still save their legitimate result.
             # Only successful certification requires the complete execution gate.
-            await self._execution_gate(self.store.get(task_id))
-            ws = workspace(task["child_workspace"]["path"])
+            _, _, snapshot = await self._execution_gate(
+                self.store.get(task_id), report, actor
+            )
+            evidence = report_link(task, snapshot, report, actor=actor)
+            ws = self._report_workspace(task, snapshot["thread"])
             if ws["dirty"] or report.get("commit") != ws["head"]:
                 raise StateError("validated_commit_or_clean_workspace_required")
         status = (
@@ -961,16 +1317,21 @@ class ManagedTasks:
             "memory_pending",
             {"work_status": status, "report_sha256": content_hash(report)},
             report=report,
+            completion_evidence=evidence,
             work_status=status,
             deliverable_kind=kind,
             approval_state="pending" if kind == "plan" else "not_required",
         )
-        cycle = await self.memory.finish(
-            task["project"]["project_id"],
-            task["parent"],
-            task["memory"]["id"],
-            status,
-            report,
+        cycle = (
+            task["memory"]
+            if self._saved(task["memory"])
+            else await self.memory.finish(
+                task["project"]["project_id"],
+                task["parent"],
+                task["memory"]["id"],
+                status,
+                report,
+            )
         )
         self.store.update(
             task_id,
@@ -986,6 +1347,19 @@ class ManagedTasks:
         )
         if not self._saved(cycle):
             raise StateError("memory_write_unconfirmed")
+        # Memory can yield while a new run, descendant or checkout change begins.
+        # Re-read the same proof before capacity release, including confirmed replay.
+        current = self.store.get(task_id)
+        if succeeded:
+            _, _, fresh = await self._execution_gate(current)
+            ws = self._report_workspace(current, fresh["thread"])
+            if ws["dirty"] or report.get("commit") != ws["head"]:
+                raise StateError("validated_commit_or_clean_workspace_required")
+        else:
+            fresh = await self._terminal_gate(current)
+        report_link(current, fresh, report)
+        if self.admission is not None:
+            self.admission.release_managed(task_id, observed)
         if not succeeded:
             raise StateError("work_not_successful")
 
@@ -1164,6 +1538,7 @@ class ManagedTasks:
             await self._scope(task)
             report = task.get("submitted_report") or task.get("report")
             if report:
+                await self._prevalidate_report(task, report)
                 observed = await self._observe(task)
                 if (
                     observed["workState"] == "result_available"
@@ -1179,6 +1554,8 @@ class ManagedTasks:
                 observed = await self._observe(task)
                 if observed["workState"] == "result_available":
                     raise StateError("terminal_task_report_missing")
+        except ReportValidationError:
+            return  # Invalid legacy input remains available for explicit recovery.
         except Exception as exc:
             code = (
                 str(exc)

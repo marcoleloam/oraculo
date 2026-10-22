@@ -4,6 +4,7 @@ import sys
 import pytest
 
 from oraculo.cli import main
+from oraculo.host_ack import make_ack
 from oraculo.state import DedupeConflict, StateError
 from oraculo.task_store import TaskStore
 from oraculo.task_transport import CommandTransport
@@ -72,6 +73,59 @@ async def test_bridge_error_does_not_expose_stderr(tmp_path):
         await CommandTransport([sys.executable, str(script)]).call("tool", {})
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_bridge_timeout_or_cancel_reaps_only_owned_process(
+    tmp_path, monkeypatch, cancel
+):
+    import asyncio
+    import os
+
+    pid_file = tmp_path / "pid"
+    script = tmp_path / "bridge.py"
+    script.write_text(
+        "import os,time\nfrom pathlib import Path\n"
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    monkeypatch.setattr(CommandTransport, "CALL_TIMEOUT", 0.3)
+    active = asyncio.create_task(
+        CommandTransport([sys.executable, str(script)]).call("tool", {})
+    )
+    async with asyncio.timeout(2):
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+    pid = int(pid_file.read_text())
+    if cancel:
+        active.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await active
+    else:
+        with pytest.raises(StateError, match="^host_response_uncertain$"):
+            await active
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # Liveness probe, no signal sent.
+
+
+@pytest.mark.parametrize("raw", ["null", "[]", "invalid"])
+async def test_bridge_invalid_json_is_uncertain(raw):
+    with pytest.raises(StateError, match="^host_response_uncertain$"):
+        await CommandTransport([sys.executable, "-c", f"print({raw!r})"]).call(
+            "tool", {}
+        )
+
+
+@pytest.mark.parametrize("raw", ["null", "[]"])
+async def test_stdio_nonobject_ack_is_explicit_mismatch(raw):
+    import io
+
+    from oraculo.task_transport import StdioHostTransport
+
+    with pytest.raises(StateError, match="native_bridge_ack_mismatch"):
+        await StdioHostTransport(io.StringIO(raw + "\n"), io.StringIO()).call(
+            "tool", {}
+        )
+
+
 def test_cli_list_without_host_bridge(service_config, monkeypatch, capsys):
     from oraculo.task_store import TaskStore
 
@@ -96,16 +150,14 @@ async def test_native_stdio_bridge_correlates_real_tool_response_shape():
         def readline(self):
             call = json.loads(output.getvalue())
             return json.dumps(
-                {
-                    "request_id": call["request_id"],
-                    "result": {"structuredContent": {"parentThreadId": "caller"}},
-                }
+                make_ack(
+                    call,
+                    json.dumps({"structuredContent": {"literal": "response"}}).encode(),
+                )
             )
 
-    result = await StdioHostTransport(Reader(), output).call(
-        "orchestrator_capabilities", {}
-    )
-    assert result == {"parentThreadId": "caller"}
+    result = await StdioHostTransport(Reader(), output).call("example", {})
+    assert result == {"literal": "response"}
     assert json.loads(output.getvalue())["marker"] == "ORACULO_HOST_CALL_V1"
 
 
@@ -144,9 +196,7 @@ def test_native_stdio_pty_accepts_large_ack_without_canonical_truncation():
     try:
         request = json.loads(process.stdout.readline())
         raw = (
-            json.dumps(
-                {"request_id": request["request_id"], "result": {"data": "x" * 12000}}
-            )
+            json.dumps(make_ack(request, json.dumps({"data": __import__("secrets").token_hex(6000)}).encode()))
             + "\n"
         ).encode()
         while raw:

@@ -362,7 +362,11 @@ class T3Client:
         return snapshot
 
     async def settlement_snapshot(
-        self, thread_id: str, *, terminal_only: bool = False
+        self,
+        thread_id: str,
+        *,
+        terminal_only: bool = False,
+        complete_runs: bool = False,
     ) -> dict[str, Any]:
         """Read bounded descendant evidence, without watching or polling.
 
@@ -430,6 +434,13 @@ class T3Client:
             has_pending = has_pending or not settlement_child_clear(
                 child, terminal_only=terminal_only
             )
+            if complete_runs:
+                from oraculo.run_continuity import terminal_chain
+
+                if child.thread.latestRunId is not None:
+                    terminal_chain(child.model_dump(mode="json"))
+                elif getattr(child.thread, "runCount", None) != 0:
+                    raise ContractError("Settlement descendant history incomplete")
             pending.extend(children.get(child_id, []))
         # Refresh the target after descendant reads so newly active work blocks
         # the caller's policy, rather than relying on the initial target state.

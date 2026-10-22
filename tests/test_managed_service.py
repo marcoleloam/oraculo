@@ -20,6 +20,48 @@ class Caller(Host):
         return result
 
 
+async def test_large_recovery_journal_keeps_status_and_list_bounded(running_service):
+    from oraculo.protocol import MAX_ENVELOPE_BYTES, canonical_json
+
+    service = running_service
+    initialize(service.config.projects_root / "alpha")
+    host = Caller(service.config.projects_root)
+    task = await command(
+        service.config,
+        "start",
+        dict(
+            kind="work",
+            key="large-journal",
+            text="Implement",
+            cwd=str(service.config.projects_root / "alpha"),
+        ),
+        host,
+    )
+    journal = dict(
+        version=1,
+        original_sha256="a" * 64,
+        replacement_sha256="b" * 64,
+        original_payload="private-original" * MAX_ENVELOPE_BYTES,
+    )
+    store = service.managed_service.store
+    store.update(
+        task["id"], task["phase"], {"test_journal": True}, report_bootstrap=journal
+    )
+    for action, payload in (("status", {"task_id": task["id"]}), ("list", {})):
+        reply = await command(service.config, action, payload, None)
+        assert len(canonical_json(reply).encode()) < MAX_ENVELOPE_BYTES
+        public = (
+            reply
+            if action == "status"
+            else next(t for t in reply["tasks"] if t["id"] == task["id"])
+        )
+        assert public["report_bootstrap"] == {
+            k: journal[k] for k in ("version", "original_sha256", "replacement_sha256")
+        }
+        assert "private-original" not in canonical_json(reply)
+    assert store.get(task["id"])["report_bootstrap"] == journal
+
+
 async def test_service_authority_caller_relay_plan_gate_and_dedupe(running_service):
     service = running_service
     initialize(service.config.projects_root / "alpha")

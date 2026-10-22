@@ -158,6 +158,25 @@ class TaskStore:
             )
         ]
 
+    def recover_report(self, expected: dict, replacement: dict, audit: dict):
+        """CAS, original evidence, replacement, event and outbox in one transaction."""
+        with self.state.transaction():
+            if self.get(expected["id"]) != expected:
+                raise StateError("report_recovery_task_changed_retry")
+            if expected.get("report_recovery") is not None:
+                raise StateError("report_recovery_reused")
+            proof = {
+                key: audit[key]
+                for key in ("original_sha256", "replacement_sha256", "invalid_reason")
+            }
+            return self.update(
+                expected["id"],
+                "validation_recovered",
+                proof,
+                submitted_report=replacement,
+                report_recovery=audit,
+            )
+
     def delivery(self, event: dict) -> dict:
         cached = self.db.execute(
             "SELECT delivery FROM task_returns WHERE id=?", (event["id"],)
@@ -265,10 +284,28 @@ class TaskStore:
                 "context",
                 "report",
                 "submitted_report",
+                "report_recovery",
+                "report_bootstrap",
                 "launch_arguments",
                 "events",
             }
         } | {
+            "report_bootstrap": (
+                {
+                    k: task["report_bootstrap"][k]
+                    for k in ("version", "original_sha256", "replacement_sha256")
+                }
+                if task.get("report_bootstrap")
+                else None
+            ),
+            "report_recovery": (
+                {
+                    k: task["report_recovery"][k]
+                    for k in ("original_sha256", "replacement_sha256", "invalid_reason")
+                }
+                if task.get("report_recovery")
+                else None
+            ),
             "pending_returns": len(self.pending_returns(task_id)),
             "events": task["events"][-100:],
             "event_count": len(task["events"]),
