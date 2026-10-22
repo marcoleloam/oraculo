@@ -155,6 +155,8 @@ def parser() -> argparse.ArgumentParser:
             "continue",
             "progress",
             "finish",
+            "recover-report",
+            "recover-report-bootstrap",
             "approve",
             "publish",
             "pr-check",
@@ -175,6 +177,9 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON argv for an explicit caller-bound host bridge",
     )
+    from oraculo.host_ack import register_parsers as bridge_parsers
+
+    bridge_parsers(commands)
     commands.add_parser("serve")
     diagnostics = commands.add_parser("doctor")
     diagnostics.add_argument(
@@ -360,6 +365,11 @@ def make_envelope(kind: str, project: str, payload: dict) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "bridge":
+            from oraculo.host_ack import run_ack
+
+            run_ack(args)
+            return 0
         if args.command in {"runtime", "service"}:
             from oraculo import runtime, service_control
 
@@ -484,7 +494,10 @@ def main(argv: list[str] | None = None) -> int:
                             store.close()
                     print_json(result)
                     return 0
-                if args.action == "reconcile-legacy-failure":
+                if args.action in {
+                    "reconcile-legacy-failure",
+                    "recover-report-bootstrap",
+                }:
                     from oraculo.legacy_failure import reconcile
 
                     transport = (
@@ -497,10 +510,17 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     try:
-                        result = asyncio.run(reconcile(config, payload, transport))
+                        if args.action == "recover-report-bootstrap":
+                            from oraculo.report_bootstrap import recover
+
+                            result = asyncio.run(
+                                recover(config, args.config, payload, transport)
+                            )
+                        else:
+                            result = asyncio.run(reconcile(config, payload, transport))
                         print_json(result)
                         # The reconciliation succeeded; the reviewed work failed.
-                        return 1
+                        return 0 if args.action == "recover-report-bootstrap" else 1
                     finally:
                         if args.stdio_host:
                             transport.close()
@@ -537,6 +557,10 @@ def main(argv: list[str] | None = None) -> int:
                     or capabilities.get("data", {}).get("protocol_version") != 1
                 ):
                     raise StateError("managed_service_upgrade_required")
+                if args.action == "recover-report" and not capabilities.get(
+                    "data", {}
+                ).get("invalid_report_recovery"):
+                    raise StateError("report_recovery_service_upgrade_required")
                 command = (
                     json.loads(args.transport_command.read_text())
                     if args.transport_command

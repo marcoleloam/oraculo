@@ -47,6 +47,7 @@ include = [
   "/deploy/local.oraculo.plist",
   "/docs/INSTALACAO.md",
   "/docs/SKILLS.md",
+  "/docs/RUN_CONTINUITY_AND_ACKS.md",
   "/pyproject.toml",
   "/uv.lock",
   "/LICENSE",

@@ -13,14 +13,30 @@ or "not running inside a T3 thread" from the generic server is not evidence of
 running outside a thread. Answer bridge frames with the caller-bound server.
 
 For stdio, keep stdin open and process complete `ORACULO_HOST_CALL_V1` JSON frames.
-Call the named native tool with exactly the frame's arguments, once; return its
-actual `request_id` and `result` in one JSON line on stdin. Do not execute a partial
-frame. Tool failure and uncertain delivery require the existing operation's
-reconciliation. ACKs, task IDs and deduplication keys must remain correlated.
+Frames declare `ack_protocol=ORACULO_HOST_ACK_V2`. Invoke the named native tool
+with exactly the supplied arguments once. Save its literal current JSON output
+programmatically to a private file (including model options); never summarize,
+redigit, edit or reuse a previous snapshot. With the exact frame saved separately:
+
+```sh
+oraculo bridge ack --frame /private/current-frame.json \
+  --from-file /private/current-tool-result.json > /private/current-ack.json
+```
+
+Write that output line programmatically to the still-open adapter stdin. The
+helper does no host calls and opens no service/vault/database. It compresses the
+whole result reversibly, validates its minimum fields, and binds the ACK to the
+request, tool, argument digest and frame time. The receiving transport also
+checks consistency across frames. Capture the result file after this frame was
+issued; an older mtime is refused. Failure/uncertain delivery requires the
+existing operation's reconciliation, not reusing an ACK or creating a task.
+Prefer the supported caller-bound ACP transport when available, which relays
+actual output directly without model transcription. Do not invent an ACP binary,
+credentials or a daemon session impersonating the caller.
+
 The stdio bridge trusts the local operator; it is not cryptographic attestation.
-The bridge waits up to 600 s for each ACK (`ORACULO_BRIDGE_ACK_TIMEOUT` seconds
-overrides it); the daemon relay waits longer. Answer promptly anyway: while a
-frame is open, the daemon serializes every other managed operation.
+Schema, hashes and consistency catch omissions, corruption and detectable reuse;
+they cannot detect every self-consistent fabrication or a rewritten old file.
 
 On an older CLI affected by PTY output backpressure, stdout to a private regular
 file with interactive stdin is a recovery workaround. Consume complete frames

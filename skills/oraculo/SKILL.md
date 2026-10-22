@@ -34,6 +34,10 @@ Choose the flow before calling a tool:
 - **Operate the installation/service:** read [operations](references/operations.md).
   Use authorized administrative commands directly, without a gratuitous work task.
 
+Run long executor test suites in the foreground and await completion; do not
+create automatic follow-up runs for test completion. Preserve original run IDs
+and require complete fresh continuity evidence before closure.
+
 For a mutating managed command use the real caller-bound bridge described in
 [bridge and evidence](references/bridge-and-evidence.md). If CLI, bridge, memory or
 service is unavailable, report the observed blocker and recovery action. Never

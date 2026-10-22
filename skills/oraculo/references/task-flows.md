@@ -61,6 +61,19 @@ An assigned managed executor submits `oraculo task finish --file report.json`:
 }
 ```
 
+Checks must describe executed commands only: `status` is `passed` or `failed`;
+optional check keys are `result`, `proof`, `layer`. Put unexecuted checks in
+`limitations`, never invent a passed/failed result for `not_run`. A rejection with
+`rejection.persisted=false` leaves the task unchanged: correct the same report
+and retry the same ID. Positive reports require the actual full clean HEAD SHA.
+
+For legacy malformed immutable submissions, use the explicit `recover-report`
+flow in the project's managed-task contract, only from the real original origin.
+It requires a running service advertising `invalid_report_recovery=true`, the
+original canonical digest, corrected report and reason, plus fresh terminal and
+memory evidence. It preserves the original and never replaces a valid/certified
+report. An old daemon is a prerequisite blocker, not authority for local DB edits.
+
 If the parent explicitly owns finish or the child is only native, return the
 report natively and do not call managed finish for the parent's task. The origin
 checks original run, descendants, checkout and validation before completion.
@@ -86,3 +99,16 @@ authorization scopes. Follow the installed project's managed-task contract for
 `publish`, `pr-check`, `merge`, `settle` and `unwatch`; checks/review apply to the
 exact HEAD. A merge does not prove deployment. The origin remains responsible
 after the child returns and after a PR is opened.
+
+Keep long executor test suites in the foreground and await their completion.
+Do not use background/nohup or a session that automatically starts another agent
+turn when tests finish. A resumed child is not proof of a new managed task.
+
+A native child may have several terminal runs in the same bound thread. Keep the
+original `childRunId`; completion requires the entire contiguous history through
+the latest run, an immutable report submitted during that latest run or later,
+no active/queued work or live descendants, and fresh proof after confirmed memory.
+Missing/truncated run history is a blocker, never permission to edit evidence.
+The origin uses the existing task ID with `resume`; it does not rebind IDs or
+resubmit an old report to refresh its timestamp. Parent-owned finish stays with
+the parent after the executor's actual terminal return.

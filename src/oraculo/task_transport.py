@@ -18,6 +18,9 @@ from oraculo.state import StateError
 
 
 class CommandTransport:
+    CALL_TIMEOUT = 60
+    CLEANUP_TIMEOUT = 5
+
     def __init__(self, command: list[str] | None = None):
         if command is None:
             node = os.environ.get("T3_ACP_MCP_NODE")
@@ -34,6 +37,9 @@ class CommandTransport:
         ):
             raise StateError("invalid_caller_bound_bridge_command")
         self.command = command
+        from oraculo.host_ack import HostResults
+
+        self.results = HostResults()
 
     async def call(self, name: str, arguments: dict) -> dict:
         process = await asyncio.create_subprocess_exec(
@@ -45,28 +51,33 @@ class CommandTransport:
             env={**os.environ, "ELECTRON_RUN_AS_NODE": "1"},
         )
         try:
-            async with asyncio.timeout(60):
+            async with asyncio.timeout(self.CALL_TIMEOUT):
                 out, _ = await process.communicate()
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+        except (TimeoutError, asyncio.CancelledError):
+            # Only this bridge process is owned here. Its remote mutation may
+            # already have happened; never retry it from transport cleanup.
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                async with asyncio.timeout(self.CLEANUP_TIMEOUT):
+                    await process.wait()
+            except TimeoutError:
+                pass  # An inherited pipe must not keep the client socket open.
+            if asyncio.current_task().cancelling():
+                raise
             raise StateError("host_response_uncertain") from None
         if process.returncode:
             raise StateError("host_response_uncertain")
-        result = json.loads(out)
-        if result.get("isError"):
+        try:
+            result = json.loads(out)
+        except ValueError:
+            raise StateError("host_response_uncertain") from None
+        if not isinstance(result, dict):
             raise StateError("host_response_uncertain")
-        if "structuredContent" in result:
-            return result["structuredContent"]
-        if "content" in result:
-            return json.loads(
-                "\n".join(
-                    x.get("text", "")
-                    for x in result["content"]
-                    if x.get("type") == "text"
-                )
-            )
-        return result
+        return self.results.validate(name, arguments, result)
 
 
 class SocketMemory:
@@ -137,6 +148,9 @@ class SocketMemory:
             )
         return cycle
 
+    async def status(self, project: str, actor: dict, cycle_id: str) -> dict:
+        return await self._call("status", project, actor, {"cycle_id": cycle_id})
+
 
 class StdioHostTransport:
     """Cooperative native-tool bridge for harnesses without an ACP executable.
@@ -147,13 +161,16 @@ class StdioHostTransport:
     The local user/agent is the trust boundary, as for the existing Unix socket.
     """
 
-    # An agent answering frames by hand may need minutes to transcribe a large
-    # argument into its native tool call; the daemon relay waits longer still.
+    # Native tools can take minutes; results are relayed programmatically, never
+    # transcribed by the model. The daemon relay waits longer still.
     DEFAULT_ACK_TIMEOUT = 600.0
 
     def __init__(self, reader=None, writer=None, ack_timeout: float | None = None):
         import sys
 
+        from oraculo.host_ack import HostResults
+
+        self.results = HostResults()
         self.reader = reader or sys.stdin
         self.writer = writer or sys.stdout
         self.terminal = None
@@ -194,20 +211,20 @@ class StdioHostTransport:
         import uuid
 
         request_id = uuid.uuid4().hex
+        import time
+
+        from oraculo.host_ack import ACK_PROTOCOL
         from oraculo.stdio import read_line, write_async
 
-        await write_async(
-            canonical_json(
-                {
-                    "marker": "ORACULO_HOST_CALL_V1",
-                    "request_id": request_id,
-                    "tool": name,
-                    "arguments": arguments,
-                }
-            )
-            + "\n",
-            self.writer,
+        frame = dict(
+            marker="ORACULO_HOST_CALL_V1",
+            request_id=request_id,
+            ack_protocol=ACK_PROTOCOL,
+            tool=name,
+            arguments=arguments,
+            issued_at=time.time(),
         )
+        await write_async(canonical_json(frame) + "\n", self.writer)
         try:
             raw = await read_line(self.reader, timeout=self.ack_timeout)
         except TimeoutError:
@@ -216,23 +233,6 @@ class StdioHostTransport:
             ack = json.loads(raw)
         except (TypeError, ValueError):
             raise StateError("native_bridge_ack_invalid") from None
-        if ack.get("request_id") != request_id or not isinstance(
-            ack.get("result"), dict
-        ):
-            raise StateError("native_bridge_ack_mismatch")
-        result = ack["result"]
-        if result.get("isError"):
-            raise StateError("host_response_uncertain")
-        if "structuredContent" in result:
-            result = result["structuredContent"]
-        elif "content" in result:
-            result = json.loads(
-                "\n".join(
-                    c.get("text", "")
-                    for c in result["content"]
-                    if c.get("type") == "text"
-                )
-            )
-        if not isinstance(result, dict):
-            raise StateError("native_bridge_result_invalid")
-        return result
+        from oraculo.host_ack import decode_ack
+
+        return self.results.validate(name, arguments, decode_ack(frame, ack))

@@ -82,6 +82,9 @@ class Host:
                     status=status,
                     workState="result_available",
                     hasPendingChildRuns=pending,
+                    hasPendingQuestion=False,
+                    latestTerminalRunId=thread["latestRunId"],
+                    latestTerminalStatus=status,
                 )
         if pending:
             self.threads["reviewer-" + child_id] = {
@@ -131,6 +134,9 @@ class Host:
                 "status": "running",
                 "workState": "working",
                 "hasPendingChildRuns": False,
+                "hasPendingQuestion": False,
+                "latestTerminalRunId": None,
+                "latestTerminalStatus": None,
             }
         else:
             receipt = {"threadId": child_id, "projectId": project_id, "runId": run_id}
@@ -142,6 +148,20 @@ class Host:
             return {
                 "parentThreadId": self.caller,
                 "features": {"appOwnedSubagents": True},
+                "inheritedProviderInstanceId": "codex",
+                "inheritedModel": "example",
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "providers": [
+                    {
+                        "providerInstanceId": "codex",
+                        "driverKind": "codex",
+                        "models": [{"id": "example", "options": []}],
+                        "canRunChildTask": True,
+                        "canRunCrossProviderChildTask": True,
+                        "constraints": [],
+                    }
+                ],
             }
         if name == "t3_project_list":
             return {"projects": copy.deepcopy(self.projects), "nextCursor": None}
@@ -152,6 +172,7 @@ class Host:
             thread.setdefault("settled", False)
             thread.setdefault("updatedAt", "2026-01-01T00:00:00Z")
             thread.setdefault("itemCount", 2)
+            thread.setdefault("runCount", 1)
             return {
                 "thread": thread,
                 "items": [],
@@ -161,6 +182,11 @@ class Host:
                     {
                         "runId": thread["latestRunId"],
                         "status": thread["status"],
+                        "ordinal": 1,
+                        "startedAt": "2026-01-01T00:00:00Z",
+                        "completedAt": "2026-01-01T00:01:00Z"
+                        if thread["activeRunId"] is None
+                        else None,
                     }
                 ],
             }
@@ -185,8 +211,13 @@ class Host:
             return {
                 "projectId": args["projectId"],
                 "nextCursor": None,
+                "total": sum(t["projectId"] == args["projectId"] for t in rows),
                 "threads": [
-                    copy.deepcopy(t)
+                    dict(
+                        copy.deepcopy(t),
+                        itemCount=t.get("itemCount", 2),
+                        updatedAt=t.get("updatedAt", "2026-01-01T00:00:00Z"),
+                    )
                     for t in rows
                     if t["projectId"] == args["projectId"]
                 ],

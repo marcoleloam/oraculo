@@ -42,7 +42,17 @@ nova tarefa para si nem finalizar a tarefa do pai.
 Se o harness tiver ferramentas T3 nativas e nenhum bridge ACP, use
 `--stdio-host --file payload.json` em sessão interativa. Para cada
 `ORACULO_HOST_CALL_V1`, execute a ferramenta nativa exata e devolva em stdin
-`request_id` e `result` reais. Não transcreva uma conclusão como recibo de ferramenta.
+a linha produzida por `oraculo bridge ack --frame FRAME --from-file RESULTADO`.
+O frame declara `ORACULO_HOST_ACK_V2`; grave o resultado literal e fresco da
+ferramenta programaticamente, sem resumir, redigitar, editar ou reaproveitar
+snapshots. Preserve opções dos modelos. Prefira ACP caller-bound quando disponível.
+O helper comprime sem perda; schema/consistência não são atestação de autenticidade.
+
+Suítes longas do executor ficam em primeiro plano até conclusão, sem background,
+nohup ou sessões que reinvoquem o agente automaticamente. Uma continuação exige
+cadeia completa de runs terminais na mesma thread, relatório vinculado ao último,
+nenhum descendente ativo e revalidação após memória confirmada. Preserve o vínculo
+original; nunca edite `childRunId`, provas ou timestamps para contornar gates.
 
 Apresente `loaded_skill`, `called_cli` e `confirmed_service` separadamente, com
 fonte/instante/correlação; ausência de prova é `not_observed`. Eventos antigos ou

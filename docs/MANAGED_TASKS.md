@@ -121,9 +121,96 @@ certificar sucesso e salvar a memória de conclusão, o adapter verifica o run
 original, o estado atual e os descendentes. Falha, cancelamento ou interrupção
 de um descendente impede essa certificação; resultados falhos do próprio executor
 continuam podendo ser registrados como falha ou parada. Um run
-posterior nunca substitui sucesso do run original. `finish` confirma SHA do
+posterior nunca substitui o vínculo ou o sucesso exigido do run original.
+Continuações de filho nativo podem concluir mediante cadeia completa terminal e
+relatório vinculado ao último run, com prova fresca repetida após a memória antes
+de liberar a reserva. Veja [política, ACKs e runbook](RUN_CONTINUITY_AND_ACKS.md).
+`finish` confirma SHA do
 checkout limpo, mantém trabalho separado da gravação e só libera PR após recibo
 canônico `confirmed`/commit. Falhas de memória ficam visíveis e são retomáveis.
+
+### Validação antes da submissão
+
+Executor e origem usam o mesmo validador canônico antes de gravar qualquer
+relatório imutável. `checks` contém somente verificações executadas: `command`
+não vazio e `status` igual a `passed` ou `failed`; as únicas chaves opcionais são
+`result`, `proof` e `layer`. Registre verificações não executadas em `limitations`.
+`not_run`, `skip` e ausência de checks são rejeitados; nunca são convertidos em
+sucesso ou falha. `FAIL` explícito e checks falhos continuam sendo evidência negativa.
+
+A validação cobre forma, campos aceitos, tipo de entrega, parecer, summary,
+serialização JSON e a projeção exata de memória, limitada a 262144 bytes UTF-8
+canônicos. Metadados de revisão aceitos continuam inertes e fora dessa projeção.
+Relatório positivo requer SHA completo do HEAD, checkout limpo, repositório,
+isolamento, linhagem do host e ancestralidade da base confirmados por leituras
+frescas. Relatórios negativos não exigem checkout limpo; um SHA fornecido ainda
+precisa ter formato válido. Os gates de término continuam obrigatórios depois.
+
+Uma entrada inválida retorna `phase=blocked`, `blocked_reason` e
+`rejection.persisted=false`, com orientação de correção. Esse bloqueio é apenas
+na resposta: não altera o snapshot persistido, eventos, outbox, reserva ou memória,
+nem envia notificação à origem. Corrija e repita `finish` no mesmo `task_id`.
+Um relatório já aceito permanece imutável.
+
+### Recuperação explícita de submissão legada inválida
+
+`task recover-report` exige que o **serviço em execução** anuncie
+`invalid_report_recovery=true` em `managed.capabilities`. Instalar somente a CLI
+nova não adiciona esse suporte a um daemon antigo: a CLI retorna
+`report_recovery_service_upgrade_required` antes de enviar a mutação. Não há
+fallback offline, edição de SQLite ou uso de `reconcile-legacy-failure` para esse
+caso. A atualização do serviço é uma operação separada; se reservas impedirem o
+procedimento oficial de atualização, este comando não resolve esse pré-requisito.
+
+Na conversa de origem original, em um run ativo e usando o bridge caller-bound,
+prepare um arquivo privado e execute:
+
+```sh
+oraculo task recover-report --stdio-host --file recovery.json
+```
+
+```json
+{
+  "task_id": "<mesmo id>",
+  "expected_report_sha256": "<hash canônico da submissão original>",
+  "reason": "Verificação não executada foi movida para limitations; evidência executada preservada",
+  "report": {
+    "summary": "Resultado revisado pela origem",
+    "commit": "<SHA completo validado>",
+    "checks": [{"command": "comando realmente executado", "status": "passed"}],
+    "limitations": ["Verificação adicional não executada"]
+  }
+}
+```
+
+Use o digest do evento original `validation_submitted.report_sha256`, conferido
+contra a cópia privada original: SHA-256 de JSON com chaves ordenadas, separadores
+`,`/`:`, `ensure_ascii=False`, UTF-8 e sem NaN. Não forneça identidade de origem no
+payload; ela vem do host. Nenhuma outra origem, inclusive uma conversa coordenadora,
+herda essa autoridade. Mantenha uma janela cooperativa sem novas execuções.
+
+A ação só aceita conteúdo inválido pelo validador canônico e memória ainda
+`running/not_requested`, consultada no serviço. Recusa relatório já certificado,
+relatório válido, digest divergente do corpo ou do evento histórico de submissão,
+execução original não terminal, continuação sem cadeia/relatório comprovados
+ou descendentes ativos, host incompleto e correção inválida. Não reinterpreta um
+relatório válido como inválido porque o checkout mudou posteriormente. Também
+recusa remover checks falhos originais ou transformar parecer negativo em positivo.
+
+A transação CAS preserva integralmente a submissão original, seu hash, o novo hash,
+a justificativa, a identidade real e o snapshot terminal no audit privado
+`report_recovery`, junto com troca de `submitted_report`, evento e outbox.
+A resposta expõe somente os hashes e o motivo de invalidez. Memória, resultado e
+reserva permanecem intactos. Repita exatamente o mesmo payload após resposta
+incerta: não duplica a auditoria, mas revalida autoridade e término. Payload
+alterado retorna `report_recovery_reused`.
+
+Após `validation_recovered`, inspecione o recibo e execute `task resume` no mesmo
+ID. Só o fluxo normal pode salvar a memória e concluir com sucesso, falha ou parada.
+Um resultado negativo continua negativo. Mudança do host/checkout, erro de memória
+ou ACK perdido exige reconciliação do mesmo ID; não autoriza trocar o relatório
+novamente. Leituras T3/Git e memória são sequenciais, não uma transação distribuída;
+o catálogo comprova somente descendentes visíveis no projeto.
 
 O daemon usa thread de trabalho e conexão SQLite própria para Git/publicação;
 chamadas T3 são encaminhadas ao loop de transporte. Não adiciona polling de modelo.
