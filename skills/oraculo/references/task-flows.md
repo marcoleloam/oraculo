@@ -54,16 +54,33 @@ An assigned managed executor submits `oraculo task finish --file report.json`:
   "report": {
     "summary": "Implemented the authorized change",
     "commit": "validated-clean-checkout-sha",
-    "checks": [{"command": "project test command", "status": "passed"}],
-    "decisions": [],
-    "limitations": []
+    "checks": [{
+      "command": "project test command",
+      "status": "passed",
+      "result": "Final execution: exit 0",
+      "proof": "/private/evidence/check-final.log"
+    }],
+    "decisions": [
+      "History: project test command failed with exit 1 (/private/evidence/check-initial.log). Fixed empty-field serialization. Repeated the same command: passed, exit 0 (/private/evidence/check-final.log)."
+    ],
+    "limitations": ["External integration test was not run."]
   }
 }
 ```
 
-Checks must describe executed commands only: `status` is `passed` or `failed`;
-optional check keys are `result`, `proof`, `layer`. Put unexecuted checks in
-`limitations`, never invent a passed/failed result for `not_run`. A rejection with
+Checks record only the actual final execution of **each verification**: `status`
+is `passed` or `failed`; optional check keys are `result`, `proof`, `layer`.
+The example assumes the referenced executions and logs really exist. Before
+submission, preserve corrected intermediate failures in `decisions` or
+`limitations`, including the command, original result/status, correction and
+evidence of the rerun. Never omit history or invent a status. If a verification's
+final execution still fails, its `failed` check is mandatory. A passing partial
+rerun or different command cannot erase another verification that still fails.
+Any `failed` in `checks` keeps the report negative even with a later `passed`
+for the same command; explicit `FAIL` also remains negative.
+Put unexecuted checks in `limitations`, never invent a passed/failed result for
+`not_run`. Never retrospectively alter an immutable report or remove a submitted
+`failed`. A rejection with
 `rejection.persisted=false` leaves the task unchanged: correct the same report
 and retry the same ID. Positive reports require the actual full clean HEAD SHA.
 
