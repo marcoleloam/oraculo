@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
-from oraculo.protocol import CONTROL_MARKER, canonical_json
+from oraculo.protocol import CONTROL_MARKER, canonical_json, content_hash
 
 PHASES = {
     "received": ("Pedido recebido", "O Oráculo está preparando a tarefa."),
@@ -209,6 +209,38 @@ def summary_markdown(view: dict) -> str:
     else:
         lines.append("Link da conversa indisponível.")
     return "\n\n".join(lines)
+
+
+def notification_signature(view: dict, snapshot: dict) -> str:
+    """Versioned meaning, independent of event IDs and technical observations.
+
+    Raw blocker identity matters even when two unknown codes share a human
+    explanation. Scope (task and immutable origin) is enforced by TaskStore.
+    """
+    return content_hash(
+        [
+            "readable-notification-v1",
+            {
+                k: v
+                for k, v in view.items()
+                if k
+                not in {
+                    "updated_at",
+                    "snapshot_revision",
+                    "task_id",
+                }
+            },
+            {
+                k: snapshot.get(k)
+                for k in (
+                    "work_status",
+                    "blocked_reason",
+                    "deliverable_kind",
+                    "approval_state",
+                )
+            },
+        ]
+    )
 
 
 def return_message(delivery: dict) -> str:

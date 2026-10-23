@@ -30,7 +30,7 @@ class TaskStore:
                 version = self.db.execute(
                     "SELECT max(version) FROM schema_migrations"
                 ).fetchone()[0]
-                if version and version > 4:
+                if version and version > 5:
                     raise StateError("state_schema_newer_than_runtime")
                 self.db.execute("SELECT id,payload FROM managed_tasks LIMIT 0")
                 self.db.execute("SELECT id,payload,receipt FROM task_returns LIMIT 0")
@@ -39,7 +39,9 @@ class TaskStore:
                     self.db.close()
                 raise StateError("managed_ledger_read_unavailable") from exc
             return
-        self.state = State(path)
+        # Schema 5 belongs only to the managed ledger. Old writers must refuse
+        # it: NULL receipts on covered events are deliberately not host ACKs.
+        self.state = State(path, schema_max=5)
         self.db = self.state.connection
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS managed_tasks(
@@ -49,10 +51,19 @@ class TaskStore:
           CREATE TABLE IF NOT EXISTS task_returns(
             id TEXT PRIMARY KEY, task_id TEXT NOT NULL, payload TEXT NOT NULL,
             receipt TEXT);
+          CREATE TABLE IF NOT EXISTS task_notifications(
+            return_id TEXT PRIMARY KEY REFERENCES task_returns(id),
+            task_id TEXT NOT NULL, origin TEXT NOT NULL,
+            signature TEXT NOT NULL, representative_id TEXT NOT NULL,
+            disposition TEXT NOT NULL CHECK(disposition IN
+              ('intent','coalesced','suppressed')), decided_at REAL NOT NULL);
+          CREATE INDEX IF NOT EXISTS task_notification_scope
+            ON task_notifications(task_id,origin);
         """)
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(task_returns)")}
         if "delivery" not in columns:
             self.db.execute("ALTER TABLE task_returns ADD COLUMN delivery TEXT")
+        self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(5)")
 
     def close(self):
         if self.state is None:
@@ -153,13 +164,122 @@ class TaskStore:
             return task
 
     def pending_returns(self, task_id: str) -> list[dict]:
+        # Old read-only ledgers have no notification migration yet.
+        migrated = self._notifications_available()
+        join = "LEFT JOIN task_notifications n ON n.return_id=r.id" if migrated else ""
+        visible = (
+            "AND (n.return_id IS NULL OR n.disposition='intent')" if migrated else ""
+        )
         return [
             dict(id=r[0], payload=json.loads(r[1]))
             for r in self.db.execute(
-                "SELECT id,payload FROM task_returns WHERE task_id=? AND receipt IS NULL ORDER BY rowid",
+                f"SELECT r.id,r.payload FROM task_returns r {join} "
+                f"WHERE r.task_id=? AND r.receipt IS NULL {visible} ORDER BY r.rowid",
                 (task_id,),
             )
         ]
+
+    def _notifications_available(self):
+        return bool(
+            self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='task_notifications'"
+            ).fetchone()
+        )
+
+    def prepare_returns(self, task_id: str) -> list[dict]:
+        """Atomically select readable intentions before any external effect.
+
+        Frozen deliveries are barriers: always replay their original bytes/key.
+        Only unprepared readable events can be covered by another intention.
+        No receipt is written here; coverage is local provenance, not a host ACK.
+        The caller sends this bounded batch, so sends cannot feed their own loop.
+        """
+        from oraculo.presentation import notification_signature, task_view
+
+        with self.state.transaction():
+            task = self.get(task_id)
+            origin = canonical_json(task["origin"])
+            last = self.db.execute(
+                "SELECT n.signature,n.return_id FROM task_notifications n "
+                "JOIN task_returns r ON r.id=n.return_id "
+                "WHERE n.task_id=? AND n.origin=? AND n.disposition='intent' "
+                "AND r.receipt IS NOT NULL ORDER BY r.rowid DESC LIMIT 1",
+                (task_id, origin),
+            ).fetchone()
+            target = tuple(last) if last else None
+            confirmed = target is not None
+            current_signature = notification_signature(task_view(task), task)
+            pending = self.pending_returns(task_id)
+            fresh = []
+
+            def prepare_fresh():
+                nonlocal target, confirmed
+                if not fresh:
+                    return
+                if not target or target[0] != current_signature:
+                    # Prefer the newest event: the one summary of a completed
+                    # batch should not masquerade as an obsolete transition.
+                    representative = fresh[-1]
+                    self.delivery(representative)
+                    self._notification(
+                        representative,
+                        origin,
+                        current_signature,
+                        representative["id"],
+                        "intent",
+                    )
+                    target, confirmed = (current_signature, representative["id"]), False
+                for item in fresh:
+                    if item["id"] != target[1]:
+                        self._notification(
+                            item,
+                            origin,
+                            current_signature,
+                            target[1],
+                            "suppressed" if confirmed else "coalesced",
+                        )
+                fresh.clear()
+
+            for event in pending:
+                row = self.db.execute(
+                    "SELECT delivery FROM task_returns WHERE id=?", (event["id"],)
+                ).fetchone()
+                frozen = json.loads(row[0]) if row[0] else None
+                if frozen is not None:
+                    prepare_fresh()
+                    # Even a pre-upgrade frozen readable duplicate must replay.
+                    if frozen.get("return_format") == "readable":
+                        signature = notification_signature(
+                            frozen["presentation"], frozen["snapshot"]
+                        )
+                        target, confirmed = (signature, event["id"]), False
+                        self._notification(
+                            event, origin, signature, event["id"], "intent"
+                        )
+                    else:
+                        target = None
+                    continue
+                if task.get("return_format", "json") != "readable":
+                    self.delivery(event)
+                    target = None
+                    continue
+                fresh.append(event)
+            prepare_fresh()
+            return self.pending_returns(task_id)
+
+    def _notification(self, event, origin, signature, representative, disposition):
+        self.db.execute(
+            "INSERT OR IGNORE INTO task_notifications VALUES(?,?,?,?,?,?,?)",
+            (
+                event["id"],
+                event["payload"]["task_id"],
+                origin,
+                signature,
+                representative,
+                disposition,
+                time.time(),
+            ),
+        )
 
     def recover_report(self, expected: dict, replacement: dict, audit: dict):
         """CAS, original evidence, replacement, event and outbox in one transaction."""
@@ -235,6 +355,12 @@ class TaskStore:
                 or receipt["threadId"] != self.get(row[0])["origin"]["thread_id"]
             ):
                 raise StateError("return_origin_mismatch")
+            disposition = self.db.execute(
+                "SELECT disposition FROM task_notifications WHERE return_id=?",
+                (event_id,),
+            ).fetchone()
+            if disposition and disposition[0] != "intent":
+                raise StateError("return_was_not_sent")
             self.db.execute(
                 "UPDATE task_returns SET receipt=? WHERE id=?",
                 (canonical_json(receipt), event_id),
@@ -279,7 +405,48 @@ class TaskStore:
             next_offset=offset + len(events),
             total=len(task["events"]),
             snapshot_revision=task.get("snapshot_revision", 0),
+            returns=self.return_history(task_id, events),
         )
+
+    def return_history(self, task_id: str, events: list[dict]) -> list[dict]:
+        """CLI audit page: local coverage never impersonates host confirmation."""
+        migrated = self._notifications_available()
+        result = []
+        for event in events:
+            ident = task_id + ":" + event["id"]
+            row = self.db.execute(
+                "SELECT receipt FROM task_returns WHERE id=?", (ident,)
+            ).fetchone()
+            notification = (
+                self.db.execute(
+                    "SELECT * FROM task_notifications WHERE return_id=?", (ident,)
+                ).fetchone()
+                if migrated
+                else None
+            )
+            record = (
+                dict(notification)
+                if notification
+                else {
+                    "return_id": ident,
+                    "disposition": "unprepared",
+                }
+            )
+            receipt = json.loads(row[0]) if row and row[0] else None
+            record["receipt"] = receipt
+            record["delivery_status"] = "host_confirmed" if receipt else "pending"
+            if notification and notification["disposition"] != "intent":
+                representative = self.db.execute(
+                    "SELECT receipt FROM task_returns WHERE id=?",
+                    (notification["representative_id"],),
+                ).fetchone()
+                record["delivery_status"] = (
+                    "covered_by_confirmed"
+                    if representative and representative[0]
+                    else "covered_by_pending"
+                )
+            result.append(record)
+        return result
 
     def describe(self, task_id: str) -> dict:
         from oraculo.presentation import task_view

@@ -567,3 +567,92 @@ falha; **exit 1 e `work_not_successful` são esperados**, não aprovação do ca
 mesmo comando revalida as fontes e reenvia o mesmo evento sem duplicá-lo. Após
 schema 4, esse comando deixa de ser aplicável. Só então continuar o procedimento
 de quiescência e migração; reconciliar uma tarefa não certifica quiescência global.
+
+### Avisos legíveis: uma mudança útil, uma intenção de envio
+
+Uma transição técnica não é uma nova execução. Antes desta política, cada evento
+criava uma linha na outbox; o envio consultava o snapshot mais recente para cada
+linha. Um lote de dez transições terminando em `settled` podia enviar dez resumos
+“Encerrada — O encerramento foi registrado”. As chaves eram diferentes: a
+idempotência por `event_id` evitava repetir **o mesmo evento**, mas não dez eventos
+com significado igual. Filtrar no consumidor depois de `t3_thread_send` não evita
+que o host já mostre as mensagens.
+
+O `flush_returns` agora prepara atomicamente um lote finito antes de chamar o T3:
+
+- Para `return_format=readable`, eventos ainda não congelados que produziriam o
+  mesmo resumo no snapshot de emissão compartilham uma intenção. O evento mais
+  novo do grupo é o representante. Mudanças intermediárias ainda não emitidas
+  continuam no histórico; a notificação descreve o estado observado ao preparar
+  o envio, sem reproduzir cada fase técnica antiga.
+- Uma assinatura semântica versionada compara esse resumo com o último aviso
+  confirmado da **mesma tarefa e origem completa**. Inclui fase legível, atividade
+  e progresso exibidos, resultado, ação, bloqueio (inclusive código bruto quando
+  duas causas têm a mesma explicação genérica), tipo de entrega, aprovação,
+  título, projeto e link. Exclui revision, timestamps e identidade do evento.
+  A→B→A avisa as três mudanças; não há supressão global por assinatura histórica.
+- Fase, progresso útil, erro, bloqueio ou aprovação diferentes em emissões
+  sucessivas continuam gerando aviso. Repetir a mesma condição que exige ação
+  conserva o aviso anterior; não envia lembretes a cada prova técnica. Uma
+  condição atual que exige ação nunca é coberta por um aviso de sucesso distinto.
+- Envio não cria transição. Eventos novos durante uma chamada ficam para o
+  próximo lote, evitando recursão no próprio flush.
+
+A tabela aditiva `task_notifications` guarda a disposição local `intent`,
+`coalesced` (coberto por intenção ainda pendente) ou `suppressed` (igual ao último
+aviso confirmado), assinatura, origem, representante e instante da decisão. É a
+versão 1 da política, identificada no domínio da assinatura. `task_returns`
+conserva todos os envelopes originais; o histórico da tarefa conserva todos os
+eventos e provas. **Somente envio efetivamente confirmado recebe `receipt` T3.**
+Eventos cobertos ficam com `receipt=NULL`; não são ACKs, entregas autônomas ou
+provas criptográficas do host.
+
+`oraculo task history` preserva a paginação de eventos e acrescenta `returns` com
+as disposições e referências da mesma página. `delivery_status=host_confirmed`
+exige recibo do próprio evento; `covered_by_pending`/`covered_by_confirmed` referem
+à intenção representante. O status `pending_returns` conta intenções que ainda
+precisam de envio, sem prender settlement ou reserva por linhas cobertas. Receber
+e persistir o evento, decidir sua cobertura e confirmar entrega são fatos
+separados. Se o envio falha, o representante continua pendente e o grupo aponta
+para ele. Nenhum evento/prova é apagado.
+
+A preparação e os vínculos são uma transação local durável. ACK perdido ou
+interrupção reusa exatamente o envelope congelado e `clientRequestId` anterior,
+inclusive após reinício. A garantia de uma entrega lógica depende da idempotência
+do host para essa chave; SQLite e T3 não formam uma transação distribuída. O
+snapshot é uma observação na preparação do envio; o destinatário ainda deve
+consultar status fresco antes de tratá-lo como estado atual.
+
+Compatibilidade e implantação:
+
+- `return_format=json` e tarefas legadas sem formato continuam enviando **todos**
+  os envelopes, em JSON puro. Consumidores que precisam de cada transição devem
+  usar esse formato. Somente o fluxo legível admite cobertura de eventos.
+- Entregas já congeladas, legíveis ou JSON, são barreiras imutáveis: não se muda
+  mensagem/chave nem se suprime uma emissão possivelmente já enviada. Um backlog
+  congelado antes da atualização ainda pode mostrar repetições. Não é possível
+  removê-las sem quebrar reconciliação; T3 não oferece edição de mensagem ou um
+  canal invisível verificado.
+- O daemon atualizado cria tabela/índice de forma aditiva e marca schema5 no
+  ledger gerenciado; não reescreve tarefas, eventos, recibos ou deliveries
+  antigos. O estado principal permanece schema4. Leituras offline novas aceitam
+  ledgers anteriores à tabela e schema5.
+  CLI nova sozinha não muda o flush de um serviço antigo.
+- Coordenar atualização oficial do serviço, backup e quiescência com a origem.
+  **Escritores antigos recusam o ledger schema5** pelo gate de versão já
+  existente; ignorar a tabela permitiria reenviar linhas cobertas com recibo
+  nulo. O manifest do runtime continua descrevendo schema4 do estado principal:
+  isso não certifica compatibilidade de downgrade do ledger gerenciado. Não há
+  migração reversa ou rollback de notificações nesta entrega. Nunca baixar
+  manualmente a versão, preencher recibos artificiais ou apagar outbox para
+  viabilizar downgrade.
+
+Na fixture sintética de dez transições (após um aviso inicial já confirmado), a
+base faz 10 chamadas/22.262 bytes UTF-8 de texto; a política faz 1 chamada/2.253
+bytes, mantendo 11 eventos e 11 linhas de outbox. Só há 2 recibos retornados pelo host simulado (inicial e
+final), em vez de 11. Conteúdo da outbox: 18.477→6.118 bytes; metadados novos de
+cobertura: 5.043 bytes adicionais. Valores são somas dos campos, não tamanho de
+páginas SQLite/WAL nem tráfego total do protocolo. O lote custa trabalho local
+linear para classificar eventos, com consultas e uma gravação de disposição por
+item; continua retendo toda auditoria e não promete redução de armazenamento para
+todo tamanho de tarefa. Tempos de uma fixture local sem rede não são SLA de T3.

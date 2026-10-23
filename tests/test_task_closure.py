@@ -110,6 +110,7 @@ async def test_required_checks_wait_uses_host_watch_not_merge(system):
 
 async def test_merge_receipt_final_memory_and_observed_settlement(system):
     task, policy, lifecycle, calls = await setup(system)
+    sends_before = sum(name == "t3_thread_send" for name, _ in system.host.calls)
     result = await system.engine.command(
         "merge", {"task_id": task["id"], "policy": policy}
     )
@@ -119,6 +120,13 @@ async def test_merge_receipt_final_memory_and_observed_settlement(system):
     assert result["final_memory"]["write_receipt"]["commit"]
     assert calls == {"watch": 1, "unwatch": 1, "settle": 1}
     assert lifecycle.calls == 1
+    sends_after = sum(name == "t3_thread_send" for name, _ in system.host.calls)
+    assert sends_after - sends_before == 1
+    assert result["pending_returns"] == 0
+    audit = system.store.history(task["id"])
+    assert audit["events"][-1]["phase"] == "settled"
+    assert audit["returns"][-1]["delivery_status"] == "host_confirmed"
+    assert any(row["disposition"] == "coalesced" for row in audit["returns"])
     # Neither daemon nor an ordinary resume should become a PR polling loop.
     before = copy.deepcopy(system.host.calls)
     await system.engine.reconcile(task["id"])

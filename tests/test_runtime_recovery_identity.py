@@ -103,8 +103,9 @@ def test_offline_status_does_not_migrate_legacy_ledger_under_writer_lock(
     path = loaded.state_dir / "managed-tasks.sqlite3"
     store = TaskStore(path)
     task = store.create({"thread_id": "fixture-origin"}, "fixture-task", {})
+    store.db.execute("DROP TABLE task_notifications")
     store.db.execute("ALTER TABLE task_returns DROP COLUMN delivery")
-    store.db.execute("DELETE FROM schema_migrations WHERE version=4")
+    store.db.execute("DELETE FROM schema_migrations WHERE version>=4")
     store.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(3)")
     store.close()
     before = path.read_bytes()

@@ -53,6 +53,8 @@ class State:
         path: str | Path,
         max_executors: int = 1,
         provider_limits: dict[str, int] | None = None,
+        *,
+        schema_max: int = 4,
     ) -> None:
         if type(max_executors) is not int or max_executors < 1:
             raise StateError("max_executors must be a positive integer")
@@ -72,7 +74,7 @@ class State:
             version = self.connection.execute(
                 "SELECT max(version) FROM schema_migrations"
             ).fetchone()[0]
-            if version and version > 4:
+            if version and version > schema_max:
                 self.connection.close()
                 raise StateError("state_schema_newer_than_runtime")
         self.connection.executescript(SCHEMA)
