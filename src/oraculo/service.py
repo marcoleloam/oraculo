@@ -936,6 +936,17 @@ class Service:
 
     async def handle(self, envelope: Envelope) -> dict:
         prepared_cycle = None
+        if envelope.kind == "experience.snapshot":
+            from oraculo.experience_service import response as experience_response
+
+            async with self.memory_lock:
+                data = experience_response(self, envelope.project_id, envelope.payload)
+            return {
+                "request_id": envelope.request_id,
+                "ok": True,
+                "state": "ok",
+                "data": data,
+            }
         if envelope.kind in {"managed.capabilities", "managed.read"}:
             if envelope.kind == "managed.capabilities":
                 data = {

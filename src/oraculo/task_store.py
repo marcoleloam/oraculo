@@ -71,6 +71,8 @@ class TaskStore:
     def create(self, origin: dict, key: str, request: dict) -> dict:
         if not key or len(key) > 200:
             raise StateError("task_dedupe_key_required")
+        if request.get("return_format", "readable") not in {"readable", "json"}:
+            raise StateError("invalid_return_format")
         task_id = "task-" + content_hash([origin["thread_id"], key])
         digest = content_hash(request)
         with self.state.transaction():
@@ -93,6 +95,7 @@ class TaskStore:
                 publication=None,
                 merged=False,
                 settled=False,
+                return_format=request.get("return_format", "readable"),
             )
             self.db.execute(
                 "INSERT INTO managed_tasks VALUES(?,?,?,?,?)",
@@ -209,6 +212,11 @@ class TaskStore:
                 )
             },
         )
+        from oraculo.presentation import task_view
+
+        payload["presentation"] = task_view(task)
+        # Old tasks and already cached deliveries keep their original wire format.
+        payload["return_format"] = task.get("return_format", "json")
         self.db.execute(
             "UPDATE task_returns SET delivery=? WHERE id=?",
             (canonical_json(payload), event["id"]),
@@ -274,6 +282,8 @@ class TaskStore:
         )
 
     def describe(self, task_id: str) -> dict:
+        from oraculo.presentation import task_view
+
         task = self.get(task_id)
         return {
             k: v
@@ -291,6 +301,8 @@ class TaskStore:
                 "events",
             }
         } | {
+            "presentation": task_view(task),
+            "title": (task.get("request") or {}).get("title"),
             "continuation_bootstrap": (
                 {
                     k: task["continuation_bootstrap"][k]

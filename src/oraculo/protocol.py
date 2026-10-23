@@ -64,6 +64,7 @@ class Envelope(BaseModel):
         "status.get",
         "managed.capabilities",
         "managed.read",
+        "experience.snapshot",
         "managed.execute",
         "maintenance.begin",
         "maintenance.status",
@@ -126,7 +127,14 @@ def parse_envelope(raw: bytes) -> Envelope:
     return Envelope.model_validate_json(raw)
 
 
-def is_control_event(message: dict[str, Any]) -> bool:
+def is_control_event(message: dict[str, Any] | str) -> bool:
+    if isinstance(message, str):
+        from oraculo.presentation import parse_return_message
+
+        try:
+            message = parse_return_message(message)
+        except (ValueError, TypeError):
+            return False
     return (
         message.get("marker") == CONTROL_MARKER or message.get("kind") == "status_event"
     )
