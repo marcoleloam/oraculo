@@ -1571,7 +1571,7 @@ class ManagedTasks:
         from oraculo.presentation import return_message
 
         task = self.store.get(task_id)
-        for event in self.store.pending_returns(task_id):
+        for event in self.store.prepare_returns(task_id):
             try:
                 receipt = await self.host.call(
                     "t3_thread_send",
