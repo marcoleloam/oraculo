@@ -286,10 +286,19 @@ class TaskStore:
                 "submitted_report",
                 "report_recovery",
                 "report_bootstrap",
+                "continuation_bootstrap",
                 "launch_arguments",
                 "events",
             }
         } | {
+            "continuation_bootstrap": (
+                {
+                    k: task["continuation_bootstrap"][k]
+                    for k in ("version", "original_sha256", "work_status")
+                }
+                if task.get("continuation_bootstrap")
+                else None
+            ),
             "report_bootstrap": (
                 {
                     k: task["report_bootstrap"][k]
