@@ -104,7 +104,7 @@ relatório com `task finish`:
   "task_id": "<id>",
   "report": {
     "summary": "Exportação implementada",
-    "checks": [{"command": "test command", "status": "passed"}],
+    "checks": [{"command": "test command", "status": "passed", "result": "Execução final: exit 0", "proof": "/private/evidence/check-final.log"}],
     "commit": "<SHA validado>",
     "decisions": [],
     "limitations": []
@@ -132,11 +132,41 @@ canônico `confirmed`/commit. Falhas de memória ficam visíveis e são retomáv
 ### Validação antes da submissão
 
 Executor e origem usam o mesmo validador canônico antes de gravar qualquer
-relatório imutável. `checks` contém somente verificações executadas: `command`
-não vazio e `status` igual a `passed` ou `failed`; as únicas chaves opcionais são
-`result`, `proof` e `layer`. Registre verificações não executadas em `limitations`.
+relatório imutável. `checks` registra somente a execução final real de **cada
+verificação**: `command` não vazio e `status` igual a `passed` ou `failed`; as únicas
+chaves opcionais são `result`, `proof` e `layer`. Registre verificações não
+executadas em `limitations`.
 `not_run`, `skip` e ausência de checks são rejeitados; nunca são convertidos em
 sucesso ou falha. `FAIL` explícito e checks falhos continuam sendo evidência negativa.
+
+Antes da submissão, preserve falhas intermediárias corrigidas e repetidas em
+`decisions` ou `limitations`, com comando, resultado/status original, correção
+aplicada e evidência da repetição. Não omita o histórico nem invente status.
+Exemplo ilustrativo de um relatório ainda não submetido, após repetir a mesma
+verificação com sucesso (os logs referenciados devem existir na execução real):
+
+```json
+{
+  "summary": "Exportação implementada e validada",
+  "commit": "<SHA completo validado>",
+  "checks": [{
+    "command": "pytest tests/test_export.py -q",
+    "status": "passed",
+    "result": "Execução final: 12 passed; exit 0",
+    "proof": "/private/evidence/export-final.log"
+  }],
+  "decisions": [
+    "Histórico: pytest tests/test_export.py -q retornou failed, 1 failed/11 passed, exit 1 (/private/evidence/export-initial.log). Corrigida a serialização de campos vazios. O mesmo comando foi repetido: passed, 12 passed, exit 0 (/private/evidence/export-final.log)."
+  ],
+  "limitations": ["Teste de integração externo não executado."]
+}
+```
+
+Se a execução final de uma verificação ainda falha, seu `failed` é obrigatório
+em `checks`. Repetir apenas um subconjunto ou executar outro comando com sucesso
+não apaga uma verificação que segue falhando: uma suíte completa falha continua
+`failed` quando apenas um teste isolado passa depois. Nunca altere retrospectivamente
+um relatório imutável nem remova um `failed` já submetido.
 
 A validação cobre forma, campos aceitos, tipo de entrega, parecer, summary,
 serialização JSON e a projeção exata de memória, limitada a 262144 bytes UTF-8
@@ -476,6 +506,15 @@ e `documentation_observations`. Esses campos preservam proveniência no relatór
 não concedem aprovação nem ampliam o schema da memória. Outros campos desconhecidos
 no relatório/check ou verdict fora de `PASS`/`FAIL` bloqueiam. O relatório submetido
 e o ciclo são imutáveis.
+
+Mesmo que haja um `passed` posterior, qualquer `failed` em `checks` mantém o
+parecer negativo; o validador não deduz substituição pela ordem ou por comandos
+iguais. No relatório ainda não submetido, registre a execução final real de cada
+verificação e preserve falhas intermediárias corrigidas e repetidas em `decisions`
+ou `limitations`, conforme [validação antes da submissão](#validação-antes-da-submissão).
+Falha final permanece `failed`, inclusive quando uma repetição parcial ou diferente
+passa. Essa orientação não autoriza alterar relatórios imutáveis ou remover
+`failed` já submetido; uma nova execução não reclassifica a submissão anterior.
 
 Uma instalação anterior pode ter um relatório negativo submetido, memória
 `failed/saved` já confirmada pelo serviço e ledger ainda `pending`, impedindo

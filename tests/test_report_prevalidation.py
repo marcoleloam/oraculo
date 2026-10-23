@@ -10,6 +10,7 @@ from test_managed_service import Caller
 from test_managed_tasks import git, initialize, report
 
 from oraculo.managed_service import command
+from oraculo.managed_tasks import ManagedTasks, ReportValidationError
 from oraculo.memory.cycles import report_projection
 from oraculo.protocol import content_hash
 from oraculo.state import StateError
@@ -56,6 +57,127 @@ async def flow(running_service):
     return SimpleNamespace(
         service=service, host=host, invoke=invoke, begin=begin, snapshot=snapshot
     )
+
+
+@pytest.mark.parametrize("history_field", ["decisions", "limitations"])
+async def test_final_passed_checks_preserve_corrected_failure_history(
+    flow, history_field
+):
+    task = await flow.begin()
+    evidence = report(task)
+    evidence["checks"][0].update(
+        result="Final execution: 1 passed; exit 0", proof="/private/check-final.log"
+    )
+    history = (
+        "pytest tests/test_example.py: failed, 1 failed, exit 1 "
+        "(/private/check-initial.log). Fixed empty-field serialization. "
+        "Repeated pytest tests/test_example.py: passed, 1 passed, exit 0 "
+        "(/private/check-final.log)."
+    )
+    evidence.setdefault(history_field, []).append(history)
+    canonical_task = flow.service.managed_service.store.get(task["id"])
+    assert ManagedTasks._validate_report(canonical_task, evidence) == (
+        "implementation",
+        False,
+    )
+    original = copy.deepcopy(evidence)
+    flow.host.caller = task["child"]["childThreadId"]
+    submitted = await flow.invoke("finish", task_id=task["id"], report=evidence)
+    assert submitted["phase"] == "validation_submitted"
+    flow.host.complete(flow.host.caller)
+    flow.host.caller = "origin"
+    result = await flow.invoke("resume", task_id=task["id"])
+    assert result["work_status"] == "succeeded", result
+    assert result["memory"]["write_state"] == "saved"
+    assert result["memory"]["write_receipt"]["state"] == "confirmed"
+    saved = flow.snapshot(task)
+    assert saved["task"]["submitted_report"] == original
+    assert saved["task"]["report"] == original
+    assert saved["cycle"]["report"]["evidence"] == original
+
+
+@pytest.mark.parametrize(
+    "later_command",
+    [
+        "pytest tests/test_example.py",
+        "pytest tests/test_example.py -k empty_field",
+        "ruff check src",
+    ],
+    ids=["same-command", "partial-rerun", "different-command"],
+)
+async def test_failed_check_remains_negative_with_later_passed(flow, later_command):
+    task = await flow.begin()
+    evidence = report(task)
+    evidence["checks"][0].update(
+        status="failed", result="1 failed; exit 1", proof="/private/check-failed.log"
+    )
+    evidence["checks"].append(
+        {"command": later_command, "status": "passed", "result": "exit 0"}
+    )
+    evidence["verdict"] = "PASS"  # Cannot override any failed check.
+    canonical_task = flow.service.managed_service.store.get(task["id"])
+    assert ManagedTasks._validate_report(canonical_task, evidence) == (
+        "implementation",
+        True,
+    )
+    original = copy.deepcopy(evidence)
+    flow.host.caller = task["child"]["childThreadId"]
+    submitted = await flow.invoke("finish", task_id=task["id"], report=evidence)
+    assert submitted["phase"] == "validation_submitted"
+    flow.host.complete(flow.host.caller)
+    flow.host.caller = "origin"
+    result = await flow.invoke("resume", task_id=task["id"])
+    assert result["work_status"] == "failed", result
+    assert result["blocked_reason"] == "work_not_successful"
+    assert result["publication"] is None
+    assert result["memory"]["write_state"] == "saved"
+    assert result["memory"]["write_receipt"]["state"] == "confirmed"
+    saved = flow.snapshot(task)
+    assert saved["task"]["submitted_report"] == original
+    assert saved["task"]["report"] == original
+    assert saved["cycle"]["report"]["evidence"] == original
+
+    rewritten = copy.deepcopy(evidence)
+    rewritten["checks"] = rewritten["checks"][1:]
+    rejected = await flow.invoke("finish", task_id=task["id"], report=rewritten)
+    assert rejected["blocked_reason"] == "terminal_report_reused"
+    unchanged = flow.snapshot(task)
+    assert unchanged["task"]["submitted_report"] == original
+    assert unchanged["task"]["report"] == original
+    assert unchanged["cycle"] == saved["cycle"]
+
+
+@pytest.mark.parametrize(
+    "negative", [{"verdict": "FAIL"}, {"summary": "FAIL — review"}]
+)
+def test_final_passed_checks_do_not_override_explicit_fail(negative):
+    evidence = {
+        "summary": "Validated example",
+        "commit": "a" * 40,
+        "checks": [{"command": "pytest", "status": "passed"}],
+        **negative,
+    }
+    assert ManagedTasks._validate_report({"request": {}}, evidence) == (
+        "implementation",
+        True,
+    )
+
+
+@pytest.mark.parametrize("scope", ["report", "check"])
+def test_superseded_by_is_not_a_supported_report_or_check_field(scope):
+    evidence = {
+        "commit": "a" * 40,
+        "checks": [{"command": "pytest", "status": "passed"}],
+    }
+    target = evidence if scope == "report" else evidence["checks"][0]
+    target["superseded_by"] = "later-check"
+    reason = (
+        "invalid_validation_report"
+        if scope == "report"
+        else "malformed_validation_check"
+    )
+    with pytest.raises(ReportValidationError, match=reason):
+        ManagedTasks._validate_report({"request": {}}, evidence)
 
 
 @pytest.mark.parametrize("independent", [False, True])
