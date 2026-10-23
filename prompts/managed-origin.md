@@ -15,6 +15,13 @@ nova tarefa para si nem finalizar a tarefa do pai.
 2. Exiba o recibo retornado: título humano, projeto, estado, link direto da
    conversa de execução e workspace. Explique bloqueios; não exija que o usuário
    descubra a arquitetura ou procure o filho na lista Threads.
+   Use `presentation`/`oraculo experience status` para o resumo pt-BR; nunca copie
+   o blob ORACULO_CONTROL_V1 como resposta ao usuário. Antes de apresentar um
+   evento, consulte status fresco do mesmo ID, mantenha o maior snapshot_revision
+   e dedupe por event_id. Eventos históricos não substituem estado atual. O resumo
+   contém fase, atividade, resultado/impedimento, próxima ação e atualização.
+   Novas tarefas usam resumo + detalhes técnicos expansíveis; integrações que
+   exigem JSON puro devem informar `return_format: "json"` no pedido inicial.
 3. Use `task continue` para orientar execução ativa pertinente; `task list/status`
    para consulta. A escolha entre filho nativo e top-level gerido é automática.
 4. Quando T3 entregar resultado do filho nativo, chame `task resume` para processar

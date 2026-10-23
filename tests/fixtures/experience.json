@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-23T14:00:00Z",
+  "projects": [
+    {
+      "id": "demo",
+      "title": "Jardim de ideias · demonstração"
+    }
+  ],
+  "documents": [
+    {
+      "path": "projects/demo/wiki/concepts/demo--imports.md",
+      "content": "---\nschema_version: 1\npage_id: imports\nproject_id: demo\ntype: concept\nsources: []\ntags: [Importação, Memória]\naliases: [Importação segura]\nreviewed: true\ncreated: '2026-10-20'\nupdated: '2026-10-23'\n---\n# Importação segura de notas\n\nValidar a origem e manter evidências antes de reconstruir o índice.\n"
+    },
+    {
+      "path": "projects/demo/raw/3b838c77e40c82643751db1bce6681add7eb59cba3f47d3caf3b114109c2146c.md",
+      "content": "{\"cycle_id\": \"cycle-demo-1\", \"evidence\": {\"checks\": [{\"command\": \"pytest tests/test_import_fixture.py\", \"status\": \"passed\"}], \"decisions\": [\"Preservar notas existentes e reconstruir somente a projeção.\"], \"errors\": [\"import_source_missing\"], \"lessons\": [\"Conferir a origem da nota antes de importar.\"], \"memory_application\": [\"O agente declarou usar a regra de preservação das notas.\"], \"summary\": \"A fixture registra o teste de importação e suas evidências.\", \"title\": \"Reconciliar importação de notas\", \"topics\": [\"Importação\", \"Memória\"]}, \"project_id\": \"demo\", \"schema_version\": 1}",
+      "sha256": "3b838c77e40c82643751db1bce6681add7eb59cba3f47d3caf3b114109c2146c"
+    },
+    {
+      "path": "projects/demo/wiki/sources/demo--cycle-demo-1.md",
+      "content": "---\nschema_version: 1\npage_id: cycle-demo-1\nproject_id: demo\ntype: source\nsources: ['[[projects/demo/raw/3b838c77e40c82643751db1bce6681add7eb59cba3f47d3caf3b114109c2146c.md]]']\ntags: [Importação]\naliases: ['Reconciliar importação de notas']\nreviewed: false\ncreated: '2026-10-23'\nupdated: '2026-10-23'\n---\n# Reconciliar importação de notas\n\n## Resumo\n\nA importação preservou a identidade das notas e registrou o resultado.\n\nFonte: [[projects/demo/raw/3b838c77e40c82643751db1bce6681add7eb59cba3f47d3caf3b114109c2146c.md]]\n"
+    },
+    {
+      "path": "projects/demo/raw/281ccaf25b6b01e8e2691cdfbc5b4c08dd6b4802466d948676cbf25430ce46a5.md",
+      "content": "{\"cycle_id\": \"cycle-demo-2\", \"evidence\": {\"checks\": [{\"command\": \"pytest tests/test_import_fixture.py\", \"status\": \"failed\"}], \"decisions\": [\"Preservar notas existentes e reconstruir somente a projeção.\"], \"errors\": [\"import_source_missing\"], \"lessons\": [\"Conferir a origem da nota antes de importar.\"], \"memory_application\": [\"O agente declarou usar a regra de preservação das notas.\"], \"summary\": \"A fixture registra o teste de importação e suas evidências.\", \"title\": \"Investigar erro repetido de importação\", \"topics\": [\"Importação\", \"Memória\"]}, \"project_id\": \"demo\", \"schema_version\": 1}",
+      "sha256": "281ccaf25b6b01e8e2691cdfbc5b4c08dd6b4802466d948676cbf25430ce46a5"
+    },
+    {
+      "path": "projects/demo/wiki/sources/demo--cycle-demo-2.md",
+      "content": "---\nschema_version: 1\npage_id: cycle-demo-2\nproject_id: demo\ntype: source\nsources: ['[[projects/demo/raw/281ccaf25b6b01e8e2691cdfbc5b4c08dd6b4802466d948676cbf25430ce46a5.md]]']\ntags: [Importação]\naliases: ['Investigar erro repetido de importação']\nreviewed: false\ncreated: '2026-10-23'\nupdated: '2026-10-23'\n---\n# Investigar erro repetido de importação\n\n## Resumo\n\nA importação preservou a identidade das notas e registrou o resultado.\n\nFonte: [[projects/demo/raw/281ccaf25b6b01e8e2691cdfbc5b4c08dd6b4802466d948676cbf25430ce46a5.md]]\n"
+    }
+  ],
+  "cycles": [
+    {
+      "id": "cycle-demo-1",
+      "project_id": "demo",
+      "read_state": "found",
+      "read_receipt": {
+        "at": "2026-10-23T13:00:00Z",
+        "sources": [
+          {
+            "path": "projects/demo/wiki/concepts/demo--imports.md",
+            "sha256": "f78d2f9623c6caeb51904824e6898c67709a29fa8d1439023c4d40c4db7c1a8b"
+          }
+        ]
+      },
+      "write_state": "saved",
+      "write_receipt": {
+        "state": "confirmed"
+      }
+    },
+    {
+      "id": "cycle-demo-2",
+      "project_id": "demo",
+      "read_state": "found",
+      "read_receipt": {
+        "at": "2026-10-23T13:00:00Z",
+        "sources": [
+          {
+            "path": "projects/demo/wiki/concepts/demo--imports.md",
+            "sha256": "f78d2f9623c6caeb51904824e6898c67709a29fa8d1439023c4d40c4db7c1a8b"
+          }
+        ]
+      },
+      "write_state": "saved",
+      "write_receipt": {
+        "state": "confirmed"
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task-demo-1",
+      "title": "Reconciliar importação de notas",
+      "project": {
+        "project_id": "demo"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "snapshot_revision": 6,
+      "observed_at": "2026-10-23T14:00:00Z",
+      "child": {
+        "childThreadId": "demo-thread-1"
+      },
+      "memory": {
+        "id": "cycle-demo-1"
+      },
+      "completion_evidence": true
+    },
+    {
+      "id": "task-demo-2",
+      "title": "Investigar erro repetido de importação",
+      "project": {
+        "project_id": "demo"
+      },
+      "phase": "memory_pending",
+      "work_status": "failed",
+      "snapshot_revision": 7,
+      "observed_at": "2026-10-23T14:00:00Z",
+      "child": {
+        "childThreadId": "demo-thread-2"
+      },
+      "memory": {
+        "id": "cycle-demo-2"
+      },
+      "completion_evidence": true
+    }
+  ]
+}

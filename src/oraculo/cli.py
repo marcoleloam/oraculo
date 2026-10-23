@@ -181,6 +181,23 @@ def parser() -> argparse.ArgumentParser:
     from oraculo.host_ack import register_parsers as bridge_parsers
 
     bridge_parsers(commands)
+    obsidian = commands.add_parser("obsidian")
+    labels = obsidian.add_subparsers(dest="action", required=True).add_parser(
+        "project-labels"
+    )
+    labels.add_argument("--file", type=Path)
+    labels.add_argument("--project", action="append", required=True)
+    experience = commands.add_parser("experience")
+    views = experience.add_subparsers(dest="action", required=True)
+    export = views.add_parser("export")
+    export.add_argument("--file", type=Path, required=True)
+    export.add_argument("--project", required=True)
+    export.add_argument("--output", type=Path, required=True)
+    snapshot = views.add_parser("snapshot")
+    snapshot.add_argument("--project", required=True)
+    readable = views.add_parser("status")
+    readable.add_argument("--file", type=Path, required=True)
+    readable.add_argument("--json", action="store_true")
     commands.add_parser("serve")
     diagnostics = commands.add_parser("doctor")
     diagnostics.add_argument(
@@ -363,9 +380,105 @@ def make_envelope(kind: str, project: str, payload: dict) -> dict:
     }
 
 
+async def experience_snapshot(config: Config, project: str) -> dict:
+    """Download a scoped, hash-checked snapshot without opening live storage."""
+    from oraculo.memory.transport import MAX_ARTIFACT_BYTES
+
+    result = await request(config, make_envelope("experience.snapshot", project, {}))
+    if not result.get("ok"):
+        raise ValueError(
+            "experience_snapshot_service_failed:"
+            + str((result.get("error") or {}).get("message"))
+        )
+    data = result["data"]
+    reference = data.get("artifact")
+    if reference is None:
+        return data
+    if reference.get("bytes", MAX_ARTIFACT_BYTES + 1) > MAX_ARTIFACT_BYTES:
+        raise ValueError("experience_snapshot_too_large")
+    chunks, offset = [], 0
+    for _ in range(MAX_ARTIFACT_BYTES // 4096 + 1):
+        result = await request(
+            config,
+            make_envelope(
+                "experience.snapshot",
+                project,
+                {"artifact": reference["artifact"], "offset": offset},
+            ),
+        )
+        if not result.get("ok"):
+            raise ValueError("experience_snapshot_download_failed")
+        page = result["data"]
+        if (
+            page.get("project_id") != project
+            or page.get("job_id") != "experience"
+            or page.get("artifact") != reference["artifact"]
+            or page.get("sha256") != reference["sha256"]
+            or page.get("offset") != offset
+            or page.get("next_offset") != offset + len(page["content"])
+        ):
+            raise ValueError("experience_snapshot_chunk_mismatch")
+        chunks.append(page["content"])
+        offset = page["next_offset"]
+        if page["eof"]:
+            raw = "".join(chunks).encode()
+            if (
+                len(raw) != reference["bytes"]
+                or hashlib.sha256(raw).hexdigest() != reference["sha256"]
+            ):
+                raise ValueError("experience_snapshot_integrity")
+            wrapper = json.loads(raw)
+            if (
+                wrapper.get("project_id") != project
+                or wrapper.get("job_id") != "experience"
+            ):
+                raise ValueError("experience_snapshot_scope")
+            return wrapper["context"]["bundle"]
+        if not page["content"]:
+            break
+    raise ValueError("experience_snapshot_incomplete")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "obsidian":
+            from oraculo.obsidian import project_labels_css
+
+            print(
+                project_labels_css(
+                    json.loads(
+                        args.file.read_text() if args.file else sys.stdin.read()
+                    ),
+                    args.project,
+                ),
+                end="",
+            )
+            return 0
+        if args.command == "experience":
+            from oraculo.experience import export_files, project_model, write_export
+            from oraculo.presentation import summary_markdown, task_view
+
+            if args.action == "snapshot":
+                print_json(
+                    asyncio.run(
+                        experience_snapshot(Config.load(args.config), args.project)
+                    )
+                )
+            elif args.action == "export":
+                model = project_model(json.loads(args.file.read_text()), args.project)
+                print_json(write_export(args.output, export_files(model)))
+            else:
+                status = json.loads(args.file.read_text())
+                if "ok" in status:
+                    if status["ok"] is not True:
+                        raise ValueError("experience_failed_status")
+                    status = status["data"]
+                if args.json:
+                    print_json(status)
+                else:
+                    print(summary_markdown(task_view(status)))
+            return 0
         if args.command == "bridge":
             from oraculo.host_ack import run_ack
 

@@ -1568,6 +1568,8 @@ class ManagedTasks:
         await self.flush_returns(task_id)
 
     async def flush_returns(self, task_id: str):
+        from oraculo.presentation import return_message
+
         task = self.store.get(task_id)
         for event in self.store.pending_returns(task_id):
             try:
@@ -1575,7 +1577,7 @@ class ManagedTasks:
                     "t3_thread_send",
                     dict(
                         threadId=task["origin"]["thread_id"],
-                        message=canonical_json(self.store.delivery(event)),
+                        message=return_message(self.store.delivery(event)),
                         mode="auto",
                         clientRequestId=event["id"],
                     ),

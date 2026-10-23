@@ -49,3 +49,12 @@ from the receipt. Separate `loaded_skill`, `called_cli` and `confirmed_service`;
 unobserved layers stay `not_observed`. A skill file, an agent's claim, CLI exit 0,
 and a service receipt prove different things. Do not announce provider support or
 global enforcement based on discovery alone.
+
+Present `presentation` as a concise pt-BR summary: phase, activity, outcome or
+blocker, next action (or no action needed), observed update and conversation link.
+Do not echo raw ORACULO_CONTROL_V1. Refresh task status first and dedupe event_id;
+frozen/replayed events do not prove current state. New tasks support readable
+messages with the complete machine envelope in technical details. Set
+`return_format: "json"` at start for integrations requiring a pure JSON body.
+`oraculo experience status --file STATUS` renders the same view offline; `--json`
+retains the input for agents. T3 has no verified invisible technical-event channel.

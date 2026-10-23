@@ -46,6 +46,11 @@ REPORT_FIELDS = frozenset(
         "artifacts",
         "criteria",
         "operations",
+        "title",
+        "topics",
+        "memory_application",
+        "lessons",
+        "errors",
     }
 )
 
@@ -419,6 +424,13 @@ class MemoryCycles:
                 + "\n\nSíntese abreviada; consulte a fonte para o conteúdo integral."
             )
         day = item["finished_at"][:10]
+        from oraculo.presentation import markdown, plain
+
+        evidence = item["report"]["evidence"]
+        title = (
+            plain(evidence.get("title") or evidence.get("summary"), 140)
+            or "Memória da tarefa"
+        )
         content = render_page(
             {
                 "schema_version": 1,
@@ -427,12 +439,12 @@ class MemoryCycles:
                 "type": "source",
                 "sources": [f"[[{raw}]]"],
                 "tags": [],
-                "aliases": [],
+                "aliases": [markdown(title)],
                 "reviewed": False,
                 "created": day,
                 "updated": day,
             },
-            f"# Task memory {item['id']}\n\nWork status: {item['work_status']}\n\n"
+            f"# {markdown(title)}\n\nWork status: {item['work_status']}\n\n"
             f"Recorded: {item['finished_at']}\n\n{summary}\n\n"
             f"Structured evidence and provenance: [[{raw}]]\n",
         )
