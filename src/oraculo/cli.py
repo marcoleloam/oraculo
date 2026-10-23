@@ -157,6 +157,7 @@ def parser() -> argparse.ArgumentParser:
             "finish",
             "recover-report",
             "recover-report-bootstrap",
+            "recover-continuation-bootstrap",
             "approve",
             "publish",
             "pr-check",
@@ -497,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.action in {
                     "reconcile-legacy-failure",
                     "recover-report-bootstrap",
+                    "recover-continuation-bootstrap",
                 }:
                     from oraculo.legacy_failure import reconcile
 
@@ -510,8 +512,14 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     try:
-                        if args.action == "recover-report-bootstrap":
-                            from oraculo.report_bootstrap import recover
+                        if args.action in {
+                            "recover-report-bootstrap",
+                            "recover-continuation-bootstrap",
+                        }:
+                            if args.action == "recover-report-bootstrap":
+                                from oraculo.report_bootstrap import recover
+                            else:
+                                from oraculo.continuation_bootstrap import recover
 
                             result = asyncio.run(
                                 recover(config, args.config, payload, transport)
@@ -520,7 +528,12 @@ def main(argv: list[str] | None = None) -> int:
                             result = asyncio.run(reconcile(config, payload, transport))
                         print_json(result)
                         # The reconciliation succeeded; the reviewed work failed.
-                        return 0 if args.action == "recover-report-bootstrap" else 1
+                        return (
+                            0
+                            if args.action != "reconcile-legacy-failure"
+                            and result.get("work_status") == "succeeded"
+                            else 1
+                        )
                     finally:
                         if args.stdio_host:
                             transport.close()

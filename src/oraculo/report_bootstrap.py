@@ -49,7 +49,7 @@ def transaction(db):
         raise
 
 
-async def live_service(config, config_path, expected):
+async def live_service(config, config_path, expected, *, release=KNOWN_RELEASE):
     daemon_running(config)
     envelope = make_envelope("status.get", "*", {})
     reply = await request(config, envelope)
@@ -60,7 +60,7 @@ async def live_service(config, config_path, expected):
         or runtime != expected
         or set(runtime)
         != {"pid", "release_id", "config_path", "config_sha256", "protocol_version"}
-        or runtime.get("release_id") != KNOWN_RELEASE
+        or runtime.get("release_id") != release
         or runtime.get("config_path") != str(config_path.resolve())
         or runtime.get("config_sha256") != config_hash(config_path)
         or runtime.get("protocol_version") != 1
@@ -214,13 +214,13 @@ async def cycle_status(config, task):
     return cycle
 
 
-def memory_matches(cycle, replacement):
+def memory_matches(cycle, replacement, *, work_status="succeeded"):
     expected = dict(
         schema_version=1,
         cycle_id=cycle["id"],
         project_id=cycle["project_id"],
         identity=cycle["identity"],
-        work_status="succeeded",
+        work_status=work_status,
         started_at=cycle["created_at"],
         finished_at=cycle.get("finished_at"),
         read_state=cycle["read_state"],
@@ -229,7 +229,7 @@ def memory_matches(cycle, replacement):
         evidence=report_projection(replacement)[0],
         scope="selected_structured_report; not a conversation archive",
     )
-    if cycle.get("work_status") != "succeeded" or cycle.get(
+    if cycle.get("work_status") != work_status or cycle.get(
         "report_sha256"
     ) != content_hash(expected):
         raise StateError("bootstrap_memory_report_mismatch")
@@ -283,17 +283,9 @@ async def fresh_host(config, task, host, replacement):
     ws = engine._report_workspace(task, thread)
     if ws["dirty"] or ws["head"] != replacement["commit"]:
         raise StateError("validated_commit_or_clean_workspace_required")
-    observed = await host.call("task_status", {"taskId": task["child"]["taskId"]})
-    if (
-        any(
-            observed.get(k) != task["child"].get(k)
-            for k in ("taskId", "childThreadId", "childRunId")
-        )
-        or observed.get("status") != "completed"
-        or observed.get("workState") != "result_available"
-        or observed.get("hasPendingChildRuns") is not False
-    ):
-        raise StateError("bootstrap_terminal_unproven")
+    # _execution_gate now checks native task status (including original identity,
+    # result availability and pending questions) in this same observation. Do not
+    # duplicate that call and exhaust the fixed manual bridge budget.
     return actor, positive
 
 

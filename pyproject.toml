@@ -48,6 +48,7 @@ include = [
   "/docs/INSTALACAO.md",
   "/docs/SKILLS.md",
   "/docs/RUN_CONTINUITY_AND_ACKS.md",
+  "/docs/CONTINUATION_BOOTSTRAP.md",
   "/pyproject.toml",
   "/uv.lock",
   "/LICENSE",
