@@ -175,7 +175,9 @@ def test_foreign_plist_preserved(controller):
     assert controller.plist.read_bytes() == original
 
 
-@pytest.mark.parametrize("payload_size", [0, MAX_ENVELOPE_BYTES + 100, MAX_RESPONSE_BYTES])
+@pytest.mark.parametrize(
+    "payload_size", [0, MAX_ENVELOPE_BYTES + 100, MAX_RESPONSE_BYTES]
+)
 def test_socket_response_correlation_and_full_json(controller, tmp_path, payload_size):
     controller.timeout = 5
     data = {"quiescent": True, "records": "x" * payload_size}
