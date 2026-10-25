@@ -7,6 +7,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 MAX_ENVELOPE_BYTES = 1048576
+# Status and task-list responses aggregate records; they can exceed one request.
+# Keep requests bounded independently while allowing a bounded larger reply.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 CONTROL_MARKER = "ORACULO_CONTROL_V1"
 
 

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from oraculo.config import Config, resources_root
 from oraculo.protocol import (
-    MAX_ENVELOPE_BYTES,
+    MAX_RESPONSE_BYTES,
     canonical_json,
     parse_envelope,
     validate_memory_submission,
@@ -27,13 +27,16 @@ async def request(config: Config, envelope: dict) -> dict:
     parse_envelope(raw)
     async with asyncio.timeout(5):
         reader, writer = await asyncio.open_unix_connection(
-            str(config.socket_path), limit=MAX_ENVELOPE_BYTES + 1
+            str(config.socket_path), limit=MAX_RESPONSE_BYTES + 1
         )
         try:
             writer.write(raw + b"\n")
             await writer.drain()
-            result = await reader.readline()
-            if not result or len(result) > MAX_ENVELOPE_BYTES:
+            try:
+                result = await reader.readline()
+            except ValueError:
+                raise ValueError("invalid_response") from None
+            if not result or len(result) > MAX_RESPONSE_BYTES:
                 raise ValueError("invalid_response")
             return json.loads(result)
         finally:

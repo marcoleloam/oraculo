@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import plistlib
@@ -16,6 +17,7 @@ import pytest
 from test_runtime_install import config, release
 
 from oraculo import runtime as rt
+from oraculo.protocol import MAX_ENVELOPE_BYTES, MAX_RESPONSE_BYTES
 from oraculo.service_control import ServiceController
 
 
@@ -173,7 +175,12 @@ def test_foreign_plist_preserved(controller):
     assert controller.plist.read_bytes() == original
 
 
-def test_socket_response_correlation_and_full_json(controller, tmp_path):
+@pytest.mark.parametrize(
+    "payload_size", [0, MAX_ENVELOPE_BYTES + 100, MAX_RESPONSE_BYTES]
+)
+def test_socket_response_correlation_and_full_json(controller, tmp_path, payload_size):
+    controller.timeout = 5
+    data = {"quiescent": True, "records": "x" * payload_size}
     # Short AF_UNIX path independent of pytest's long temporary tree.
     with tempfile.TemporaryDirectory(prefix="ora-sock-", dir="/tmp") as directory:
         conf = controller.config
@@ -187,20 +194,25 @@ def test_socket_response_correlation_and_full_json(controller, tmp_path):
                 connection, _ = server.accept()
                 with connection:
                     request = json.loads(connection.makefile("rb").readline())
-                    connection.sendall(
-                        json.dumps(
-                            dict(
-                                request_id=request["request_id"],
-                                ok=True,
-                                data={"quiescent": True},
-                            )
-                        ).encode()
-                        + b"\n"
-                    )
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                        connection.sendall(
+                            json.dumps(
+                                dict(
+                                    request_id=request["request_id"],
+                                    ok=True,
+                                    data=data,
+                                )
+                            ).encode()
+                            + b"\n"
+                        )
 
             thread = threading.Thread(target=reply)
             thread.start()
-            assert controller.request("maintenance.status", {}) == {"quiescent": True}
+            if payload_size == MAX_RESPONSE_BYTES:
+                with pytest.raises(rt.RuntimeError, match="invalid_socket_response"):
+                    controller.request("maintenance.status", {})
+            else:
+                assert controller.request("maintenance.status", {}) == data
             thread.join(timeout=1)
             assert not thread.is_alive()
 
