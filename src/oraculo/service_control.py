@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from oraculo.protocol import MAX_RESPONSE_BYTES
 from oraculo.runtime import (
     RuntimeError,
     atomic_write,
@@ -108,8 +109,8 @@ class ServiceController:
             response = bytearray()
             while b"\n" not in response:
                 client.settimeout(max(0.001, deadline - time.monotonic()))
-                part = client.recv(min(65536, 1048577 - len(response)))
-                if not part or len(response) + len(part) > 1048576:
+                part = client.recv(min(65536, MAX_RESPONSE_BYTES + 1 - len(response)))
+                if not part or len(response) + len(part) > MAX_RESPONSE_BYTES:
                     raise RuntimeError("invalid_socket_response")
                 response.extend(part)
             value = json.loads(response)
