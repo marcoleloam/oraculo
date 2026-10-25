@@ -6,9 +6,10 @@ Versionar e incorporar o reparo existente para consultas agregadas maiores que
 um envelope de entrada, preservando as duas etapas da correção e a separação
 entre código integrado, cliente de recuperação e versão padrão ativa.
 
-Estado observado em 2026-10-25: incorporação local concluída, validação focal
-aprovada; publicação e integração na branch principal ainda pendentes.
-O fluxo gerenciado de revisão aguarda capacidade. A ativação padrão não ocorreu.
+Estado observado em 2026-10-25, após a revisão: incorporação local concluída,
+revisão aprovada e memória canônica confirmada. A release combinada está ativa
+na versão padrão. Publicação e integração remota seguem seus próprios recibos;
+os itens abaixo registram a observação anterior à abertura do PR.
 Este documento é um registro Git sanitizado; não comprova encerramento de tarefa,
 gravação canônica de memória, merge remoto ou rollout.
 
@@ -41,8 +42,9 @@ não houve recriação da implementação.
 
 `MAX_ENVELOPE_BYTES` permanece em 1 MiB para requisições. Respostas acima de
 16 MiB continuam sendo rejeitadas; a mudança não é truncamento nem leitura
-ilimitada. Correlação e validação JSON permanecem exigidas. Não há alteração
-do daemon ativo, de schema, reservas, configuração ou capacidade neste reparo.
+ilimitada. As validações JSON e a correlação síncrona preexistentes foram
+preservadas. O reparo dos limites não modifica schema, reservas, configuração
+ou capacidade; sua ativação operacional é registrada separadamente abaixo.
 
 Arquivos de implementação: [protocol.py](../../src/oraculo/protocol.py),
 [cli.py](../../src/oraculo/cli.py) e
@@ -73,6 +75,11 @@ concluídas sem conflitos textuais, em worktrees isolados.
 O checkout principal e a branch do reparo original foram preservados.
 Preparar uma branch de história pública não equivale a push, PR ou merge.
 
+A branch pública foi enviada após a revisão do delta sanitizado. O relatório
+gerenciado valida o commit de código `3f5d386664deb75c1c019e0a397ffc86c54d5e1b`.
+A atualização posterior deste registro é apenas documental; não muda os cinco
+arquivos de implementação e testes revisados.
+
 ## Validação
 
 Reparo original: **40 passed, 5 skipped**, Ruff e `git diff --check` aprovados.
@@ -97,12 +104,33 @@ síncrono; a segunda etapa corrigiu esse consumidor. Houve rejeição inicial de
 manifesto com SHA abreviado, corrigida com o SHA completo antes da instalação.
 Recibos, logs integrais, snapshots e evidências de host permanecem privados.
 
+Revisão gerenciada posterior: **57 passed, 5 skipped**, mais **3 passed**
+em verificações adicionais de fronteira com sockets descartáveis. Equivalência
+dos patches originais e compatibilidade com a base pública contendo o PR12
+confirmadas, sem achados impeditivos. O relatório foi aceito e a gravação
+canônica de memória foi confirmada. Os cinco skips continuam explícitos.
+
+A origem também executou a suíte completa da release combinada:
+**1.325 passed, 140 skipped**. Esse resultado e a revisão focal são evidências
+distintas; nenhum skip foi contado como teste aprovado.
+
 ## Recuperação separada e rollout
 
 A release verificada `client-response-fix-f7ee421` fornece o comando
 `oraculo-recovery`, recuperando as consultas sem substituir o daemon.
-Isso é diferente de ativar a versão padrão: o ponteiro e o serviço padrão
-continuam na release anterior na observação registrada.
+Na recuperação inicial, o ponteiro e o serviço padrão continuaram na release
+anterior; a CLI separada, por si só, não comprovava ativação.
+
+Na etapa operacional posterior, a quiescência foi comprovada pelo fluxo oficial,
+o serviço foi parado, um backup offline foi copiado e seus hashes conferidos.
+A release combinada `3f5d386664deb75c1c019e0a397ffc86c54d5e1b` foi ativada e o
+serviço iniciado pela interface oficial. Identidade da release, novo processo
+e saúde foram conferidos. A CLI padrão passou em `status`, `task list`, `doctor`
+e `service status`; configuração e limite de capacidade foram preservados.
+Os recibos operacionais permanecem privados, separados do histórico Git.
+
+O agrupamento de notificações também foi observado na retomada real:
+sete eventos de auditoria preservados produziram um único envio confirmado.
 
 A implantação requer artefato revisado, quiescência atual comprovada,
 manutenção pela interface oficial e probes posteriores de identidade e saúde.
@@ -114,10 +142,10 @@ válido para forçar essa etapa.
 - [x] Causa e duas etapas originais registradas com hashes completos.
 - [x] Aplicação local e aplicação sobre história pública segura sem conflitos.
 - [x] Regressões focais, lint, formatação e whitespace aprovados.
-- [ ] Revisão gerenciada concluída quando houver vaga, com memória confirmada.
+- [x] Revisão gerenciada concluída, com memória confirmada.
 - [ ] PR publicado, checks do HEAD público e integração remota comprovados.
-- [ ] Se houver rollout autorizado: quiescência, ativação padrão e probes
-      confirmados em recibos separados; caso contrário, manter rollout pendente.
+- [x] Rollout autorizado: quiescência, ativação padrão e probes confirmados
+      em recibos separados.
 
 Não anexar snapshots, IDs de conversas, dados de clientes ou evidências privadas
 a esta tarefa publicável. Um commit deste registro não satisfaz os itens pendentes.
