@@ -41,7 +41,6 @@ def azure_repository(remote: str) -> dict | None:
             return None
         if (
             p.scheme != "https"
-            or p.username is not None
             or p.password is not None
             or p.port is not None
             or p.query
@@ -52,6 +51,16 @@ def azure_repository(remote: str) -> dict | None:
         if len(parts) != 4 or parts[2] != "_git":
             raise PublicationError("publication_remote_invalid")
         org, project, _, repo = [unquote(v, errors="strict") for v in parts]
+        # Azure clone URLs commonly include a login hint. It is not an API
+        # credential and must never enter receipts or outgoing REST URLs.
+        if p.username is not None:
+            username = unquote(p.username, errors="strict")
+            if (
+                not username
+                or len(username) > 512
+                or any(ord(c) < 32 for c in username)
+            ):
+                raise PublicationError("publication_remote_invalid")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", org):
             raise PublicationError("publication_remote_invalid")
         for value in (project, repo):
@@ -676,7 +685,7 @@ class AzureRepos:
         ]:
             raise PublicationError("azure_iteration_head_mismatch")
         statuses = self._pages(m, path + "/statuses", mode="single")
-        names = set()
+        names, stale_required = set(), set()
         for status in statuses:
             context, state = status.get("context"), status.get("state")
             if (
@@ -700,7 +709,7 @@ class AzureRepos:
             ) + context["name"]
             if status.get("iterationId") != iteration["id"]:
                 if name in checks:
-                    blockers.append("pr_check_head_unverified")
+                    stale_required.add(name)
                 continue
             if name in names:
                 blockers.append("pr_check_context_ambiguous")
@@ -714,6 +723,10 @@ class AzureRepos:
                     if state in {"notSet", "pending"}
                     else "pr_checks_failed"
                 )
+        # The endpoint returns statuses across iterations. Old results cannot
+        # satisfy a current requirement or invalidate an exact-current result.
+        if stale_required - names:
+            blockers.append("pr_check_head_unverified")
         if set(checks) - names:
             blockers.append("pr_required_checks_missing")
         reviewers = row.get("reviewers")

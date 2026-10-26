@@ -11,7 +11,9 @@ exigir IDs de ferramentas T3, credenciais ou uma sessão de modelo ativa.
 O daemon seleciona GitHub ou Azure pela identidade do **remote Git selecionado**.
 Azure Services aceita HTTPS `https://dev.azure.com/<org>/<project>/_git/<repo>`;
 componentes de projeto/repositório são decodificados e escapados como segmentos,
-sem credenciais, porta, query, fragmento ou separadores embutidos. `repository`
+sem senha, porta, query, fragmento ou separadores embutidos. Um nome de usuário
+opcional antes de `@dev.azure.com` é removido da identidade canônica e dos
+recibos; ele nunca fornece a autenticação REST. `repository`
 Azure é `org/project/repo`. SSH Azure, URLs legadas visualstudio.com e Azure
 Server não são reconhecidos nesta versão; GitHub conserva seu fluxo anterior.
 Nenhum adapter faz push ou busca objetos Git automaticamente.
@@ -28,7 +30,9 @@ URL web canônica derivada dessa identidade observada; a propriedade REST `url`
 
 `pr-check` observa políticas reais, revisores, conflitos e status vinculados à
 iteração do HEAD exato. Status sem associação comprovada à iteração não satisfaz
-checks obrigatórios. Ausência de checks só é permitida pela política explícita
+checks obrigatórios. Resultados de iterações anteriores não substituem nem
+invalidam o resultado da iteração atual; a ausência deste mantém o bloqueio.
+Ausência de checks só é permitida pela política explícita
 `allow_no_checks=true`; isso não dispensa políticas bloqueantes do Azure.
 Antes do PATCH de conclusão são conferidos refs/HEAD/base e uma segunda leitura
 do PR. O PATCH fixa `lastMergeSourceCommit`, usa estratégia explícita e
@@ -433,8 +437,9 @@ delta. A preparação/revisão do delta e o push autorizado devem preceder o PR.
 O adapter GitHub verifica remote real, identidade do host, SHA da branch remota,
 base e checkout limpo. Não faz push, fork automático, merge ou settlement. Consulta
 PRs por repo/head/base antes de criar e novamente depois, inclusive fechados.
-Outros hosts retornam bloqueio `publication_host_unsupported`; Azure não é uma
-integração implementada por este módulo.
+Azure Services usa o adapter REST descrito na seção de Azure Repos, incluindo
+reconciliação explícita de PRs existentes. Outros hosts retornam bloqueio
+`publication_host_unsupported`.
 
 Antes de uma nova emissão, a execução é verificada novamente: sucesso salvo
 anteriormente não basta se surgiu trabalho pendente ou falho. A intenção de

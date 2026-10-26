@@ -159,6 +159,22 @@ def existing(azure, status="active"):
     return adapter.ensure_pr({**spec, "reconcile_only": True, "pr_id": 17})
 
 
+@pytest.mark.parametrize("old_state", ["failed", "pending", "succeeded"])
+def test_current_iteration_check_supersedes_prior_iteration_status(azure, old_state):
+    repo, spec, host, adapter = azure
+    pr = existing(azure)
+    host.iterations.append({**host.iterations[0], "id": 2})
+    host.statuses = [
+        {**host.statuses[0], "state": old_state},
+        {**host.statuses[0], "iterationId": 2},
+    ]
+    result = adapter.inspect(pr, policy(spec), repo)
+    assert result["ready"], result["blockers"]
+    assert result["checks"] == [
+        {"name": "ci/unit", "state": "succeeded", "iterationId": 2}
+    ]
+
+
 def test_remote_identity_and_escaping(azure):
     repo, _, _, _ = azure
     m = inspect_repository(repo)
@@ -180,7 +196,7 @@ def test_remote_identity_and_escaping(azure):
     "remote",
     [
         "http://dev.azure.com/example/project/_git/repo",
-        "https://user@dev.azure.com/example/p/_git/r",
+        "https://user:synthetic-password@dev.azure.com/example/p/_git/r",
         "https://dev.azure.com:443/example/p/_git/r",
         "https://dev.azure.com/example/p/_git/r?token=value",
         "https://dev.azure.com/example/p/_git/r#fragment",
@@ -194,6 +210,23 @@ def test_remote_identity_and_escaping(azure):
 def test_invalid_remotes(remote):
     with pytest.raises(PublicationError, match="publication_remote_invalid"):
         azure_repository(remote)
+
+
+@pytest.mark.parametrize(
+    "username", ["example", "user%40example.org", "synthetic-token"]
+)
+def test_azure_login_hint_is_removed_from_repository_and_rest_identity(azure, username):
+    repo, spec, host, adapter = azure
+    git(repo, "remote", "set-url", "origin", REMOTE.replace("://", f"://{username}@"))
+    metadata = inspect_repository(repo)
+    assert metadata["remote_url"] == REMOTE
+    assert azure_repository(REMOTE) == azure_repository(
+        REMOTE.replace("://", f"://{username}@")
+    )
+    receipt = adapter.ensure_pr(spec)
+    assert receipt["remote_url"] == REMOTE
+    assert receipt["url"] == REMOTE + "/pullrequest/17"
+    assert username not in str(receipt) or username == "example"
 
 
 @pytest.mark.parametrize("status", ["active", "completed"])
