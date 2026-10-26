@@ -167,6 +167,7 @@ def parser() -> argparse.ArgumentParser:
             "merge",
             "settle",
             "unwatch",
+            "deployment",
             "reconcile-legacy-failure",
         ],
     )

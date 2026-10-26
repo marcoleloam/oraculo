@@ -57,6 +57,10 @@ PHASES = {
         "Confirmando a memória da publicação.",
     ),
     "pr_open": ("Publicação em revisão", "A solicitação de integração está aberta."),
+    "pr_reconciled": (
+        "Integração observada",
+        "A publicação existente foi observada; aguardando os gates de encerramento.",
+    ),
     "pr_waiting": (
         "Aguardando verificações",
         "Aguardando checks ou revisão da publicação.",

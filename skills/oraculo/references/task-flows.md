@@ -117,6 +117,39 @@ authorization scopes. Follow the installed project's managed-task contract for
 exact HEAD. A merge does not prove deployment. The origin remains responsible
 after the child returns and after a PR is opened.
 
+Azure Repos and existing integration PRs use the same assigned task IDs; never
+restart accepted tasks to reconcile an external merge. The remote selects the
+adapter. Use an explicit publication binding, reconcile_only=true and pr_id or
+pr_url for an externally published PR. Keep source_commit equal to report.commit;
+integration={head_sha,contains:[commits]} declares the integration HEAD and every
+commit to verify locally by Git ancestry. Every declared object must exist and
+be an ancestor; a list, cherry-pick or matching tree is insufficient. The clean
+publication checkout's remote/repo/branch/base/head must match the REST receipt.
+Repeat the same payload after uncertain ACK; it cannot create or merge again.
+An already completed PR is observed as pr_reconciled. Then use pr-check with
+policy.observe_only=true (merge_authorized=false) to observe the merge and run
+the official memory/settlement gates; settle resumes after a preserved merge
+receipt. Full contract and sanitized payloads: docs/MANAGED_TASKS.md.
+
+Azure observation uses REST Git 7.1 and Policy 7.1-preview.1, independently of T3
+native tracking/watch. The adapter does not enable unverified Azure native
+linking/watch: its local limitation record is not a host ACK. Keep all other
+native linked PRs gated; do not fake a GitHub URL or install a polling loop.
+Active Azure PRs need an explicit later pr-check. Source reports, runs, negative
+results and per-task authorization/memory remain immutable even with shared PRs.
+
+Azure PATs belong only in the selected publication checkout's ignored .env as a
+literal SYS__AZDO_PAT assignment, or an already configured explicit Keychain
+service/account reference. Never source .env, print or copy a PAT into payloads,
+logs, URLs, command arguments or Git. T3 OAuth credentials are unrelated. No host
+secret-reference capability is assumed. HTTP redirects are refused entirely.
+
+Deployment is optional and separate: task deployment records a reported claim
+with full merge release SHA, environment, timezone timestamp and private proof
+references/digests. A PR/Git receipt is not rollout proof. No rollout verifier is
+configured, so confirmed is refused rather than inferred from a supplied claim.
+Do not block task settlement on missing deployment evidence.
+
 Keep long executor test suites in the foreground and await their completion.
 Do not use background/nohup or a session that automatically starts another agent
 turn when tests finish. A resumed child is not proof of a new managed task.

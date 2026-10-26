@@ -1669,7 +1669,7 @@ class Service:
 
         def reconcile_batch():
             from oraculo.managed_tasks import ManagedTasks
-            from oraculo.publication import GitHubPublisher
+            from oraculo.publication import RepositoryPublisher
             from oraculo.task_store import TaskStore
 
             store = admission = None
@@ -1690,7 +1690,7 @@ class Service:
                     store,
                     host,
                     facade.memory(),
-                    GitHubPublisher(),
+                    RepositoryPublisher(),
                     admission=admission,
                 )
                 cursor = store.state.get_meta("managed_reconcile_cursor", 0)
