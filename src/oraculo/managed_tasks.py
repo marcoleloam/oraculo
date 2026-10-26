@@ -250,6 +250,22 @@ class ManagedTasks:
                         )
                     else:
                         await self._finish(task_id, payload.get("report"), actor)
+                elif action == "deployment":
+                    from oraculo.deployment import deployment_evidence
+
+                    if actor["thread_id"] != task["origin"]["thread_id"]:
+                        raise StateError("deployment_requires_origin")
+                    evidence = deployment_evidence(
+                        payload.get("deployment"), task.get("merge_receipt")
+                    )
+                    records = task.get("deployments", [])
+                    if evidence not in records:
+                        self.store.update(
+                            task_id,
+                            task["phase"],
+                            {"deployment": evidence},
+                            deployments=[*records, evidence],
+                        )
                 elif action in {"pr-check", "merge", "settle", "unwatch"}:
                     if task.get("deliverable_kind") == "plan":
                         raise StateError("plan_not_publishable")
@@ -263,16 +279,28 @@ class ManagedTasks:
                     if action == "settle":
                         await closure.finalize(task_id)
                     elif action == "unwatch":
-                        receipt = await self.host.call(
-                            "unwatch_pull_request",
-                            {
-                                "threadId": task["origin"]["thread_id"],
-                                "url": task["publication"]["url"],
-                            },
-                        )
-                        if receipt.get("watching") is not False:
-                            raise StateError("pr_unwatch_unconfirmed")
-                        self.store.update(task_id, task["phase"], {"watching": False})
+                        if task["publication"].get("host") == "azure":
+                            self.store.update(
+                                task_id,
+                                task["phase"],
+                                {
+                                    "native_watch": "unsupported",
+                                    "source": "oraculo_adapter_capability_policy",
+                                },
+                            )
+                        else:
+                            receipt = await self.host.call(
+                                "unwatch_pull_request",
+                                {
+                                    "threadId": task["origin"]["thread_id"],
+                                    "url": task["publication"]["url"],
+                                },
+                            )
+                            if receipt.get("watching") is not False:
+                                raise StateError("pr_unwatch_unconfirmed")
+                            self.store.update(
+                                task_id, task["phase"], {"watching": False}
+                            )
                     else:
                         await closure.check(task_id, merge=action == "merge")
                 elif action == "publish":
@@ -362,6 +390,7 @@ class ManagedTasks:
         if task.get("child"):
             if task["phase"] in {
                 "pr_open",
+                "pr_reconciled",
                 "pr_waiting",
                 "pr_ready",
                 "merged",
@@ -1383,7 +1412,9 @@ class ManagedTasks:
             raise StateError("work_not_successful")
         if not self.publisher:
             raise StateError("publication_host_adapter_unavailable")
-        if task.get("publication_attempted") and task.get("publication_spec") != spec:
+        if (task.get("publication_attempted") or task.get("publication")) and task.get(
+            "publication_spec"
+        ) != spec:
             raise StateError("publication_intent_reused")
         # Explicit public binding permits a separate safe checkout; never assumes
         # the private development checkout must have a remote or can be pushed.
@@ -1402,7 +1433,12 @@ class ManagedTasks:
             "source_commit"
         ) != task["report"].get("commit"):
             raise StateError("publication_source_binding_mismatch")
-        uncertain = bool(task.get("publication_attempted"))
+        from oraculo.azure_repos import credential_reference
+        from oraculo.publication import integration_binding
+
+        credential_reference(spec.get("credential"))
+        integration_binding(spec)
+        uncertain = bool(task.get("publication_attempted") or task.get("publication"))
         if not uncertain:
             await self._execution_gate(task)
         self.store.update(
@@ -1422,13 +1458,47 @@ class ManagedTasks:
 
         # Always refresh a cached receipt, including after a lost link response.
         pr = self.publisher.ensure_pr(
-            dict(spec, task_id=task_id, reconcile_only=uncertain),
+            dict(
+                spec,
+                task_id=task_id,
+                reconcile_only=uncertain or spec.get("reconcile_only", False),
+            ),
             before_create=before_create,
         )
+        observed_at = pr.get("observed_at")
+        prior = task.get("publication")
+        if (
+            prior
+            and prior.get("state") == "merged"
+            and any(
+                prior.get(k) != pr.get(k)
+                for k in (
+                    "host",
+                    "repository",
+                    "number",
+                    "url",
+                    "head_sha",
+                    "base",
+                    "branch",
+                    "repository_id",
+                    "project_id",
+                    "merge_sha",
+                )
+            )
+        ):
+            raise StateError("publication_merge_receipt_changed")
+        if prior and {k: v for k, v in prior.items() if k != "observed_at"} == {
+            k: v for k, v in pr.items() if k != "observed_at"
+        }:
+            pr = prior
         self.store.update(
             task_id,
             "pr_link_pending",
-            {"url": pr["url"], "state": pr["state"]},
+            {
+                "url": pr["url"],
+                "state": pr["state"],
+                **({"observed_at": observed_at} if observed_at else {}),
+            },
             publication=pr,
         )
         task = self.store.get(task_id)
@@ -1436,11 +1506,41 @@ class ManagedTasks:
         # Preserve the observed receipt, but never certify publication as ready
         # using stale execution evidence. No retry above can re-emit the PR.
         await self._execution_gate(task)
-        for thread in dict.fromkeys(
-            (
-                task["origin"]["thread_id"],
-                task["parent"]["thread_id"],
-                task["child"]["childThreadId"],
+        if task.get("settled") and prior == pr and pr.get("state") == "merged":
+            # A repeated observation cannot reopen the business phase. This is
+            # not a new settlement or a fresh certification of rollout.
+            self.store.update(
+                task_id,
+                "settled",
+                {"publication_reobserved": pr["url"], "observed_at": observed_at},
+                blocked_reason=None,
+            )
+            return
+        if pr.get("host") == "azure":
+            # Azure native tracking/watch is not verified by this adapter. Keep this
+            # local capability observation distinct from a host link/watch ACK.
+            self.store.update(
+                task_id,
+                "pr_link_pending",
+                {
+                    "native_tracking": "unsupported",
+                    "source": "oraculo_adapter_capability_policy",
+                },
+                native_pr_tracking={
+                    "state": "unsupported",
+                    "host": "azure",
+                    "source": "oraculo_adapter_capability_policy",
+                },
+            )
+        for thread in (
+            []
+            if pr.get("host") == "azure"
+            else dict.fromkeys(
+                (
+                    task["origin"]["thread_id"],
+                    task["parent"]["thread_id"],
+                    task["child"]["childThreadId"],
+                )
             )
         ):
             linked = await self.host.call(
@@ -1483,6 +1583,14 @@ class ManagedTasks:
         )
         if not self._saved(saved):
             raise StateError("pr_memory_write_unconfirmed")
+        if pr["state"] == "merged" and spec.get("reconcile_only") is True:
+            self.store.update(
+                task_id,
+                "pr_reconciled",
+                {"url": pr["url"], "state": "merged"},
+                blocked_reason=None,
+            )
+            return
         if pr["state"].upper() != "OPEN":
             raise StateError("pr_not_open_requires_reconciliation")
         self.store.update(

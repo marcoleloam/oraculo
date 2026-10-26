@@ -6,6 +6,178 @@ link direto `t3-thread://v1/<identidade retornada pelo host>`, branch/worktree,
 bloqueios e recibo do PR. `task list` e `task status` consultam o serviço ou o ledger offline sem
 exigir IDs de ferramentas T3, credenciais ou uma sessão de modelo ativa.
 
+## Azure Repos e PR de integração já existente
+
+O daemon seleciona GitHub ou Azure pela identidade do **remote Git selecionado**.
+Azure Services aceita HTTPS `https://dev.azure.com/<org>/<project>/_git/<repo>`;
+componentes de projeto/repositório são decodificados e escapados como segmentos,
+sem credenciais, porta, query, fragmento ou separadores embutidos. `repository`
+Azure é `org/project/repo`. SSH Azure, URLs legadas visualstudio.com e Azure
+Server não são reconhecidos nesta versão; GitHub conserva seu fluxo anterior.
+Nenhum adapter faz push ou busca objetos Git automaticamente.
+
+O adapter Azure usa REST Git **7.1** para repositório, refs, PRs, iterações e
+status. Avaliações de políticas usam **7.1-preview.1**, a versão documentada
+pela Microsoft nessa família. A criação registra intenção durável antes do POST;
+ACK perdido só permite observar o mesmo PR, nunca repetir a criação. Listas de
+PRs/políticas usam `$top/$skip`; refs usam continuation token, com limites e
+recusa de cursor/página repetidos. Identidades GUID do projeto/repositório, remote
+canônico, ID, source/target refs e SHAs são conferidos contra o host. `url` é a
+URL web canônica derivada dessa identidade observada; a propriedade REST `url`
+é uma URL interna e não é usada como link web.
+
+`pr-check` observa políticas reais, revisores, conflitos e status vinculados à
+iteração do HEAD exato. Status sem associação comprovada à iteração não satisfaz
+checks obrigatórios. Ausência de checks só é permitida pela política explícita
+`allow_no_checks=true`; isso não dispensa políticas bloqueantes do Azure.
+Antes do PATCH de conclusão são conferidos refs/HEAD/base e uma segunda leitura
+do PR. O PATCH fixa `lastMergeSourceCommit`, usa estratégia explícita e
+`bypassPolicy=false`, sem auto-complete. Só nova leitura `status=completed`,
+`mergeStatus=succeeded` e `lastMergeCommit.commitId` integral confirma merge.
+Enfileiramento, HTTP 2xx ou exit 0 não confirmam conclusão. Mudança do target
+entre preflight e conclusão bloqueia a certificação: não há CAS distribuído do
+target, da política ou do T3. O Azure continua responsável pela aplicação das
+políticas no momento do merge.
+
+Para um PR publicado externamente, envie **no mesmo task_id existente**:
+
+```json
+{
+  "task_id": "<existing-task-id>",
+  "publication": {
+    "cwd": "/workspace/example/integration",
+    "publication_root": "/workspace/example",
+    "remote": "origin",
+    "repository": "example/Example Project/example-repo",
+    "base": "develop",
+    "branch": "integration/accepted-work",
+    "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "source_project_id": "<original-project-id>",
+    "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "title": "Accepted integration",
+    "body": "Previously published integration; observation only.",
+    "reconcile_only": true,
+    "pr_id": 42,
+    "pr_url": "https://dev.azure.com/example/Example%20Project/_git/example-repo/pullrequest/42",
+    "integration": {
+      "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "contains": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ]
+    }
+  }
+}
+```
+
+Os hashes são exemplos, não commits disponíveis. `pr_id` ou `pr_url` é
+obrigatório na associação explícita; se ambos vierem devem apontar ao mesmo PR.
+`integration` exige `reconcile_only=true`. O checkout limpo deve estar na branch
+e HEAD de integração declarados. **source_commit continua exatamente igual ao
+report.commit de cada tarefa.** Todos os itens de `contains` precisam existir
+como commits integrais e passar em `git merge-base --is-ancestor <commit> <head>`;
+o commit do relatório deve constar da lista. Objetos ausentes, cherry-picks sem
+ancestralidade e igualdade de árvore não substituem essa prova. Replace refs e
+grafts locais são desativados no runner. Não reescrever relatórios nem trocar o
+commit individual pelo HEAD integrado. O mesmo PR pode ser associado a várias
+tarefas, cada uma com sua própria autorização, run, relatório, memória e gates.
+Uma associação já observada é imutável; repetir o payload literal é idempotente.
+
+Execute `task publish --file payload.json` pelo bridge caller-bound. Para PR já
+concluído, o estado observado é `pr_reconciled`; nenhuma criação ou novo merge
+é emitido. Em seguida, `task pr-check` com política de observação pode concluir
+os gates oficiais de memória/settlement:
+
+```json
+{
+  "task_id": "<existing-task-id>",
+  "policy": {
+    "repository": "example/Example Project/example-repo",
+    "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "base": "develop",
+    "remote": "origin",
+    "method": "merge",
+    "merge_authorized": false,
+    "observe_only": true,
+    "required_checks": ["ci/unit"],
+    "required_review": true,
+    "policy_source": "<observed repository rules and origin authorization>"
+  }
+}
+```
+
+`task settle` retoma uma finalização cujo merge já foi observado. Exige execução
+terminal e continuidade completas, relatório positivo, ausência de descendentes
+e perguntas pendentes, memória confirmada e nova observação REST do mesmo merge.
+O conjunto nativo completo de PRs do executor também é consultado antes e depois
+do pedido de settlement. PRs adicionais impedem fechamento; resposta perdida do
+pedido exige observação de `settled=true`, sem outro pedido de organização.
+Relatórios negativos continuam negativos. Nenhum comando cria/reexecuta tarefas
+antigas para reconciliar sua integração.
+
+**Capacidade nativa do T3:** esta versão do adapter não habilita linking/watch de
+Azure, pois esse suporte não está verificado no contrato disponível. Registra
+essa limitação local, sem chamar linking/watch com URL falsa nem fabricar ACKs.
+O receipt REST e o ledger privado mantêm a associação por tarefa; o conjunto de
+PRs nativo precisa estar observado vazio, ou conter exatamente o PR Azure com
+identidade/commits completos se o host o expuser. PR ativo pendente requer novo
+`task pr-check` explícito após uma atualização externa; não há watcher/polling
+Azure instalado. Observação REST não anuncia suporte de watch nativo. O fluxo
+legado `settlement bind` continua dependente dos PRs rastreados pelo T3; para
+este caso use `task publish` → `task pr-check` → `task settle` quando necessário.
+
+Credenciais Azure são lidas somente de `SYS__AZDO_PAT` no `.env` do checkout de
+publicação selecionado, como atribuição literal (aspas simples/duplas aceitas).
+O arquivo não é executado, interpolado nem procurado em diretórios pais; symlinks,
+atribuições duplicadas e valores com sintaxe de shell são recusados. Mantenha-o
+ignorado pelo Git. Alternativamente, `publication.credential` pode conter apenas
+`{"keychain_service":"<already-configured-service>","keychain_account":"<existing-account>"}`.
+Não há namespace PAT implícito: o Keychain OAuth do T3 é independente. Não há
+secret-reference do host habilitada sem capacidade real verificada. Nunca envie
+o PAT no payload, URL ou linha de comando. O transporte usa header em memória,
+timeout de 30s e limite de resposta de 4 MiB; não segue redirects (nem same-host),
+não usa proxy do ambiente e retorna somente códigos de erro estáveis, sem corpo
+remoto, Authorization ou exceção original. Testes usam exclusivamente segredos
+sintéticos e transportes/servidores descartáveis, sem certificar Azure real.
+
+Implantação é opcional e separada. Depois de merge observado, a origem pode usar
+`task deployment --file deployment.json` para registrar uma alegação vinculada
+à release integral, ambiente, timestamp com timezone e referências de prova:
+
+```json
+{
+  "task_id": "<existing-task-id>",
+  "deployment": {
+    "release": "cccccccccccccccccccccccccccccccccccccccc",
+    "environment": "Example VM",
+    "occurred_at": "2026-10-26T12:00:00Z",
+    "state": "reported",
+    "proof": [{
+      "source": "origin-deployment-receipt",
+      "reference": "private:deployment-receipt.json",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }]
+  }
+}
+```
+
+`release` deve corresponder a `merge_receipt.merge_sha`. Os dados são conservados
+como `reported/verification=not_observed`, separados de report e memória de
+execução; payload repetido não duplica registro. `state=confirmed` é recusado:
+esta versão não tem verificador de rollout, e referências/digests fornecidos
+pela origem não confirmam implantação por si. Git, testes e PR não provam rollout.
+Deployment ausente não bloqueia merge/settlement. Não há alteração de schema ou
+manifest: os novos recibos/metadados usam o payload privado versionado existente;
+a migração oficial do ledger permanece inalterada.
+
+Referências primárias consultadas: [criar PR](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-requests/create?view=azure-devops-rest-7.1),
+[concluir PR](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-requests/update?view=azure-devops-rest-7.1),
+[listar PRs](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-requests/get-pull-requests?view=azure-devops-rest-7.1),
+[refs](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/refs/list?view=azure-devops-rest-7.1),
+[avaliações de políticas](https://learn.microsoft.com/en-us/rest/api/azure/devops/policy/evaluations/list?view=azure-devops-rest-7.1),
+[status](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-request-statuses/list?view=azure-devops-rest-7.1),
+[iterações](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-request-iterations/list?view=azure-devops-rest-7.1).
+
 ## Contrato de transporte
 
 A escolha é automática:

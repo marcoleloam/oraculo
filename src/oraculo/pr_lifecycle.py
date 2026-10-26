@@ -33,6 +33,31 @@ _FIELDS = (
 )
 
 
+class RepositoryPRLifecycle:
+    """REST observation is independent of native host watch capabilities."""
+
+    def __init__(self, runner=command_runner, *, azure_factory=None):
+        self.runner, self.azure_factory = runner, azure_factory
+
+    def _adapter(self, pr, cwd):
+        if pr.get("host") == "azure":
+            from oraculo.azure_repos import AzureRepos
+
+            spec = {"cwd": cwd, "credential": pr.get("credential")}
+            return (
+                self.azure_factory(spec)
+                if self.azure_factory
+                else AzureRepos.from_spec(spec, self.runner)
+            )
+        return GitHubPRLifecycle(self.runner)
+
+    def inspect(self, pr, policy, cwd):
+        return self._adapter(pr, cwd).inspect(pr, policy, cwd)
+
+    def merge(self, pr, policy, cwd, **kwargs):
+        return self._adapter(pr, cwd).merge(pr, policy, cwd, **kwargs)
+
+
 def _policy(pr: dict, policy: dict) -> tuple[dict, str]:
     if not isinstance(pr, dict) or not isinstance(policy, dict):
         raise PublicationError("pr_merge_policy_invalid")

@@ -44,6 +44,8 @@ def command_runner(argv: list[str], cwd: Path) -> str:
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C")
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_GRAFT_FILE"] = os.devnull
     return subprocess.run(
         argv, cwd=cwd, env=env, capture_output=True, text=True, check=True, timeout=60
     ).stdout.strip()
@@ -118,7 +120,10 @@ def inspect_repository(
     ).splitlines()
     if len(urls) != 1:
         raise PublicationError("publication_remote_ambiguous")
-    repository = _github_repository(urls[0])
+    from oraculo.azure_repos import azure_repository
+
+    azure = azure_repository(urls[0])
+    repository = azure["repository"] if azure else _github_repository(urls[0])
     branch = _run(
         runner,
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -134,13 +139,104 @@ def inspect_repository(
     if not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", head):
         raise PublicationError("publication_head_invalid")
     return {
-        "host": "github",
+        **(azure or {"host": "github"}),
         "repository": repository,
-        "remote_url": f"https://github.com/{repository}.git",
+        "remote": remote,
+        "remote_url": azure["remote_url"]
+        if azure
+        else f"https://github.com/{repository}.git",
         "base": base,
         "head_sha": head,
         "branch": branch,
     }
+
+
+def integration_binding(spec: dict, runner: Runner = command_runner) -> dict:
+    """Prove every declared commit using local Git objects, never tree equality.
+
+    No fetch is attempted: unavailable objects require explicit operator recovery.
+    The managed caller separately binds source_commit to the immutable report.
+    """
+    integration = spec.get("integration")
+    if integration is None:
+        if (
+            (spec.get("pr_id") or spec.get("pr_url"))
+            and spec.get("source_commit")
+            and spec["source_commit"] != spec.get("head_sha")
+        ):
+            raise PublicationError("publication_integration_required")
+        return {}
+    sha = r"(?:[a-f0-9]{40}|[a-f0-9]{64})"
+    if (
+        not isinstance(integration, dict)
+        or set(integration) != {"head_sha", "contains"}
+        or integration.get("head_sha") != spec.get("head_sha")
+        or not isinstance(integration.get("head_sha"), str)
+        or not re.fullmatch(sha, integration["head_sha"])
+        or not isinstance(integration.get("contains"), list)
+        or not integration["contains"]
+        or len(integration["contains"]) > 1000
+        or any(
+            not isinstance(c, str) or not re.fullmatch(sha, c)
+            for c in integration["contains"]
+        )
+        or len(set(integration["contains"])) != len(integration["contains"])
+        or spec.get("source_commit") not in integration["contains"]
+        or spec.get("reconcile_only") is not True
+        or not (spec.get("pr_id") or spec.get("pr_url"))
+    ):
+        raise PublicationError("publication_integration_invalid")
+    cwd = Path(spec["cwd"]).resolve()
+    for commit in [integration["head_sha"], *integration["contains"]]:
+        resolved = _run(
+            runner,
+            ["git", "rev-parse", "--verify", commit + "^{commit}"],
+            cwd,
+            "publication_integration_commit_missing",
+        )
+        if resolved != commit:
+            raise PublicationError("publication_integration_commit_mismatch")
+    for commit in integration["contains"]:
+        _run(
+            runner,
+            ["git", "merge-base", "--is-ancestor", commit, integration["head_sha"]],
+            cwd,
+            "publication_integration_not_ancestor",
+        )
+    return {
+        "integration": {
+            "head_sha": integration["head_sha"],
+            "contains": list(integration["contains"]),
+        }
+    }
+
+
+class RepositoryPublisher:
+    """Select the adapter from the selected Git remote, never a caller host hint."""
+
+    def __init__(self, runner: Runner = command_runner, *, azure_factory=None):
+        self.runner, self.azure_factory = runner, azure_factory
+
+    def ensure_pr(self, spec, *, before_create=None):
+        from oraculo.azure_repos import AzureRepos
+
+        metadata = inspect_repository(
+            spec["cwd"], remote=spec["remote"], base=spec["base"], runner=self.runner
+        )
+        if metadata["host"] == "azure":
+            adapter = (
+                self.azure_factory(spec)
+                if self.azure_factory
+                else AzureRepos.from_spec(spec, self.runner)
+            )
+        else:
+            adapter = GitHubPublisher(self.runner)
+        receipt = adapter.ensure_pr(spec, before_create=before_create)
+        if metadata["host"] == "azure" and spec.get("credential") is not None:
+            from oraculo.azure_repos import credential_reference
+
+            receipt["credential"] = credential_reference(spec["credential"])
+        return receipt
 
 
 class GitHubPublisher:
@@ -154,7 +250,9 @@ class GitHubPublisher:
         except (ValueError, TypeError):
             raise PublicationError("publication_host_response_invalid") from None
 
-    def _lookup(self, metadata: dict, marker: str, cwd: Path) -> dict | None:
+    def _lookup(
+        self, metadata: dict, marker: str, cwd: Path, explicit=None
+    ) -> dict | None:
         repo = metadata["repository"]
         query = urlencode(
             {
@@ -164,17 +262,34 @@ class GitHubPublisher:
                 "per_page": 100,
             }
         )
-        pages = self._json(
+        pages = (
             [
-                "gh",
-                "api",
-                "--hostname",
-                "github.com",
-                "--paginate",
-                "--slurp",
-                f"repos/{repo}/pulls?{query}",
-            ],
-            cwd,
+                [
+                    self._json(
+                        [
+                            "gh",
+                            "api",
+                            "--hostname",
+                            "github.com",
+                            f"repos/{repo}/pulls/{explicit}",
+                        ],
+                        cwd,
+                    )
+                ]
+            ]
+            if explicit
+            else self._json(
+                [
+                    "gh",
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "--paginate",
+                    "--slurp",
+                    f"repos/{repo}/pulls?{query}",
+                ],
+                cwd,
+            )
         )
         if not isinstance(pages, list) or any(not isinstance(p, list) for p in pages):
             raise PublicationError("publication_host_response_invalid")
@@ -204,13 +319,18 @@ class GitHubPublisher:
         row = candidates[0]
         if row["head"].get("sha") != metadata["head_sha"]:
             raise PublicationError("publication_pr_head_mismatch")
-        if "<!-- oraculo-task:" in (row.get("body") or "") and not marked:
+        if (
+            not explicit
+            and "<!-- oraculo-task:" in (row.get("body") or "")
+            and not marked
+        ):
             raise PublicationError("publication_pr_task_mismatch")
         number = row.get("number")
         url = row.get("html_url")
         if (
             type(number) is not int
             or number < 1
+            or (explicit is not None and number != explicit)
             or not isinstance(url, str)
             or url.lower() != f"https://github.com/{repo}/pull/{number}".lower()
             or row.get("state") not in {"open", "closed"}
@@ -276,6 +396,12 @@ class GitHubPublisher:
             base=spec["base"],
             runner=self.runner,
         )
+        if metadata["host"] != "github":
+            raise PublicationError("publication_host_unsupported")
+        integration = integration_binding(spec, self.runner)
+        explicit = explicit_pr(
+            spec, f"https://github.com/{metadata['repository']}/pull/"
+        )
         if "repository" in spec and (
             not isinstance(spec["repository"], str)
             or spec["repository"].lower() != metadata["repository"].lower()
@@ -320,9 +446,9 @@ class GitHubPublisher:
             + " -->"
         )
         # Existing closed/merged PRs remain reconcilable after branch deletion.
-        existing = self._lookup(metadata, marker, cwd)
+        existing = self._lookup(metadata, marker, cwd, explicit)
         if existing:
-            return {**existing, **source_binding}
+            return {**existing, **source_binding, **integration}
         if spec.get("reconcile_only", False):
             raise PublicationError("publication_uncertain")
         for branch, expected in (
@@ -404,3 +530,26 @@ class GitHubPublisher:
         if receipt is None:
             raise PublicationError("publication_uncertain", emitted=True)
         return {**receipt, **source_binding}
+
+
+def explicit_pr(spec: dict, prefix: str) -> int | None:
+    """Explicit external associations are observation-only and identity-bound."""
+    number, url = spec.get("pr_id"), spec.get("pr_url")
+    if number is None and url is None:
+        return None
+    if spec.get("reconcile_only") is not True:
+        raise PublicationError("publication_existing_requires_reconcile_only")
+    if number is not None and (type(number) is not int or number < 1):
+        raise PublicationError("publication_pr_identity_invalid")
+    if url is not None:
+        if (
+            not isinstance(url, str)
+            or not url.startswith(prefix)
+            or not re.fullmatch(r"[1-9][0-9]*", url[len(prefix) :])
+        ):
+            raise PublicationError("publication_pr_identity_invalid")
+        parsed = int(url[len(prefix) :])
+        if number is not None and parsed != number:
+            raise PublicationError("publication_pr_identity_invalid")
+        number = parsed
+    return number

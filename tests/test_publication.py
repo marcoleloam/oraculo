@@ -63,6 +63,35 @@ def specification(repo):
     }
 
 
+@pytest.mark.parametrize("merged", [False, True])
+def test_explicit_github_external_pr_is_observation_only(repo, merged):
+    spec = specification(repo)
+    host = Host(spec)
+    row = host.row(marked=True)
+    if merged:
+        row.update(state="closed", merged_at="2026-01-01T00:00:00Z")
+    host.rows = [row]
+
+    def runner(argv, cwd):
+        if argv[0] == "gh" and argv[-1] == "repos/example/public-project/pulls/12":
+            return json.dumps(row)
+        return host(argv, cwd)
+
+    explicit = {
+        **spec,
+        "task_id": "another-authorized-task",
+        "reconcile_only": True,
+        "pr_id": 12,
+        "pr_url": "https://github.com/example/public-project/pull/12",
+        "source_project_id": "example",
+        "source_commit": spec["head_sha"],
+    }
+    receipt = GitHubPublisher(runner).ensure_pr(explicit)
+    assert receipt["state"] == ("merged" if merged else "open")
+    assert host.created == 0
+    assert GitHubPublisher(runner).ensure_pr(explicit) == receipt
+
+
 class Host:
     """Real local Git metadata; fake GitHub transport with explicit calls."""
 
@@ -169,7 +198,7 @@ def test_repository_identity_comes_from_remote_not_folder(repo, url):
     ("url", "code"),
     [
         (
-            "https://dev.azure.com/example/project/_git/repo",
+            "https://gitlab.com/example/project.git",
             "publication_host_unsupported",
         ),
         (

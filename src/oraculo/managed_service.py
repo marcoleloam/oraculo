@@ -187,8 +187,8 @@ class ManagedService:
 
     async def execute(self, envelope, reader, writer):
         from oraculo.managed_tasks import ManagedTasks
-        from oraculo.pr_lifecycle import GitHubPRLifecycle
-        from oraculo.publication import GitHubPublisher
+        from oraculo.pr_lifecycle import RepositoryPRLifecycle
+        from oraculo.publication import RepositoryPublisher
 
         if self.busy:
             raise StateError("managed_adapter_busy_retry_same_key")
@@ -276,8 +276,8 @@ class ManagedService:
                 self.store,
                 Relay(),
                 self.memory(),
-                GitHubPublisher(),
-                GitHubPRLifecycle(),
+                RepositoryPublisher(),
+                RepositoryPRLifecycle(),
                 admission=self.service.state,
             )
             adapter.config_path = self.service.config_path

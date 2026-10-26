@@ -25,11 +25,16 @@ class TaskClosure:
             raise StateError("plan_not_publishable")
         if actor["thread_id"] != task["origin"]["thread_id"]:
             raise StateError("merge_policy_requires_origin")
-        if not isinstance(policy, dict) or policy.get("merge_authorized") is not True:
+        if not isinstance(policy, dict) or (
+            policy.get("merge_authorized") is not True
+            and policy.get("observe_only") is not True
+        ):
             raise StateError("merge_authorization_required")
         if not policy.get("policy_source"):
             raise StateError("project_merge_policy_source_required")
-        if task.get("merge_attempted") and task.get("merge_policy") != policy:
+        if (task.get("merge_attempted") or task.get("merge_receipt")) and task.get(
+            "merge_policy"
+        ) != policy:
             raise StateError("uncertain_merge_policy_immutable")
         self.store.update(
             task_id,
@@ -58,11 +63,27 @@ class TaskClosure:
             raise StateError("work_not_successful")
         if task["merge_policy"]["head_sha"] != task["publication"]["head_sha"]:
             raise StateError("new_head_requires_new_validation_and_publication")
+        if specification.get("source_commit") != task["report"].get("commit"):
+            raise StateError("publication_source_binding_mismatch")
+        from oraculo.publication import integration_binding
+
+        integration_binding(specification)
 
     async def watch(self, task_id):
         task = self.store.get(task_id)
         if task.get("deliverable_kind") == "plan":
             raise StateError("plan_not_publishable")
+        if task["publication"].get("host") == "azure":
+            self.store.update(
+                task_id,
+                "pr_waiting",
+                {
+                    "native_watch": "unsupported",
+                    "observation": "explicit_pr_check_required",
+                    "source": "oraculo_adapter_capability_policy",
+                },
+            )
+            return
         origin = await self.engine._thread(task["origin"]["thread_id"])
         if origin.get("parentThreadId"):
             raise StateError("pr_watch_requires_root_origin")
@@ -96,6 +117,27 @@ class TaskClosure:
         if receipt["state"] == "merged":
             if not receipt.get("merge_sha"):
                 raise StateError("merge_not_confirmed")
+            prior = task.get("merge_receipt")
+            if prior and any(
+                prior.get(k) != receipt.get(k)
+                for k in (
+                    "host",
+                    "repository",
+                    "number",
+                    "url",
+                    "head_sha",
+                    "base",
+                    "branch",
+                    "repository_id",
+                    "project_id",
+                    "merge_sha",
+                )
+            ):
+                raise StateError("merge_receipt_changed")
+            if prior and {k: v for k, v in prior.items() if k != "observed_at"} == {
+                k: v for k, v in receipt.items() if k != "observed_at"
+            }:
+                receipt = prior
             self.store.update(
                 task_id,
                 "merged",
@@ -126,6 +168,10 @@ class TaskClosure:
             return
         if not merge:
             return
+        if task["publication_spec"].get("reconcile_only") or task["merge_policy"].get(
+            "observe_only"
+        ):
+            raise StateError("reconciled_pr_observation_only")
         if receipt["state"] != "merged":
             observed = await self.engine._observe(task)
             if (
@@ -176,6 +222,7 @@ class TaskClosure:
 
     async def finalize(self, task_id):
         task = self.store.get(task_id)
+        self._requirements(task)
         if task.get("deliverable_kind") == "plan":
             raise StateError("plan_not_publishable")
         merged = task.get("merge_receipt")
@@ -238,11 +285,16 @@ class TaskClosure:
                 raise StateError("settlement_unconfirmed")
         # Also validate after a new request or when reconciling a lost response.
         await self._pull_request_gate(client, task)
-        unwatched = await self.host.call(
-            "unwatch_pull_request",
-            {"threadId": task["origin"]["thread_id"], "url": merged["url"]},
-        )
-        if unwatched.get("watching") is not False:
+        if merged.get("host") == "azure":
+            # No watch was emitted for this host, so there is no host ACK to
+            # manufacture. Native linked PRs are still gated below.
+            unwatched = None
+        else:
+            unwatched = await self.host.call(
+                "unwatch_pull_request",
+                {"threadId": task["origin"]["thread_id"], "url": merged["url"]},
+            )
+        if unwatched is not None and unwatched.get("watching") is not False:
             raise StateError("pr_unwatch_unconfirmed")
         self.store.update(
             task_id,
@@ -258,6 +310,48 @@ class TaskClosure:
 
     async def _pull_request_gate(self, client, task):
         pr = task["merge_receipt"]
+        if pr.get("host") == "azure":
+            observed = await client.list_thread_pull_requests(
+                task["child"]["childThreadId"]
+            )
+            actual = self.lifecycle.inspect(
+                task["publication"],
+                task["merge_policy"],
+                task["publication_spec"]["cwd"],
+            )
+            if actual.get("state") != "merged" or any(
+                actual.get(k) != pr.get(k)
+                for k in (
+                    "url",
+                    "repository_id",
+                    "project_id",
+                    "head_sha",
+                    "base",
+                    "branch",
+                    "merge_sha",
+                )
+            ):
+                raise StateError("azure_merge_observation_mismatch")
+            # Azure native support is not verified. Require a fully observed empty
+            # native set, or exactly this PR if a future host reports it. Never
+            # hide another linked PR by substituting the REST receipt.
+            rows = observed.get("pullRequests")
+            if rows == []:
+                return
+            verify_pull_requests(
+                [
+                    {
+                        "host": "dev.azure.com",
+                        "repository": pr["repository"],
+                        "number": pr["number"],
+                        "base_branch": pr["base"],
+                        "head_sha": pr["head_sha"],
+                        "merge_sha": pr["merge_sha"],
+                    }
+                ],
+                observed,
+            )
+            return
         # GitHub supplied the verified commit receipt. T3 exposes the linked
         # PR identities, target and host state, but not commit SHAs.
         expected = [
