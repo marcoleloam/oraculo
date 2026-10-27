@@ -22,6 +22,8 @@ from pathlib import Path
 DEFAULT_ROOT = Path.home() / ".local/share/oraculo"
 DEFAULT_BIN = Path.home() / ".local/bin"
 CURRENT_STATE_SCHEMA = 4
+# Journal states after which no effect of the operation remains pending.
+TERMINAL_OPERATION_STATES = frozenset({"complete", "abandoned"})
 
 
 class RuntimeError(Exception):
@@ -326,9 +328,16 @@ def prepare(root, bin_dir, bundle, *, dry_run=False, initial=False):
     )
 
 
-def compatible(manifest, guard):
+def compatible(manifest, guard, carry=None):
+    # A carried maintenance replaces quiescence only with its own proof for the
+    # same explicit list; without a requested carry nothing changes.
+    quiet = guard.get("quiescent") is True or (
+        carry is not None
+        and guard.get("carry_quiescent") is True
+        and (guard.get("carry") or {}).get("task_ids") == carry
+    )
     if not (
-        guard.get("quiescent") is True
+        quiet
         and guard.get("admission_closed") is True
         and isinstance(guard.get("state_schema"), int)
         and guard.get("config_schema") == 1
@@ -402,6 +411,20 @@ def require_migration_complete(root):
         )
 
 
+def carry_audit(phase, actor, proof, **data):
+    return dict(
+        phase=phase,
+        at=datetime.now(UTC).isoformat(),
+        actor=actor,
+        proof=proof,
+        **data,
+    )
+
+
+def recorded_carry(journal):
+    return ((journal or {}).get("carry") or {}).get("task_ids")
+
+
 def activate(
     root,
     bin_dir,
@@ -411,16 +434,44 @@ def activate(
     *,
     rollback=False,
     dry_run=False,
+    carry=None,
+    authorization=None,
 ):
+    from oraculo import reservation_carry
+
     require_migration_complete(root)
+    try:
+        carry = reservation_carry.normalize(carry)
+        actor = reservation_carry.actor(authorization) if carry else None
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+    if authorization is not None and carry is None:
+        raise RuntimeError("carry_authorization_without_carry")
+    if carry and not authorization:
+        raise RuntimeError(
+            "carry_authorization_required",
+            "State who authorized the exceptional carry with --carry-authorization.",
+        )
+    # Only a carried operation passes carry arguments to the official guard.
+    carry_kwargs = dict(carry=carry, actor=actor) if carry else {}
     journal_path = root / "operation.json"
     journal = json.loads(journal_path.read_text()) if journal_path.exists() else None
-    pending = journal and journal["state"] != "complete"
+    pending = journal and journal["state"] not in TERMINAL_OPERATION_STATES
     if pending and not rollback and release_id != journal.get("target"):
         raise RuntimeError(
             "recovery_required",
             "Repeat runtime activate for the recorded target or use runtime rollback; inspect operation.json first.",
         )
+    if pending and recorded_carry(journal) != carry:
+        raise RuntimeError(
+            "carry_mismatch",
+            "Repeat with exactly the carry list recorded in operation.json. An operation that never acquired maintenance can be retired with runtime abandon-operation.",
+        )
+    superseded = (
+        journal.get("abandoned")
+        if journal and journal["state"] == "abandoned"
+        else None
+    )
     previous = current_release(root)
     if rollback:
         history = journal or {}
@@ -464,6 +515,13 @@ def activate(
     if observed["state"] in {"unknown", "failed", "stopping", "starting", "loaded"}:
         raise RuntimeError("service_state_unproven")
     running = observed["state"] == "online"
+    if carry and (running or (pending and journal.get("was_running"))):
+        # An older daemon cannot prove a carry; its maintenance.begin only knows
+        # quiescence. Stopping is a separate, audited and identity-checked step.
+        raise RuntimeError(
+            "carry_requires_stopped_service",
+            "Run service stop --carry-reservation with the same list first; the carried activation never starts the service.",
+        )
     if dry_run:
         return receipt(
             "planned",
@@ -489,6 +547,11 @@ def activate(
         and service_operation["operation_id"] != journal["operation_id"]
     ):
         raise RuntimeError("maintenance_correlation")
+    if service_operation and recorded_carry(service_operation) != carry:
+        raise RuntimeError(
+            "carry_mismatch",
+            "Use exactly the carry list recorded by the pending service operation.",
+        )
     operation = (
         journal["operation_id"]
         if pending
@@ -506,6 +569,8 @@ def activate(
     )
     if not fresh and config is None:
         raise RuntimeError("config_missing")
+    if fresh and carry:
+        raise RuntimeError("carry_state_missing")
     if not pending:
         journal = dict(
             schema_version=1,
@@ -522,6 +587,10 @@ def activate(
             if controller.plist_bytes()
             else None,
         )
+        if superseded:
+            journal["supersedes"] = superseded
+        if carry:
+            journal["carry"] = dict(task_ids=carry, audit=[])
     else:
         journal.update(state="recovering", recovery_target=release_id)
     write_json(journal_path, journal)
@@ -545,9 +614,21 @@ def activate(
                 from oraculo.maintenance import maintenance_guard
             except ImportError:
                 raise RuntimeError("offline_maintenance_unavailable") from None
-            guard = stack.enter_context(maintenance_guard(config, operation))
+            guard = stack.enter_context(
+                maintenance_guard(config, operation, **carry_kwargs)
+            )
         if not fresh:
             match_guard(journal, guard)
+        if carry:
+            journal["carry"]["audit"].append(
+                carry_audit(
+                    "maintenance",
+                    actor,
+                    guard.get("carry_proof"),
+                    release_id=release_id,
+                    rollback=rollback,
+                )
+            )
         journal["token"] = guard.get("token")
         journal["maintenance_end_attempted"] = False
         if not pending or journal.get("capacity") is None:
@@ -555,7 +636,7 @@ def activate(
             # capacity; the recovered guard is the baseline the restart must keep.
             journal["capacity"] = guard.get("capacity")
         step("maintenance")
-        compatible(manifest, guard)
+        compatible(manifest, guard, carry)
         if guard.get("operation_id", operation) != operation:
             raise RuntimeError("maintenance_correlation")
         if not fresh and not guard.get("token"):
@@ -605,7 +686,11 @@ def activate(
 
             journal["maintenance_end_attempted"] = True
             write_json(journal_path, journal)
-            end_maintenance(config, operation, journal["token"])
+            ended = end_maintenance(config, operation, journal["token"], **carry_kwargs)
+            if carry:
+                journal["carry"]["audit"].append(
+                    carry_audit("end", actor, (ended or {}).get("carry_proof"))
+                )
         step("complete")
         if service_operation:
             service_operation["state"] = "complete"
@@ -619,7 +704,133 @@ def activate(
         release_id=release_id,
         previous=previous,
         service_started=journal["was_running"],
+        **({"carried_reservations": carry} if carry else {}),
     )
+
+
+def maintenance_holder(config, controller, observed, acceptance=None):
+    """Operation currently holding maintenance, read without acquiring it.
+
+    A running daemon answers through its socket when maintenance_acceptance
+    proved it reachable (online, or degraded only by the legacy dispatcher).
+    """
+    if acceptance:
+        return controller.request("maintenance.status", {}).get("operation_id")
+    if observed["state"] != "unloaded":
+        raise RuntimeError("service_state_unproven")
+    if config is None or not config.db_path.exists():
+        return None
+    import sqlite3
+
+    from oraculo.service import Singleton
+
+    with Singleton(config.state_dir):
+        db = sqlite3.connect(config.db_path.absolute().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = db.execute(
+                "SELECT value FROM metadata WHERE key='runtime_maintenance'"
+            ).fetchone()
+        finally:
+            db.close()
+    value = json.loads(row[0]) if row else None
+    return (value or {}).get("operation_id")
+
+
+def abandon(
+    root, config_path, controller, operation_id, *, authorization, dry_run=False
+):
+    """Retire a pending activation that provably never acquired maintenance.
+
+    Repeating its target or rolling back both require quiescence again. When
+    the operation stopped before any effect, the verbatim journal is archived
+    and the replacement record keeps who, when, why and the observed proof.
+    """
+    from oraculo import reservation_carry
+
+    require_migration_complete(root)
+    path = root / "operation.json"
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError("operation_missing")
+    raw = path.read_bytes()
+    journal = json.loads(raw)
+    if journal.get("operation_id") != operation_id:
+        raise RuntimeError(
+            "operation_mismatch",
+            "Pass the exact pending operation_id shown by runtime status.",
+        )
+    if journal.get("state") == "abandoned":
+        return receipt("abandoned", **journal["abandoned"])
+    try:
+        actor = reservation_carry.actor(authorization)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+    if not authorization:
+        raise RuntimeError("carry_authorization_invalid")
+    if (
+        journal.get("state") != "acquiring_maintenance"
+        or journal.get("token") is not None
+        or journal.get("replacement")
+        or journal.get("replacement_maintenance")
+        or journal.get("recovery_pids")
+        or journal.get("maintenance_end_attempted")
+        or journal.get("recovery_target")
+    ):
+        raise RuntimeError(
+            "operation_effects_possible",
+            "Only an operation that never acquired maintenance can be abandoned; repeat runtime activate for its target or use runtime rollback.",
+        )
+    current = current_release(root)
+    if current != journal.get("previous"):
+        raise RuntimeError("operation_effects_possible")
+    if journal.get("old_plist") is not None and controller.plist_bytes() != (
+        journal["old_plist"].encode()
+    ):
+        raise RuntimeError("operation_effects_possible")
+    expected = config_hash(config_path)
+    if expected != journal.get("config_sha256"):
+        raise RuntimeError(
+            "config_changed",
+            "Restore the configuration recorded by the pending operation before abandoning it.",
+        )
+    config = load_config_verified(config_path, expected) if expected else None
+    from oraculo.service_control import maintenance_acceptance
+
+    observed = controller.status()
+    acceptance = maintenance_acceptance(controller, observed)
+    holder = maintenance_holder(config, controller, observed, acceptance)
+    if holder == operation_id:
+        raise RuntimeError(
+            "operation_holds_maintenance",
+            "Maintenance was acquired; repeat runtime activate for the recorded target or use runtime rollback.",
+        )
+    proof = dict(
+        service_state=observed["state"],
+        service_pid=observed.get("pid"),
+        service_health=observed.get("health"),
+        service_acceptance=acceptance,
+        current_release=current,
+        maintenance_holder=holder,
+        config_sha256=expected,
+    )
+    if dry_run:
+        return receipt("planned", operation_id=operation_id, proof=proof)
+    archive = root / "operations-archive" / f"{operation_id}.json"
+    if archive.exists() and archive.read_bytes() != raw:
+        raise RuntimeError("operation_archive_conflict")
+    atomic_write(archive, raw)
+    record = dict(
+        operation_id=operation_id,
+        target=journal.get("target"),
+        previous=journal.get("previous"),
+        state_before=journal["state"],
+        at=datetime.now(UTC).isoformat(),
+        actor=actor,
+        archive=str(archive),
+        archive_sha256=hashlib.sha256(raw).hexdigest(),
+        proof=proof,
+    )
+    write_json(path, dict(journal, state="abandoned", abandoned=record))
+    return receipt("abandoned", **record)
 
 
 def diagnose(root=DEFAULT_ROOT, bin_dir=DEFAULT_BIN, config=None):
@@ -643,7 +854,7 @@ def diagnose(root=DEFAULT_ROOT, bin_dir=DEFAULT_BIN, config=None):
             result["operation"] = json.loads((root / "operation.json").read_text())
             result["operation"].pop("token", None)
             result["operation"].pop("replacement_maintenance", None)
-            if result["operation"]["state"] != "complete":
+            if result["operation"]["state"] not in TERMINAL_OPERATION_STATES:
                 result["state"] = "recovery_required"
     except (RuntimeError, ValueError, OSError) as exc:
         result.update(
@@ -679,6 +890,20 @@ def common_options(parser):
     parser.add_argument("--dry-run", action="store_true")
 
 
+def carry_options(parser):
+    parser.add_argument(
+        "--carry-reservation",
+        dest="carry_reservations",
+        action="append",
+        metavar="TASK_ID",
+        help="Exceptional, audited: keep this finished executor's reservation across maintenance. Repeat per task.",
+    )
+    parser.add_argument(
+        "--carry-authorization",
+        help="Who authorized the carry and why; recorded in every audit entry.",
+    )
+
+
 def register_parsers(subparsers):
     parser = subparsers.add_parser("runtime")
     actions = parser.add_subparsers(dest="runtime_action", required=True)
@@ -689,6 +914,7 @@ def register_parsers(subparsers):
         "rollback",
         "status",
         "migrate-legacy",
+        "abandon-operation",
     ):
         child = actions.add_parser(action)
         common_options(child)
@@ -696,6 +922,11 @@ def register_parsers(subparsers):
             child.add_argument("--bundle", type=Path, required=True)
         if action == "activate":
             child.add_argument("release_id")
+        if action in {"activate", "rollback"}:
+            carry_options(child)
+        if action == "abandon-operation":
+            child.add_argument("--operation-id", required=True)
+            child.add_argument("--authorization", required=True)
         if action == "migrate-legacy":
             child.add_argument("--candidate-root", type=Path, required=True)
             child.add_argument("--release-id", required=True)
@@ -739,6 +970,15 @@ def dispatch(args):
                     args.previous_pid,
                     dry_run=args.dry_run,
                 )
+            if args.runtime_action == "abandon-operation":
+                return abandon(
+                    root,
+                    args.config.expanduser().absolute(),
+                    ServiceController.from_args(args),
+                    args.operation_id,
+                    authorization=args.authorization,
+                    dry_run=args.dry_run,
+                )
             return activate(
                 root,
                 bin_dir,
@@ -747,6 +987,8 @@ def dispatch(args):
                 getattr(args, "release_id", None),
                 rollback=args.runtime_action == "rollback",
                 dry_run=args.dry_run,
+                carry=args.carry_reservations,
+                authorization=args.carry_authorization,
             )
     except RuntimeError as exc:
         result = receipt("blocked", error_code=exc.code)

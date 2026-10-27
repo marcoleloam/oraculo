@@ -79,6 +79,14 @@ class TaskStore:
             raise StateError("managed_task_not_found")
         return json.loads(row[0])
 
+    def exists(self, origin: dict, key: str) -> bool:
+        task_id = "task-" + content_hash([origin["thread_id"], key])
+        return bool(
+            self.db.execute(
+                "SELECT 1 FROM managed_tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        )
+
     def create(self, origin: dict, key: str, request: dict) -> dict:
         if not key or len(key) > 200:
             raise StateError("task_dedupe_key_required")
@@ -187,26 +195,22 @@ class TaskStore:
         )
 
     def prepare_returns(self, task_id: str) -> list[dict]:
-        """Atomically select readable intentions before any external effect.
+        """Atomically select notification intentions before any external effect.
 
-        Frozen deliveries are barriers: always replay their original bytes/key.
-        Only unprepared readable events can be covered by another intention.
-        No receipt is written here; coverage is local provenance, not a host ACK.
-        The caller sends this bounded batch, so sends cannot feed their own loop.
+        Both formats share one semantic rule: a fresh batch is represented by
+        its newest event only when the meaning (phase, blocker, result, action
+        or approval) differs from the last host-confirmed notification;
+        otherwise it is suppressed and wakes nobody. Frozen deliveries are
+        barriers: always replay their original bytes/key. No receipt is written
+        here; coverage is local provenance, not a host ACK. The caller sends
+        this bounded batch, so sends cannot feed their own loop.
         """
         from oraculo.presentation import notification_signature, task_view
 
         with self.state.transaction():
             task = self.get(task_id)
             origin = canonical_json(task["origin"])
-            last = self.db.execute(
-                "SELECT n.signature,n.return_id FROM task_notifications n "
-                "JOIN task_returns r ON r.id=n.return_id "
-                "WHERE n.task_id=? AND n.origin=? AND n.disposition='intent' "
-                "AND r.receipt IS NOT NULL ORDER BY r.rowid DESC LIMIT 1",
-                (task_id, origin),
-            ).fetchone()
-            target = tuple(last) if last else None
+            target = self._last_confirmed(task_id, origin)
             confirmed = target is not None
             current_signature = notification_signature(task_view(task), task)
             pending = self.pending_returns(task_id)
@@ -247,25 +251,49 @@ class TaskStore:
                 frozen = json.loads(row[0]) if row[0] else None
                 if frozen is not None:
                     prepare_fresh()
-                    # Even a pre-upgrade frozen readable duplicate must replay.
-                    if frozen.get("return_format") == "readable":
-                        signature = notification_signature(
-                            frozen["presentation"], frozen["snapshot"]
-                        )
-                        target, confirmed = (signature, event["id"]), False
-                        self._notification(
-                            event, origin, signature, event["id"], "intent"
-                        )
-                    else:
+                    # Even a pre-upgrade frozen duplicate must replay unchanged.
+                    signature = self._delivery_signature(frozen)
+                    if signature is None:
                         target = None
-                    continue
-                if task.get("return_format", "json") != "readable":
-                    self.delivery(event)
-                    target = None
+                        continue
+                    target, confirmed = (signature, event["id"]), False
+                    self._notification(event, origin, signature, event["id"], "intent")
                     continue
                 fresh.append(event)
             prepare_fresh()
             return self.pending_returns(task_id)
+
+    @staticmethod
+    def _delivery_signature(delivery: dict) -> str | None:
+        from oraculo.presentation import notification_signature
+
+        if not isinstance(delivery.get("presentation"), dict) or not isinstance(
+            delivery.get("snapshot"), dict
+        ):
+            return None  # Pre-presentation envelope: meaning unknown, never dedupe.
+        return notification_signature(delivery["presentation"], delivery["snapshot"])
+
+    def _last_confirmed(self, task_id: str, origin: str) -> tuple | None:
+        """Meaning of the newest host-confirmed notification for this scope.
+
+        Legacy confirmed deliveries (JSON, or readable before notification
+        metadata) have no decision row; their frozen snapshot still states
+        what the origin already received.
+        """
+        row = self.db.execute(
+            "SELECT r.id,r.delivery,n.signature FROM task_returns r "
+            "LEFT JOIN task_notifications n ON n.return_id=r.id "
+            "WHERE r.task_id=? AND r.receipt IS NOT NULL AND (n.return_id IS NULL "
+            "OR (n.disposition='intent' AND n.origin=?)) "
+            "ORDER BY r.rowid DESC LIMIT 1",
+            (task_id, origin),
+        ).fetchone()
+        if row is None:
+            return None
+        signature = row[2] or (
+            self._delivery_signature(json.loads(row[1])) if row[1] else None
+        )
+        return (signature, row[0]) if signature else None
 
     def _notification(self, event, origin, signature, representative, disposition):
         self.db.execute(

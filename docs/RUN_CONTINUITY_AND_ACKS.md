@@ -22,6 +22,23 @@ visible descendant is read. Successful work still requires original and latest
 runs completed, successful descendants, a positive valid report, and the bound
 clean checkout/commit/base. Negative work stays negative.
 
+### Stopped original, completed continuation
+
+Native `task_status.status` follows the delegated task, not `childRunId`: after a
+cancelled original and a completed continuation it reports `completed` while
+`childRunId` still names the cancelled run. Success is accepted for such a chain
+only when, in the same child thread, the original (`childRunId`, ordinal 1) is
+`cancelled` or `interrupted`, every run is `cancelled`/`interrupted`/`completed`
+(never `failed` or `rolled_back`), the latest run is `completed` and equals the
+thread's `latestRunId`/status, native `status`, `latestTerminalRunId` and
+`latestTerminalStatus` equal that latest run, `hasPendingChildRuns` and
+`hasPendingQuestion` are false, and the report is the executor's own submission
+bound to the latest run (legacy unbound events and origin-authored reports are
+refused with `latest_run_report_unproven`). `completion_evidence.continuation`
+records the basis, original/latest IDs and statuses, the submission run and the
+native status fields; `childRunId` is never rewritten. A single cancelled run,
+an open run or any failed run keeps the previous negative/blocking behavior.
+
 A new executor submission records its actual caller thread/run. For legacy
 submissions, the immutable `validation_submitted` event's report digest and
 service timestamp must place submission during the last run or after it; the

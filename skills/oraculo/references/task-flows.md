@@ -22,6 +22,18 @@ invent caller/run/provider IDs. The adapter obtains identity from the host and
 chooses the valid transport. A worktree outside its main checkout needs an actual
 host/Git binding; a basename or similar title does not establish project scope.
 
+The transport is a native child of the origin, never an implicit top-level
+conversation. Native requires the same project, `cwd` equal to the origin's bound
+checkout and `base` equal to that checkout's HEAD. If any of these fails, `start`
+returns `state: "launch_rejected"`, `created: false` and a `rejection` with
+`reason`, `hint`, `observed` and `host_effects: "none"`: no task, reservation,
+memory cycle or host thread exists. Fix the binding (check out or bind a worktree
+of the origin at the requested base) and start the same key again. Ask for a
+top-level conversation only when the user explicitly wants one, with the JSON
+boolean `"independent": true`; any other value is `invalid_independent_flag`.
+Return notifications (`ORACULO_CONTROL_V1`) given as `text` return
+`control_event_not_work` and never create a task or count as plan approval.
+
 Retain the returned `task_id` and original key. For `status` and `resume`, the
 file contains `{"task_id":"returned-id"}`; `list` requires no payload. If the
 request is already bound, inspect it before doing anything else. Same key with

@@ -1694,12 +1694,23 @@ class Service:
                     admission=admission,
                 )
                 cursor = store.state.get_meta("managed_reconcile_cursor", 0)
-                rows = store.db.execute(
-                    "SELECT rowid,id FROM managed_tasks WHERE rowid>? ORDER BY rowid LIMIT 16",
+                scanned = store.db.execute(
+                    "SELECT rowid,id FROM managed_tasks WHERE rowid>? ORDER BY rowid LIMIT 256",
                     (cursor,),
                 ).fetchall()
-                if not rows:
+                if not scanned:
                     store.state.set_meta("managed_reconcile_cursor", 0)
+                # Terminal/certified tasks without pending work or undelivered
+                # returns are skipped without any host read, event or send.
+                rows, consumed = [], cursor
+                for row in scanned:
+                    if len(rows) == 16:
+                        break
+                    consumed = row["rowid"]
+                    if adapter.background_work(
+                        store.get(row["id"])
+                    ) is not None or store.pending_returns(row["id"]):
+                        rows.append(row)
 
                 async def run_batch():
                     last = cursor
@@ -1713,11 +1724,11 @@ class Service:
                             )
                         last = row["rowid"]
                         if host.failed:
-                            break
-                    return last
+                            return last
+                    return consumed
 
                 last = asyncio.run(run_batch())
-                if rows:
+                if scanned:
                     store.state.set_meta("managed_reconcile_cursor", last)
             finally:
                 if store:

@@ -14,16 +14,59 @@ import subprocess
 from pathlib import Path
 
 from oraculo.projects import resolve_project
-from oraculo.protocol import canonical_json, content_hash
+from oraculo.protocol import canonical_json, content_hash, is_control_event
 from oraculo.run_continuity import report_link, terminal_chain
 from oraculo.settlement import Settlements
 from oraculo.state import StateError
 from oraculo.t3.client import T3Client
 from oraculo.task_store import TaskStore
 
+# A stopped original run may be followed by completed continuations in the same
+# child thread. failed/rolled_back never belong to such a chain.
+STOPPED_RUN_STATUSES = frozenset({"cancelled", "interrupted"})
+CONTINUATION_RUN_STATUSES = STOPPED_RUN_STATUSES | {"completed"}
+CERTIFIED_WORK_STATUSES = frozenset({"succeeded", "failed", "stopped"})
+
+LAUNCH_HINTS = {
+    "invalid_independent_flag": (
+        "independent must be the JSON boolean true, false or absent."
+    ),
+    "native_child_unavailable_independent_required": (
+        "The host offers no app-owned subagents. A top-level conversation "
+        "requires an explicit independent=true request."
+    ),
+    "native_child_project_mismatch": (
+        "The resolved project differs from the origin conversation's project. "
+        "Start the task from a conversation bound to that project, or request "
+        "independent=true explicitly for a top-level conversation."
+    ),
+    "native_child_workspace_mismatch": (
+        "cwd is not the checkout bound to the origin conversation. Start from "
+        "the origin's bound worktree, or request independent=true explicitly."
+    ),
+    "native_child_base_not_head": (
+        "A native child starts from the origin checkout HEAD. Check out the "
+        "requested base in the origin's bound worktree (or bind the origin to a "
+        "worktree at that base) and start again, or request independent=true "
+        "explicitly for a top-level conversation."
+    ),
+    "implicit_top_level_intent_refused": (
+        "A persisted top-level intent without explicit independent=true is never "
+        "sent. Cancel this task and start again natively or with independent=true."
+    ),
+}
+
 
 class ReportValidationError(StateError):
     """Correctable input/preflight failure; never persist a blocked transition."""
+
+
+class LaunchPreflightError(StateError):
+    """Routing refused before any reservation, memory cycle or host mutation."""
+
+    def __init__(self, reason: str, observed: dict | None = None):
+        super().__init__(reason)
+        self.observed = observed or {}
 
 
 def git(cwd: str | Path, *args: str) -> str:
@@ -139,12 +182,16 @@ class ManagedTasks:
                         )
                     ]
                 }
+            plan = None
             if action == "start":
                 if payload.get("kind") != "work":
                     return {"state": "not_work", "created": False}
                 text = payload.get("text")
                 if not isinstance(text, str) or not text.strip() or len(text) > 32000:
                     raise StateError("task_brief_required")
+                if is_control_event(payload) or is_control_event(text):
+                    # Return notifications are never a human request or approval.
+                    return {"state": "control_event_not_work", "created": False}
                 if payload.get("approved_plan"):
                     reference = payload["approved_plan"]
                     plan = self.store.get(reference["task_id"])
@@ -155,6 +202,21 @@ class ManagedTasks:
                         or plan["report"].get("commit") != reference.get("commit")
                     ):
                         raise StateError("approved_plan_binding_required")
+                key = payload.get("key")
+                if (
+                    isinstance(key, str)
+                    and 0 < len(key) <= 200
+                    and not self.store.exists(actor, key)
+                ):
+                    # Routing is decided before the task, reservation, memory
+                    # cycle or any host mutation exists. Other preflight errors
+                    # keep their persisted blocked transition in _advance.
+                    try:
+                        plan = await self._launch_plan(payload, actor, caps)
+                    except LaunchPreflightError as exc:
+                        return self._launch_rejection(None, exc)
+                    except (StateError, ValueError, KeyError):
+                        plan = None
                 task = self.store.create(actor, payload["key"], payload)
             else:
                 task = self.store.get(payload["task_id"])
@@ -195,7 +257,7 @@ class ManagedTasks:
                 elif action == "cancel":
                     await self._cancel(task_id, actor)
                 elif action in {"start", "resume"}:
-                    await self._advance(task_id, actor, caps)
+                    await self._advance(task_id, actor, caps, plan)
                 elif action == "approve":
                     if (
                         actor["thread_id"] != task["origin"]["thread_id"]
@@ -205,6 +267,7 @@ class ManagedTasks:
                         != (task.get("report") or {}).get("commit")
                         or not isinstance(payload.get("evidence"), str)
                         or not payload["evidence"].strip()
+                        or is_control_event(payload["evidence"])
                     ):
                         raise StateError("plan_approval_binding_required")
                     self.store.update(
@@ -307,6 +370,8 @@ class ManagedTasks:
                     await self._publish(task_id, payload["publication"], actor)
                 else:
                     raise StateError("unknown_managed_action")
+            except LaunchPreflightError as exc:
+                return self._launch_rejection(task_id, exc)
             except ReportValidationError as exc:
                 return self._report_rejection(task_id, str(exc))
             except Exception as exc:
@@ -353,6 +418,101 @@ class ManagedTasks:
             },
         )
 
+    def _launch_rejection(self, task_id, exc: LaunchPreflightError):
+        """A response only: no transition, outbox entry, reservation or launch."""
+        reason = str(exc)
+        rejection = {
+            "persisted": False,
+            "correctable": True,
+            "reason": reason,
+            "hint": LAUNCH_HINTS.get(
+                reason, "Correct the routing request and retry the same task key."
+            ),
+            "observed": exc.observed,
+            "host_effects": "none",
+        }
+        if task_id is None:
+            return dict(
+                state="launch_rejected",
+                created=False,
+                phase="blocked",
+                blocked_reason=reason,
+                rejection=rejection,
+            )
+        return dict(
+            self.store.describe(task_id),
+            phase="blocked",
+            blocked_reason=reason,
+            rejection=rejection,
+        )
+
+    async def _launch_plan(
+        self, req: dict, actor: dict, caps: dict, project: dict | None = None
+    ) -> dict:
+        """Read-only routing decision; never chooses a top-level implicitly.
+
+        appOwnedSubagents children keep the origin as parent. A top-level
+        conversation exists only for an explicit boolean independent=true.
+        """
+        independent = req.get("independent", False)
+        if type(independent) is not bool:
+            raise LaunchPreflightError("invalid_independent_flag")
+        if project is None:
+            project = resolve_project(
+                self.config,
+                cwd=req["cwd"],
+                projects=await self._projects(),
+                explicit=req.get("project"),
+            )
+        # The host launches from the selected project's Git repository. A cwd in
+        # that repository may pin a private development commit; other-project cwd
+        # never chooses the destination base implicitly.
+        try:
+            source = resolve_project(
+                self.config, cwd=req["cwd"], projects=await self._projects()
+            )
+        except ValueError:
+            if not req.get("project"):
+                raise
+            source = {}
+        parent_path = (
+            req["cwd"]
+            if source.get("project_id") == project["project_id"]
+            else project["project_path"]
+        )
+        ws = workspace(parent_path)
+        if ws["dirty"]:
+            raise StateError("dirty_source_commit_selection_required")
+        requested_base = req.get("base", "HEAD")
+        if not isinstance(requested_base, str) or requested_base.startswith("-"):
+            raise StateError("invalid_base_ref")
+        base_sha = git(
+            parent_path, "rev-parse", "--verify", requested_base + "^{commit}"
+        )
+        plan = dict(project=project, ws=ws, base_sha=base_sha, native=False)
+        if independent:
+            return plan
+        caller = await self._thread(actor["thread_id"])
+        caller_path = caller.get("worktreePath") or project["project_path"]
+        observed = dict(
+            requested_base=requested_base,
+            base_sha=base_sha,
+            head=ws["head"],
+            origin_project_id=actor["project_id"],
+            project_id=project["project_id"],
+        )
+        if caps.get("features", {}).get("appOwnedSubagents") is not True:
+            raise LaunchPreflightError(
+                "native_child_unavailable_independent_required", observed
+            )
+        if actor["project_id"] != project["project_id"]:
+            raise LaunchPreflightError("native_child_project_mismatch", observed)
+        if Path(caller_path).resolve() != Path(ws["path"]).resolve():
+            raise LaunchPreflightError("native_child_workspace_mismatch", observed)
+        if ws["head"] != base_sha:
+            raise LaunchPreflightError("native_child_base_not_head", observed)
+        return dict(plan, native=True)
+
     async def _scope(self, task: dict):
         project = task["project"]
         if not self.config.project_in_scope(project["project_path"]):
@@ -369,15 +529,21 @@ class ManagedTasks:
         ):
             raise StateError("managed_project_binding_changed")
 
-    async def _advance(self, task_id: str, actor: dict, caps: dict):
+    async def _advance(
+        self, task_id: str, actor: dict, caps: dict, plan: dict | None = None
+    ):
         task = self.store.get(task_id)
         req = task["request"]
         if not task.get("project"):
-            project = resolve_project(
-                self.config,
-                cwd=req["cwd"],
-                projects=await self._projects(),
-                explicit=req.get("project"),
+            project = (
+                plan["project"]
+                if plan
+                else resolve_project(
+                    self.config,
+                    cwd=req["cwd"],
+                    projects=await self._projects(),
+                    explicit=req.get("project"),
+                )
             )
             self.store.update(
                 task_id,
@@ -413,6 +579,14 @@ class ManagedTasks:
             elif task["work_status"] == "pending":
                 await self._observe(task)
             return
+        if not task.get("launch_attempted"):
+            # Same read-only routing as start, before admission and memory.
+            plan = plan or await self._launch_plan(req, actor, caps, project)
+            if (
+                task.get("transport_mode") == "managed_thread"
+                and req.get("independent") is not True
+            ):
+                raise LaunchPreflightError("implicit_top_level_intent_refused")
         if self.admission is not None:
             provider = (req.get("target") or {}).get("providerInstanceId") or caps.get(
                 "inheritedProviderInstanceId"
@@ -438,38 +612,11 @@ class ManagedTasks:
                     or workspace(source_path) != task["parent_workspace"]
                 ):
                     raise StateError("native_retry_parent_binding_changed")
-                receipt = await self.host.call(
-                    "delegate_task", task["launch_arguments"]
-                )
-                await self._accept_launch(task, receipt)
+                await self._reconcile_native_launch(task)
             else:
                 await self._reconcile_launch(task)
             return
-        # The host launches from the selected project's Git repository. A cwd in
-        # that repository may pin a private development commit; other-project cwd
-        # never chooses the destination base implicitly.
-        try:
-            source = resolve_project(
-                self.config, cwd=req["cwd"], projects=await self._projects()
-            )
-        except ValueError:
-            if not req.get("project"):
-                raise
-            source = {}
-        parent_path = (
-            req["cwd"]
-            if source.get("project_id") == project["project_id"]
-            else project["project_path"]
-        )
-        ws = workspace(parent_path)
-        if ws["dirty"]:
-            raise StateError("dirty_source_commit_selection_required")
-        requested_base = req.get("base", "HEAD")
-        if not isinstance(requested_base, str) or requested_base.startswith("-"):
-            raise StateError("invalid_base_ref")
-        base_sha = git(
-            parent_path, "rev-parse", "--verify", requested_base + "^{commit}"
-        )
+        ws, base_sha, native = plan["ws"], plan["base_sha"], plan["native"]
         if task.get("base_sha") and task["base_sha"] != base_sha:
             raise StateError("source_base_changed_reconcile_original_intent")
         if not task.get("memory"):
@@ -488,15 +635,6 @@ class ManagedTasks:
             )
             task = self.store.get(task_id)
         if not task.get("launch_arguments"):
-            caller_thread = await self._thread(actor["thread_id"])
-            caller_path = caller_thread.get("worktreePath") or project["project_path"]
-            native = (
-                not req.get("independent", False)
-                and actor["project_id"] == project["project_id"]
-                and caps.get("features", {}).get("appOwnedSubagents") is True
-                and Path(caller_path).resolve() == Path(ws["path"]).resolve()
-                and ws["head"] == base_sha
-            )
             mode = "native_child" if native else "managed_thread"
             reference = self.store.context_artifact(task["context"])
             brief = {
@@ -658,6 +796,58 @@ class ManagedTasks:
             seen.add(cursor)
         raise StateError("thread_catalog_incomplete")
 
+    async def _reconcile_native_launch(self, task: dict):
+        """Bind an uncertain native launch: catalog first, then the same key.
+
+        T3 exposes no read that maps a child thread to its taskId, so the only
+        way to obtain the native binding is to replay the persisted
+        delegate_task, byte-identical with clientRequestId ``<task_id>:delegate``
+        (idempotent per caller under the T3 contract). The catalog decides how
+        that replay is judged: with one unbound candidate the receipt must name
+        it (a lookup, never a second child); with none the replay is the first
+        effective launch; several candidates block without any host mutation.
+        """
+        arguments = task["launch_arguments"]
+        origin = task["origin"]["thread_id"]
+        rows = await self._thread_rows(task["project"]["project_id"])
+        bound = {
+            r[0]
+            for r in self.store.db.execute(
+                "SELECT json_extract(payload,'$.child.childThreadId') "
+                "FROM managed_tasks WHERE origin=? AND id<>?",
+                (origin, task["id"]),
+            )
+            if r[0]
+        }
+        candidates = sorted(
+            r["threadId"]
+            for r in rows
+            if r.get("parentThreadId") == origin
+            and r.get("title") == arguments.get("title")
+            and r["threadId"] not in bound
+        )
+        if len(candidates) > 1:
+            raise StateError("launch_uncertain_multiple_candidates")
+        self.store.update(
+            task["id"],
+            "launch_pending",
+            {
+                "launch_reconciliation": "replay_same_key_expect_candidate"
+                if candidates
+                else "reissue_same_key_no_candidate",
+                "client_request_id": arguments.get("clientRequestId"),
+                "intent_sha256": content_hash(arguments),
+                "catalog_rows": len(rows),
+                "candidates": candidates,
+                "excluded_bound": len(bound),
+            },
+        )
+        receipt = await self.host.call("delegate_task", arguments)
+        if candidates and receipt.get("childThreadId") != candidates[0]:
+            # Never bind (or release) on a receipt that contradicts the catalog.
+            raise StateError("launch_reconciliation_receipt_mismatch")
+        await self._accept_launch(self.store.get(task["id"]), receipt)
+
     async def _reconcile_launch(self, task: dict):
         await self._scope(task)
         rows = await self._thread_rows(task["project"]["project_id"])
@@ -744,7 +934,7 @@ class ManagedTasks:
         git(path, "merge-base", "--is-ancestor", task["base_sha"], "HEAD")
         self.store.update(
             task["id"],
-            "workspace_ready",
+            self._phase(task["id"], "workspace_ready"),
             {
                 "title": task["request"].get("title", "Project task"),
                 "project_id": task["project"]["project_id"],
@@ -770,7 +960,7 @@ class ManagedTasks:
                 child["childRunId"] = observed["childRunId"]
                 self.store.update(
                     task["id"],
-                    "workspace_ready",
+                    self._phase(task["id"], "workspace_ready"),
                     {"original_run_id": child["childRunId"]},
                     child=child,
                 )
@@ -784,7 +974,9 @@ class ManagedTasks:
                 and proof["hasPendingChildRuns"] is False
                 else "executing"
             )
-            self.store.update(task["id"], phase, proof, observed=proof)
+            self.store.update(
+                task["id"], self._phase(task["id"], phase), proof, observed=proof
+            )
             return proof
         snapshot = await self.host.call(
             "t3_thread_read",
@@ -811,7 +1003,7 @@ class ManagedTasks:
             child["childRunId"] = originals[0]["runId"]
             self.store.update(
                 task["id"],
-                "workspace_ready",
+                self._phase(task["id"], "workspace_ready"),
                 {"original_run_id": child["childRunId"]},
                 child=child,
             )
@@ -855,7 +1047,9 @@ class ManagedTasks:
         phase = (
             "validating" if observed["workState"] == "result_available" else "executing"
         )
-        self.store.update(task["id"], phase, observed, observed=observed)
+        self.store.update(
+            task["id"], self._phase(task["id"], phase), observed, observed=observed
+        )
         return observed
 
     async def _continue(self, task_id: str, payload: dict):
@@ -1217,7 +1411,23 @@ class ManagedTasks:
         self._report_workspace(task, thread)
         return chain
 
-    async def _terminal_gate(self, task, *, successful=False):
+    @staticmethod
+    def _continued_after_stop(task, chain):
+        """Original cancelled/interrupted, then completed continuation(s).
+
+        Same child thread and immutable childRunId; every earlier run stopped or
+        completed and the latest run completed. A failed or rolled back run
+        anywhere in the chain, or a single run, never qualifies.
+        """
+        return (
+            len(chain) > 1
+            and chain[0]["runId"] == task["child"]["childRunId"]
+            and chain[0]["status"] in STOPPED_RUN_STATUSES
+            and chain[-1]["status"] == "completed"
+            and all(r["status"] in CONTINUATION_RUN_STATUSES for r in chain)
+        )
+
+    async def _terminal_gate(self, task, *, successful=False, observations=None):
         """Preserve original binding and prove every run/descendant terminal."""
         client = T3Client("http://127.0.0.1/mcp")
         client.call = self.host.call
@@ -1247,12 +1457,19 @@ class ManagedTasks:
             original = next(
                 r for r in chain if r["runId"] == task["child"]["childRunId"]
             )
+            # task_status.status follows the delegated task: after a stopped
+            # original it reports the completed continuation, never the original.
+            expected = (
+                chain[-1]["status"]
+                if self._continued_after_stop(task, chain)
+                else original["status"]
+            )
             if (
                 any(
                     observed.get(k) != task["child"].get(k)
                     for k in ("taskId", "childThreadId", "childRunId")
                 )
-                or observed.get("status") != original["status"]
+                or observed.get("status") != expected
                 or observed.get("workState") != "result_available"
                 or observed.get("hasPendingChildRuns") is not False
                 or observed.get("hasPendingQuestion") is not False
@@ -1265,14 +1482,32 @@ class ManagedTasks:
                 )
             ):
                 raise StateError("terminal_execution_or_descendants_unproven")
+            if observations is not None:
+                observations["task_status"] = {
+                    k: observed.get(k)
+                    for k in (
+                        "taskId",
+                        "childThreadId",
+                        "childRunId",
+                        "status",
+                        "workState",
+                        "hasPendingChildRuns",
+                        "hasPendingQuestion",
+                        "latestTerminalRunId",
+                        "latestTerminalStatus",
+                    )
+                }
         return snapshot
 
-    async def _execution_gate(self, task, report=None, actor=None):
+    async def _execution_gate(self, task, report=None, actor=None, observations=None):
         """Success may follow a proven continuation; the original is immutable."""
-        snapshot = await self._terminal_gate(task, successful=True)
-        chain = snapshot["recentRuns"]
+        snapshot = await self._terminal_gate(
+            task, successful=True, observations=observations
+        )
+        chain = terminal_chain(snapshot)
         original = next(r for r in chain if r["runId"] == task["child"]["childRunId"])
-        if original["status"] != "completed":
+        after_stop = original["status"] != "completed"
+        if after_stop and not self._continued_after_stop(task, chain):
             raise StateError("expected_run_not_completed")
         binding = {
             "thread_id": task["child"]["childThreadId"],
@@ -1280,12 +1515,35 @@ class ManagedTasks:
             "run_id": snapshot["thread"]["latestRunId"],
         }
         Settlements.remote_gate(binding, snapshot)
-        report_link(
+        evidence = report_link(
             task,
             snapshot,
             report or task.get("report") or task.get("submitted_report"),
             actor=actor,
         )
+        if after_stop:
+            # Stricter than a continuation of a completed original: only the
+            # executor's own submission from the latest run certifies success.
+            # Legacy unbound events and origin-authored reports do not.
+            submitted = evidence.get("submission_actor") or {}
+            if (
+                not evidence.get("submission_event_id")
+                or evidence.get("legacy_submission")
+                or submitted.get("thread_id") != task["child"]["childThreadId"]
+                or submitted.get("run_id") != chain[-1]["runId"]
+            ):
+                raise StateError("latest_run_report_unproven")
+            if observations is not None:
+                observations["continuation"] = dict(
+                    basis="stopped_original_completed_continuation",
+                    original_run_id=original["runId"],
+                    original_status=original["status"],
+                    latest_run_id=chain[-1]["runId"],
+                    latest_status=chain[-1]["status"],
+                    run_count=len(chain),
+                    submission_run_id=submitted["run_id"],
+                    task_status=observations.get("task_status"),
+                )
         client = T3Client("http://127.0.0.1/mcp")
         client.call = self.host.call
         return client, binding, snapshot
@@ -1299,6 +1557,28 @@ class ManagedTasks:
             raise StateError("finish_requires_task_or_origin")
         if not task.get("child"):
             raise StateError("child_not_launched")
+        if self._certified(task):
+            # Certified results are immutable: replay never re-certifies,
+            # rewrites memory, regresses the phase or resets approval_state.
+            if report != task["report"]:
+                raise ReportValidationError("terminal_report_reused")
+            if self._reservation_held(task_id):
+                await self._release_certified(task)
+                phase = self._certified_phase(task)
+                if phase and task["phase"] == "blocked":
+                    # A post-memory gate had blocked the release; now proven.
+                    self.store.update(
+                        task_id,
+                        phase,
+                        {
+                            "memory_cycle_id": task["memory"]["id"],
+                            "write_state": task["memory"]["write_state"],
+                            "work_status": task["work_status"],
+                        },
+                    )
+            if task["work_status"] != "succeeded":
+                raise StateError("work_not_successful")
+            return
         kind, failed = await self._prevalidate_report(task, report)
         for field in ("report", "submitted_report"):
             if task.get(field) is not None and task[field] != report:
@@ -1327,10 +1607,14 @@ class ManagedTasks:
         if succeeded:
             # Failed/stopped original runs still save their legitimate result.
             # Only successful certification requires the complete execution gate.
+            observations = {}
             _, _, snapshot = await self._execution_gate(
-                self.store.get(task_id), report, actor
+                self.store.get(task_id), report, actor, observations
             )
             evidence = report_link(task, snapshot, report, actor=actor)
+            if observations.get("continuation"):
+                # Receipt of the stopped-original rule; childRunId is untouched.
+                evidence = dict(evidence, continuation=observations["continuation"])
             ws = self._report_workspace(task, snapshot["thread"])
             if ws["dirty"] or report.get("commit") != ws["head"]:
                 raise StateError("validated_commit_or_clean_workspace_required")
@@ -1391,6 +1675,90 @@ class ManagedTasks:
             self.admission.release_managed(task_id, observed)
         if not succeeded:
             raise StateError("work_not_successful")
+
+    async def _release_certified(self, task: dict):
+        """Release a reservation left by an interrupted certification.
+
+        Fresh terminal/execution gates and the same workspace binding are
+        required, exactly as in the first pass, but nothing is re-certified.
+        """
+        report = task["report"]
+        observed = await self._observe(task)
+        if (
+            observed.get("workState") != "result_available"
+            or observed.get("hasPendingChildRuns") is not False
+        ):
+            raise StateError("children_still_running")
+        current = self.store.get(task["id"])
+        if task["work_status"] == "succeeded":
+            _, _, fresh = await self._execution_gate(current)
+            ws = self._report_workspace(current, fresh["thread"])
+            if ws["dirty"] or report.get("commit") != ws["head"]:
+                raise StateError("validated_commit_or_clean_workspace_required")
+        else:
+            fresh = await self._terminal_gate(current)
+        report_link(current, fresh, report)
+        self.admission.release_managed(task["id"], observed)
+
+    @staticmethod
+    def _certified_phase(task: dict) -> str | None:
+        if task.get("work_status") != "succeeded":
+            return None
+        if task.get("deliverable_kind") == "plan":
+            return (
+                "plan_approved"
+                if task.get("approval_state") == "approved"
+                else "awaiting_approval"
+            )
+        return "pr_pending"
+
+    def _certified(self, task: dict) -> bool:
+        """Report certified and its memory confirmed: an immutable result."""
+        return (
+            task.get("report") is not None
+            and task.get("work_status") in CERTIFIED_WORK_STATUSES
+            and self._saved(task.get("memory") or {})
+        )
+
+    def _phase(self, task_id: str, phase: str) -> str:
+        """Observations never move a certified task back to an earlier phase."""
+        task = self.store.get(task_id)
+        return task["phase"] if self._certified(task) else phase
+
+    def _reservation_held(self, task_id: str) -> bool:
+        if self.admission is None:
+            return False
+        row = self.admission._one(
+            "SELECT id FROM managed_reservations WHERE id=?", (task_id,)
+        )
+        return bool(row) or task_id in (
+            self.admission.get_meta("managed_legacy_untracked") or []
+        )
+
+    def background_work(self, task: dict) -> str | None:
+        """What daemon reconciliation may still do; None means nothing.
+
+        Native children are parent-driven; PR checks, watches and merge are
+        event-driven. Certified results only release a leftover reservation or
+        perform a requested publication still pending.
+        """
+        if task.get("work_status") == "cancelled":
+            return None
+        if task.get("transport_mode") != "managed_thread":
+            return None
+        if not task.get("child"):
+            return "launch" if task.get("launch_attempted") else None
+        if self._saved(task.get("publication_memory") or {}) or task.get("merged"):
+            return None
+        if self._certified(task):
+            if self._reservation_held(task["id"]):
+                return "release"
+            if task["phase"] == "pr_pending" and (
+                task.get("publication_request") or task.get("publication_spec")
+            ):
+                return "publish"
+            return None
+        return "observe"
 
     @staticmethod
     def _saved(cycle: dict) -> bool:
@@ -1610,16 +1978,11 @@ class ManagedTasks:
 
         No launch/delegate here. Native task_status is parent-scoped, so a daemon
         queues one idempotent resume notice to that parent instead of impersonating it.
+        Certified results are never re-observed or re-certified: an exact replay
+        writes no event and sends nothing.
         """
         task = self.store.get(task_id)
-        if task.get("work_status") == "cancelled":
-            await self.flush_returns(task_id)
-            return
-        if (
-            not task.get("child")
-            and task.get("launch_attempted")
-            and task.get("transport_mode") == "managed_thread"
-        ):
+        if self.background_work(task) == "launch":
             try:
                 await self._scope(task)
                 await self._reconcile_launch(task)
@@ -1629,23 +1992,22 @@ class ManagedTasks:
                 self.store.update(
                     task_id, "blocked", {"reason": code}, blocked_reason=code
                 )
-        if (
-            not task.get("child")
-            or self._saved(task.get("publication_memory") or {})
-            or task.get("merged")
-        ):
-            # PR checks/merge are event-driven through T3 watches, never daemon polling.
-            await self.flush_returns(task_id)
-            return
-        if task["transport_mode"] == "native_child":
-            # Native completion already notifies its parent. Persisted reports
-            # remain available to that parent's next adapter resume/finish call.
+        work = self.background_work(task)
+        if work in {None, "launch"}:
             await self.flush_returns(task_id)
             return
         try:
             await self._scope(task)
             report = task.get("submitted_report") or task.get("report")
-            if report:
+            if work == "release":
+                await self._finish(task_id, task["report"], task["origin"])
+            elif work == "publish":
+                await self._publish(
+                    task_id,
+                    task.get("publication_request") or task.get("publication_spec"),
+                    task["origin"],
+                )
+            elif report:
                 await self._prevalidate_report(task, report)
                 observed = await self._observe(task)
                 if (

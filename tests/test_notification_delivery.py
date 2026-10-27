@@ -222,7 +222,7 @@ async def test_tasks_and_origins_do_not_suppress_each_other(tmp_path):
     store.close()
 
 
-async def test_json_preserves_every_envelope_and_frozen_readable_is_never_rewritten(
+async def test_json_coalesces_semantically_and_frozen_readable_is_never_rewritten(
     tmp_path,
 ):
     import json
@@ -233,8 +233,18 @@ async def test_json_preserves_every_envelope_and_frozen_readable_is_never_rewrit
         store.update(ident, phase, {"synthetic": i})
     host = Host()
     await engine(store, host).flush_returns(ident)
-    assert len(host.calls) == 11
-    assert all(json.loads(a["message"])["task_id"] == ident for a in host.calls)
+    # One pure JSON envelope (the newest), every event still in history.
+    assert len(host.calls) == 1
+    envelope = json.loads(host.calls[0]["message"])
+    assert envelope["task_id"] == ident and envelope["phase"] == "settled"
+    assert envelope["return_format"] == "json"
+    assert store.history(ident)["total"] == 11
+    assert store.describe(ident)["pending_returns"] == 0
+    # A repeated technical cycle ending in the same meaning wakes nobody.
+    store.update(ident, "workspace_ready", {"synthetic": "again"})
+    store.update(ident, "settled", {"synthetic": "again"})
+    await engine(store, host).flush_returns(ident)
+    assert len(host.calls) == 1
     readable = create(store, key="readable")
     for i in range(3):
         store.update(readable, "received", {"synthetic": i})
@@ -245,15 +255,17 @@ async def test_json_preserves_every_envelope_and_frozen_readable_is_never_rewrit
         for event in store.pending_returns(readable)
     }
     await engine(store, host).flush_returns(readable)
-    assert len(host.calls) == 15  # all four pre-existing immutable deliveries
+    assert len(host.calls) == 5  # all four pre-existing immutable deliveries
     assert all(a["message"] == expected[a["clientRequestId"]] for a in host.calls[-4:])
     store.update(readable, "received", {"fresh": True})
     await engine(store, host).flush_returns(readable)
-    assert len(host.calls) == 15  # last old frozen ACK seeds the semantic cursor
+    assert len(host.calls) == 5  # last old frozen ACK seeds the semantic cursor
     store.close()
 
 
-async def test_formatless_legacy_and_cached_json_are_not_coalesced(tmp_path):
+async def test_formatless_legacy_coalesces_and_cached_json_replays_unchanged(
+    tmp_path,
+):
     import json
 
     store = TaskStore(tmp_path / "ledger.db")
@@ -265,10 +277,19 @@ async def test_formatless_legacy_and_cached_json_are_not_coalesced(tmp_path):
     )
     for i in range(3):
         store.update(ident, "executing", {"step": i})
+    # A delivery frozen before this release (or before a lost ACK) is a barrier
+    # and replays byte for byte; the later fresh events share one envelope.
+    frozen = store.pending_returns(ident)[1]
+    cached = store.delivery(frozen)
     host = Host()
     await engine(store, host).flush_returns(ident)
-    assert len(host.calls) == 4
+    sent = {a["clientRequestId"]: a["message"] for a in host.calls}
+    assert json.loads(sent[frozen["id"]]) == cached
+    assert len(host.calls) == 2  # earlier batch representative + frozen barrier
     assert all(json.loads(a["message"]) for a in host.calls)
+    assert store.describe(ident)["pending_returns"] == 0
+    await engine(store, host).flush_returns(ident)
+    assert len(host.calls) == 2
     store.close()
 
 

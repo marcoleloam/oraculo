@@ -23,7 +23,10 @@ nova tarefa para si nem finalizar a tarefa do pai.
    Novas tarefas usam resumo + detalhes técnicos expansíveis; integrações que
    exigem JSON puro devem informar `return_format: "json"` no pedido inicial.
 3. Use `task continue` para orientar execução ativa pertinente; `task list/status`
-   para consulta. A escolha entre filho nativo e top-level gerido é automática.
+   para consulta. O transporte é filho nativo da origem; top-level só existe com
+   `"independent": true` pedido explicitamente pelo usuário. Se `start` devolver
+   `launch_rejected` (por exemplo `native_child_base_not_head`), nada foi criado:
+   alinhe o checkout/worktree da origem à base pedida e repita a mesma chave.
 4. Quando T3 entregar resultado do filho nativo, chame `task resume` para processar
    relatório, memória e publicação pendentes. Não encerre responsabilidade porque
    um filho terminou um turno. Em top-level, o daemon reconcilia o callback
