@@ -91,6 +91,53 @@ def _pat(value):
     return value
 
 
+def _envelope_pat(raw, reference):
+    """Explicit metadata envelope; no inference from an arbitrary Keychain item."""
+    try:
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError()
+                result[key] = value
+            return result
+
+        if not isinstance(raw, str) or len(raw) > 8192:
+            raise ValueError()
+        value = json.loads(raw, object_pairs_hook=unique)
+        if not isinstance(value, dict) or set(value) != {
+            "token",
+            "authorization_id",
+            "owner",
+            "organization",
+            "scope",
+            "valid_to",
+        }:
+            raise ValueError()
+        if (
+            value["owner"] != reference["keychain_account"]
+            or value["organization"] != reference["organization"]
+            or not isinstance(value["authorization_id"], str)
+            or not _UUID.fullmatch(value["authorization_id"])
+            or not isinstance(value["scope"], str)
+        ):
+            raise ValueError()
+        scopes = value["scope"].split()
+        if len(scopes) != len(set(scopes)) or set(scopes) != set(reference["scopes"]):
+            raise ValueError()
+        expiry = datetime.fromisoformat(value["valid_to"])
+        if expiry.tzinfo is None or expiry <= datetime.now(UTC):
+            raise ValueError()
+        token = _pat(value["token"])
+        if len(token) < 20:
+            raise ValueError()
+        return token
+    except Exception:
+        # JSON/metadata errors must not disclose the envelope or exception body.
+        raise PublicationError("azure_credential_invalid") from None
+
+
 def load_pat(cwd: Path, credential=None, *, backend=None):
     """Only the selected checkout's literal assignment or an explicit Keychain ref.
 
@@ -98,12 +145,7 @@ def load_pat(cwd: Path, credential=None, *, backend=None):
     guessed service/account name, parent .env, environment scan or host secret API.
     """
     if credential is not None:
-        if (
-            not isinstance(credential, dict)
-            or set(credential) != {"keychain_service", "keychain_account"}
-            or any(not isinstance(v, str) or not v.strip() for v in credential.values())
-        ):
-            raise PublicationError("azure_credential_reference_invalid")
+        credential_reference(credential)
         try:
             if backend is None:
                 from keyring.backends.macOS import Keyring
@@ -116,6 +158,8 @@ def load_pat(cwd: Path, credential=None, *, backend=None):
             raise PublicationError("azure_credential_unavailable") from None
         if value is None:
             raise PublicationError("azure_credential_unavailable")
+        if credential.get("format") == "pat-envelope-v1":
+            return _envelope_pat(value, credential)
         return _pat(value)
     try:
         fd = os.open(Path(cwd) / ".env", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -146,13 +190,32 @@ def load_pat(cwd: Path, credential=None, *, backend=None):
 
 def credential_reference(credential):
     """Validate references before the managed owner persists any intent."""
-    if credential is not None and (
-        not isinstance(credential, dict)
-        or set(credential) != {"keychain_service", "keychain_account"}
+    if credential is None:
+        return None
+    basic = {"keychain_service", "keychain_account"}
+    if not isinstance(credential, dict) or set(credential) not in (
+        basic,
+        basic | {"format", "organization", "scopes"},
+    ):
+        raise PublicationError("azure_credential_reference_invalid")
+    if any(
+        not isinstance(credential[k], str)
+        or not credential[k].strip()
+        or len(credential[k]) > 200
+        for k in basic
+    ):
+        raise PublicationError("azure_credential_reference_invalid")
+    if "format" in credential and (
+        credential["format"] != "pat-envelope-v1"
+        or not isinstance(credential["organization"], str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", credential["organization"])
+        or not isinstance(credential["scopes"], list)
+        or not credential["scopes"]
         or any(
-            not isinstance(v, str) or not v.strip() or len(v) > 200
-            for v in credential.values()
+            not isinstance(s, str) or not re.fullmatch(r"vso\.[a-z_]+", s)
+            for s in credential["scopes"]
         )
+        or len(credential["scopes"]) != len(set(credential["scopes"]))
     ):
         raise PublicationError("azure_credential_reference_invalid")
     return credential
@@ -229,6 +292,19 @@ class AzureRepos:
 
     @classmethod
     def from_spec(cls, spec, runner=command_runner):
+        reference = credential_reference(spec.get("credential"))
+        if reference and reference.get("format") == "pat-envelope-v1":
+            metadata = inspect_repository(
+                spec["cwd"],
+                remote=spec.get("remote", "origin"),
+                base=spec.get("base", "main"),
+                runner=runner,
+            )
+            if (
+                metadata["host"] != "azure"
+                or metadata["organization"] != reference["organization"]
+            ):
+                raise PublicationError("azure_credential_organization_mismatch")
         return cls(
             AzureHTTP(load_pat(Path(spec["cwd"]).resolve(), spec.get("credential"))),
             runner,
@@ -435,7 +511,11 @@ class AzureRepos:
         number = rows[0].get("pullRequestId")
         if type(number) is not int or number < 1:
             raise PublicationError("azure_response_invalid")
-        # List responses truncate description; retrieve the full record.
+        # Identity is the selected repository GUIDs + source/target refs + exact
+        # source SHA, with a unique candidate across every PR state. The owner
+        # persists its task correlation privately before POST. Descriptions are
+        # product content, not a mandatory correlation channel. Preserve the
+        # legacy-marker conflict check when observing older marked PRs.
         row, receipt = self._get(m, number)
         marker = (
             "<!-- oraculo-task:"
@@ -515,11 +595,6 @@ class AzureRepos:
         if self._ref(m, m["branch"]) != m["head_sha"]:
             raise PublicationError("publication_remote_head_mismatch")
         self._ref(m, m["base"])
-        marker = (
-            "<!-- oraculo-task:"
-            + hashlib.sha256(spec["task_id"].encode()).hexdigest()
-            + " -->"
-        )
         if before_create:
             try:
                 before_create()
@@ -534,7 +609,7 @@ class AzureRepos:
                     "sourceRefName": "refs/heads/" + m["branch"],
                     "targetRefName": "refs/heads/" + m["base"],
                     "title": spec["title"],
-                    "description": spec["body"] + "\n\n" + marker,
+                    "description": spec["body"],
                     "isDraft": False,
                 },
             )

@@ -107,6 +107,49 @@ async def publish(system, task, spec):
     )
 
 
+async def test_private_intent_survives_unmarked_creation_timeout(system):
+    tasks, spec, host, _ = await integrated_setup(system, status="active")
+    task = tasks[0]
+    spec = {
+        k: v
+        for k, v in spec.items()
+        if k not in {"pr_id", "reconcile_only", "integration"}
+    }
+    host.rows = []
+    host.lose_create = host.invisible = True
+    original = host.__call__
+
+    def transport(method, url, body=None):
+        if method == "POST":
+            saved = system.store.get(task["id"])
+            assert saved["publication_attempted"] is True
+            assert saved["publication_spec"]["head_sha"] == spec["head_sha"]
+            assert body["description"] == spec["body"]
+            assert "oraculo-task:" not in body["description"]
+        return original(method, url, body)
+
+    system.engine.publisher = RepositoryPublisher(
+        azure_factory=lambda _: AzureRepos(transport)
+    )
+    first = await publish(system, task, spec)
+    assert first["blocked_reason"] == "publication_uncertain", first
+    assert first["publication_attempted"] and host.created == 1
+    saved_report = copy.deepcopy(system.store.get(task["id"])["report"])
+    # A fresh adapter uses the persisted managed intent, not process-local state
+    # or an external description marker. Invisible replay remains read-only.
+    again = await publish(system, task, spec)
+    assert again["blocked_reason"] == "publication_uncertain" and host.created == 1
+    host.invisible = False
+    observed = await publish(system, task, spec)
+    assert observed["phase"] == "pr_open", observed
+    assert observed["publication"]["head_sha"] == spec["head_sha"]
+    assert host.created == 1 and host.merges == 0
+    assert system.store.get(task["id"])["report"] == saved_report
+    changed = await publish(system, task, {**spec, "body": "Changed intent"})
+    assert changed["blocked_reason"] == "publication_intent_reused"
+    assert host.created == 1
+
+
 async def test_five_tasks_share_completed_pr_preserve_reports_and_memories(system):
     tasks, spec, host, counts = await integrated_setup(system, count=5)
     reports = [copy.deepcopy(t["report"]) for t in tasks]
