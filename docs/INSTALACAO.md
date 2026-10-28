@@ -190,6 +190,85 @@ o journal sozinho não prova que a admissão continua fechada. A parada de
 recuperação exige prova atual de manutenção via socket antes de bootout; socket
 indisponível, admissão reaberta ou token divergente bloqueiam essa parada.
 
+### Operação pendente que nunca adquiriu manutenção
+
+Uma ativação recusada por quiescência deixa `operation.json` em
+`acquiring_maintenance` sem token. Repetir o alvo ou fazer rollback exige
+quiescência de novo. Quando nenhum efeito ocorreu, a operação pode ser retirada
+de forma explícita e auditada:
+
+```sh
+oraculo runtime abandon-operation --operation-id ID --authorization "quem e por quê" --dry-run
+oraculo runtime abandon-operation --operation-id ID --authorization "quem e por quê"
+```
+
+O comando exige o `operation_id` exato, journal sem token, sem identidade de
+substituição, sem PIDs de recuperação e sem tentativa de encerramento; `current`
+igual a `previous`, plist igual ao registrado e configuração com o hash
+registrado. Com o serviço online consulta `maintenance.status`; parado, lê o
+estado sob o lock do daemon. Se a manutenção estiver presa a essa operação,
+recusa. Os bytes originais vão para `operations-archive/ID.json` e o journal
+passa a `abandoned`, com autor, horário, autorização, hash do arquivo e prova.
+A próxima ativação registra essa operação em `supersedes`.
+
+### Reservas de executores terminados (exceção auditada)
+
+A quiescência continua sendo a regra para manutenção, `service start/stop` e
+ativação. Quando a única ocupação são reservas de tarefas gerenciadas cujo
+executor já submeteu o próprio relatório e o ledger não registra execução viva,
+`--carry-reservation TASK_ID` (repetido por tarefa) e `--carry-authorization`
+permitem atravessar a manutenção mantendo essas reservas. Existe somente em
+`service stop`, `runtime activate`, `runtime rollback` e `service start`.
+
+Para cada tarefa listada exige reserva vinculada a filho (`executing`) com recibo
+igual a `child`, `work_status` pendente, fase `validation_submitted`,
+`validating` ou `blocked` sem motivo de efeito incerto, submissão do próprio
+filho com hash igual ao relatório, nenhuma observação `executing`/lançamento
+posterior a ela, nenhuma continuação sem recibo e nenhum descendente pendente.
+Recusa qualquer outra reserva ou lease, tarefa lançada não terminal fora da
+lista, operação `dispatched/uncertain`, ciclo de memória `pending/failed` e
+listas vazias, duplicadas ou com IDs incompletos. Nada é liberado nem alterado: o daemon ativado aplica seus
+gates com o host antes de liberar. Cada aquisição/encerramento grava
+`maintenance.carry` em `audit_events` e no journal (`carry.audit`) com autor,
+horário, autorização e prova.
+
+`service stop --carry-reservation` funciona com daemons antigos: exige ocupação
+igual às reservas listadas e admissão esgotada (`capacity --set N`), faz bootout
+do job exato, prova offline sob os locks e mantém a manutenção. A ativação com
+carry é sempre offline e não inicia o serviço. `service start
+--carry-reservation` prova e encerra a manutenção offline antes do bootstrap, de
+modo que a release iniciada não precisa conhecer o carry. Sem a lista, uma
+operação aberta com carry recusa (`maintenance_carry_required`). Preserve os
+recibos e use a mesma lista explícita e autorização em todas essas etapas.
+
+### Saúde degradada só pelo despachante legado
+
+`service status` continua mapeando qualquer `health` diferente de `online` para
+`failed` (`service_unhealthy`). Três caminhos de manutenção aceitam, além de
+`online`, um daemon cujo único sinal é `dispatch_attempts_exhausted`: um objetivo
+legado esgotou as tentativas de despacho e o despachante não reenvia mais. Esses
+caminhos são `runtime abandon-operation` (leitura de `maintenance.status`),
+`service stop --carry-reservation` e a espera pós-bootstrap de `service start
+--carry-reservation`. Os gates de manutenção (`quiescent()` e a prova do carry)
+nunca leem jobs de objetivo enfileirados nem o outbox deles; ocupação, leases e
+operações continuam exigidos como antes.
+
+O aceite exige um segundo `status.get` com o mesmo `health` e a mesma identidade
+(PID do launchd, release `current`, caminho e hash da configuração, protocolo 1),
+plist gerenciado igual ao da release e job carregado igual a ele
+(`degraded_service_identity_unproven`, `plist_runtime_mismatch`). Como `health`
+guarda só o último sinal de cada passagem do despachante, todo job enfileirado
+com despacho precisa estar enviado, com `run_id` e na última tentativa
+(`legacy_dispatch_unproven`); assim um job esgotado não mascara outro. Ficam
+fora da lista `awaiting_coordinator` (coordenador vivo pode reivindicar uma
+vaga) e `dispatch_identity_unknown` (efeito no host incerto); qualquer outro
+`health` continua recusado com `service_state_unproven`. O `health` observado e
+a razão do aceite ficam na prova do abandon (`service_health`,
+`service_acceptance`), na entrada `pre_stop` do carry e em
+`service-operation.json` (`service_acceptance`) após a partida. `runtime
+activate/rollback`, `service start/stop/restart` sem carry e `quiescent()` não
+mudaram.
+
 ## Migrar o layout legado, explicitamente e offline
 
 Um layout com `current -> releases/ANTIGA`, `.venv` e plist sem marcador de ownership
@@ -312,3 +391,39 @@ e 2 para entrada inválida. Recibos JSON incluem versão, estado, error_code,
 retryability, recovery_action, operation_id, fonte e instante. Não confunda
 instalação com ativação, saúde do daemon com sucesso do trabalho, ou testes de
 launchd com validação de integração dos provedores.
+
+## Carry terminal sem relatório do executor
+
+Quando a versão antiga não consegue encerrar uma execução já terminal e não há
+relatório do executor, uma manutenção explicitamente autorizada pode usar
+`runtime prove-terminal-carry`. O comando coleta leituras novas pelo transporte
+caller-bound, verifica a cadeia completa de runs e descendentes visíveis do
+projeto e vincula os snapshots ao hash integral da tarefa, da reserva e à
+identidade PID/release/configuração do daemon. Não certifica entrega nem sucesso.
+
+Use a mesma lista explícita de `--carry-reservation TASK_ID` e a mesma autorização
+em todas as etapas. Primeiro gere a prova em arquivo privado com
+`runtime prove-terminal-carry --stdio-host --output PROVA.json`. Depois forneça
+`--carry-terminal-proof PROVA.json` a `service stop`, `runtime activate RELEASE`
+e `service start`. A CLI que executa a manutenção precisa suportar essa opção;
+a release alvo não precisa dela, pois a manutenção termina antes do bootstrap.
+
+A primeira prova expira em 300 segundos. Antes de parar, o operador comprova a
+identidade atual do serviço, ausência de operação gerida ativa e todos os gates
+restantes de leases, operações e memória. Grava backups SQLite consistentes do
+estado e ledger, configuração e plist, com hashes, na pasta privada indicada no
+recibo. Após a parada confirmada, a guarda oficial repete a verificação sob os
+locks de daemon/ledger. Reservas, resultados e capacidade ficam preservados.
+
+Esse caminho admite vagas disponíveis: não reduz a capacidade para fechar a
+admissão. Uma reserva nova ou alteração da tarefa invalida a prova; a guarda
+offline recusa estado desconhecido em vez de liberar vagas. A operação fixa o
+hash da prova no token de manutenção. Replays exigem exatamente a mesma prova e
+estado; apenas a mesma operação já auditada pode ultrapassar a janela temporal.
+Provas novas não autorizam modificar uma operação existente.
+
+Os snapshots não são uma transação distribuída com o T3. Use uma janela
+cooperativa sem iniciar novos runs durante a parada. O transporte e o operador
+local são a fronteira de confiança, sem atestação criptográfica. Preserve prova,
+backup e journal para reconciliar qualquer recusa ou resposta perdida. Os
+encerramentos continuam com seus próprios gates no daemon ativado.

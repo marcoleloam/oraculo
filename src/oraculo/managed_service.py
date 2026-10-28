@@ -25,6 +25,8 @@ HOST_FRAME_TIMEOUT = 1200
 # Background calls have no manual bridge to wait for. A failed call ends this
 # batch's host traffic; pending durable returns retain their original keys.
 BACKGROUND_HOST_TIMEOUT = 60
+CALLER_QUEUE_TIMEOUT = 60
+MAX_QUEUED_CALLERS = 32
 
 
 async def close_writer(writer):
@@ -70,9 +72,40 @@ class ManagedService:
         self.owner = None
         self.reader = None
         self.background_worker = None
+        self.waiters = []
+
+    def _wake_caller(self):
+        if not self.busy and self.waiters:
+            waiter = self.waiters[0]
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def acquire_caller(self):
+        """Serialize writes fairly without rejecting concurrent task controls.
+
+        No host effect or task mutation happens until the caller owns the writer.
+        Timeout/cancellation removes only the waiting intent, never its owner.
+        """
+        if len(self.waiters) >= MAX_QUEUED_CALLERS:
+            raise StateError("managed_adapter_busy_retry_same_key")
+        waiter = asyncio.get_running_loop().create_future()
+        self.waiters.append(waiter)
+        self._wake_caller()
+        acquired = False
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), CALLER_QUEUE_TIMEOUT)
+            acquired = True
+        except TimeoutError:
+            raise StateError("managed_adapter_busy_retry_same_key") from None
+        finally:
+            self.waiters.remove(waiter)
+            # The successful caller invokes begin synchronously before yielding;
+            # only cancellation/timeout should hand the slot to another waiter.
+            if not acquired:
+                self._wake_caller()
 
     def begin(self, mode, operation_id, *, action=None, task_id=None, reader=None):
-        if self.busy:
+        if self.busy or (mode == "background" and self.waiters):
             raise StateError("managed_adapter_busy_retry_same_key")
         self.busy = True
         self.owner = asyncio.current_task()
@@ -99,10 +132,11 @@ class ManagedService:
     def end(self):
         self.busy = False
         self.activity = self.owner = self.reader = None
+        self._wake_caller()
 
     def diagnostic(self):
         if not self.busy:
-            return dict(state="idle", busy=False)
+            return dict(state="idle", busy=False, queued_callers=len(self.waiters))
         if self.activity is None or self.owner is None:
             return dict(
                 state="owner_unknown", busy=True, recovery="inspect_do_not_clear"
@@ -120,6 +154,7 @@ class ManagedService:
             state="owner_finished" if self.owner.done() else "active",
             client_eof=self.reader.at_eof() if self.reader else None,
             recovery="wait_then_retry_same_intent",
+            queued_callers=len(self.waiters),
         )
 
     def memory(self):
@@ -190,10 +225,12 @@ class ManagedService:
         from oraculo.pr_lifecycle import RepositoryPRLifecycle
         from oraculo.publication import RepositoryPublisher
 
-        if self.busy:
-            raise StateError("managed_adapter_busy_retry_same_key")
         if envelope.payload.get("protocol_version") != PROTOCOL_VERSION:
             raise StateError("managed_protocol_incompatible")
+        await self.acquire_caller()
+        if reader.at_eof():
+            self._wake_caller()
+            raise StateError("managed_host_ack_eof")
         operation = envelope.request_id
         self.begin(
             "caller",

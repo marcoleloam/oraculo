@@ -14,6 +14,21 @@ import time
 from oraculo.state import StateError
 
 MAX_STDIO_BYTES = 16 * 1024 * 1024
+# Darwin named pipes (mkfifo) can lose kqueue/poll wakeups: a blocking writer
+# whose single write() exceeds the 8 KiB FIFO buffer fills it and sleeps, and a
+# read knote registered before those bytes arrived is never activated. select()
+# still reports them, so readiness is also rechecked by level on this interval.
+READY_RECHECK_SECONDS = 0.1
+
+
+def readable_now(fd: int) -> bool:
+    """Level-triggered, non-blocking readability check that never sets flags."""
+    try:
+        return bool(select.select([fd], [], [], 0)[0])
+    except ValueError:  # Descriptor above FD_SETSIZE.
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(0))
 
 
 def write_text(text: str, stream=None, *, timeout: float = 60, cancelled=None) -> None:
@@ -95,23 +110,31 @@ async def read_line(
             raise StateError("native_bridge_ack_limit")
         return raw
     # Readiness registration does not mutate O_NONBLOCK, unlike connect_read_pipe.
+    # A wakeup is only a hint: bytes are read after a level check confirms them,
+    # so a blocking descriptor is never read while empty.
     loop = asyncio.get_running_loop()
     result = bytearray()
     async with asyncio.timeout(timeout):
         while True:
-            ready = loop.create_future()
+            if not readable_now(fd):
+                ready = loop.create_future()
 
-            def wake():
-                if not ready.done():
-                    ready.set_result(None)
+                def wake():
+                    if not ready.done():
+                        ready.set_result(None)
 
-            try:
-                loop.add_reader(fd, wake)
-                await ready
-            except PermissionError:
-                pass  # Regular files are already readable.
-            finally:
-                loop.remove_reader(fd)
+                try:
+                    loop.add_reader(fd, wake)
+                except PermissionError:
+                    # Regular files (epoll) cannot be registered.
+                    await asyncio.sleep(READY_RECHECK_SECONDS)
+                else:
+                    try:
+                        await asyncio.wait([ready], timeout=READY_RECHECK_SECONDS)
+                    finally:
+                        loop.remove_reader(fd)
+                if not readable_now(fd):
+                    continue
             try:
                 byte = os.read(fd, min(65536, limit + 1 - len(result)))
             except BlockingIOError:

@@ -39,7 +39,7 @@ async def test_publication_must_recheck_execution(
         return result
 
     monkeypatch.setattr(system.host, "call", mode)
-    task, spec, github = await publication_setup(system)
+    task, spec, github = await publication_setup(system, independent=independent)
     child = task["child"]["childThreadId"]
     if case == "pending_descendant":
         system.host.complete(child, pending=True)

@@ -17,6 +17,7 @@ import pytest
 from test_runtime_install import config, release
 
 from oraculo import runtime as rt
+from oraculo import service_control as sc
 from oraculo.protocol import MAX_ENVELOPE_BYTES, MAX_RESPONSE_BYTES
 from oraculo.service_control import ServiceController
 
@@ -666,3 +667,171 @@ def test_lost_end_ack_requires_current_maintenance_proof_before_bootout(
     ):
         controller.recovery_stop(journal)
     assert not calls
+
+
+def exhausted_job(job="job-example", *, attempts=3, state="sent", run_id="run:c:9"):
+    intent = f"dispatch:{job}:0" + (f":retry:{attempts}" if attempts > 1 else "")
+    return dict(
+        id=job,
+        objective_id="objective-example",
+        kind="implementation",
+        state="queued",
+        admission=dict(
+            eligible=True,
+            blockers=[],
+            dispatch=dict(
+                id=intent, state=state, receipt={"run_id": run_id} if run_id else {}
+            ),
+        ),
+    )
+
+
+def degraded_daemon(controller, monkeypatch, *, health="dispatch_attempts_exhausted"):
+    """Real controller; launchd shows the managed job, the socket answers."""
+    daemon = dict(
+        loaded=dict(loaded_identity(controller), pid=41),
+        identity=dict(
+            pid=41,
+            release_id="one",
+            config_path=str(controller.config),
+            config_sha256=rt.config_hash(controller.config),
+            protocol_version=1,
+        ),
+        health=health,
+        jobs=[exhausted_job(), exhausted_job("job-idle", attempts=1)],
+        samples=[],
+    )
+    daemon["jobs"][1]["admission"]["dispatch"] = None
+
+    def request(kind, payload):
+        assert kind == "status.get"
+        sample = dict(
+            health=daemon["health"],
+            runtime=dict(daemon["identity"]),
+            jobs=daemon["jobs"],
+        )
+        daemon["samples"].append(sample)
+        if len(daemon["samples"]) > 1 and daemon.get("second"):
+            sample.update(daemon["second"])
+        return sample
+
+    monkeypatch.setattr(controller, "inspect_launchd", lambda: dict(daemon["loaded"]))
+    monkeypatch.setattr(controller, "request", request)
+    return daemon
+
+
+def test_status_semantics_unchanged_but_maintenance_accepts_legacy_dispatch(
+    controller, monkeypatch
+):
+    degraded_daemon(controller, monkeypatch)
+    observed = controller.status()
+    assert observed["state"] == "failed"
+    assert observed["error_code"] == "service_unhealthy"
+    acceptance = sc.maintenance_acceptance(controller, observed)
+    assert acceptance["accepted_as"] == "legacy_dispatch_degraded"
+    assert acceptance["health"] == "dispatch_attempts_exhausted"
+    assert acceptance["pid"] == 41 and acceptance["release_id"] == "one"
+    assert acceptance["plist_sha256"] == rt.digest(controller.plist)
+    assert acceptance["dispatch"] == [
+        dict(
+            job_id="job-example",
+            objective_id="objective-example",
+            dispatch_id="dispatch:job-example:0:retry:3",
+            run_id="run:c:9",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "health",
+    [
+        "awaiting_coordinator",
+        "dispatch_identity_unknown",
+        "task_dispatch_too_large",
+        "disconnected",
+        "never-seen-health",
+    ],
+)
+def test_maintenance_refuses_any_other_health(controller, monkeypatch, health):
+    daemon = degraded_daemon(controller, monkeypatch, health=health)
+    observed = controller.status()
+    assert observed["state"] == "failed"
+    assert sc.maintenance_acceptance(controller, observed) is None
+    assert len(daemon["samples"]) == 1
+
+
+@pytest.mark.parametrize(
+    "fault,code",
+    [
+        ("plist", "plist_runtime_mismatch"),
+        ("program", "degraded_service_identity_unproven"),
+        ("path", "degraded_service_identity_unproven"),
+        ("second_pid", "degraded_service_identity_unproven"),
+        ("second_release", "degraded_service_identity_unproven"),
+        ("second_health", "service_state_unproven"),
+        ("pending_intent", "legacy_dispatch_unproven"),
+        ("missing_run", "legacy_dispatch_unproven"),
+        ("not_final_retry", "legacy_dispatch_unproven"),
+        ("no_exhausted_job", "legacy_dispatch_unproven"),
+    ],
+)
+def test_maintenance_refuses_degraded_daemon_without_coherent_proof(
+    controller, monkeypatch, fault, code
+):
+    daemon = degraded_daemon(controller, monkeypatch)
+    if fault == "plist":
+        value = controller.owned_plist()
+        value["KeepAlive"] = False
+        controller.plist.write_bytes(plistlib.dumps(value))
+    elif fault in {"program", "path"}:
+        daemon["loaded"][fault] = "/foreign"
+    elif fault == "second_pid":
+        daemon["second"] = dict(runtime=dict(daemon["identity"], pid=42))
+    elif fault == "second_release":
+        daemon["second"] = dict(runtime=dict(daemon["identity"], release_id="old"))
+    elif fault == "second_health":
+        daemon["second"] = dict(health="awaiting_coordinator")
+    elif fault == "pending_intent":
+        daemon["jobs"].append(exhausted_job("job-b", state="pending"))
+    elif fault == "missing_run":
+        # An exhausted job written last can mask dispatch_identity_unknown.
+        daemon["jobs"].append(exhausted_job("job-b", run_id=None))
+    elif fault == "not_final_retry":
+        # ...or a live coordinator (awaiting_coordinator) on an earlier retry.
+        daemon["jobs"].append(exhausted_job("job-b", attempts=2))
+    else:
+        daemon["jobs"] = []
+    observed = controller.status()
+    assert observed["state"] == "failed"
+    with pytest.raises(rt.RuntimeError, match=code):
+        sc.maintenance_acceptance(controller, observed)
+
+
+def test_carried_start_waits_for_online_or_legacy_dispatch_only(
+    controller, monkeypatch
+):
+    daemon = degraded_daemon(controller, monkeypatch)
+    booted = []
+    loaded = daemon["loaded"]
+    monkeypatch.setattr(
+        controller,
+        "inspect_launchd",
+        lambda: dict(loaded) if booted else dict(loaded=False, pid=None),
+    )
+    monkeypatch.setattr(controller, "socket_present", lambda: False)
+    monkeypatch.setattr(controller, "alive", lambda pid: False)
+
+    def command(*args):
+        if args[0] == "bootstrap":
+            booted.append(args)
+        return result()
+
+    monkeypatch.setattr(controller, "command", command)
+    with pytest.raises(rt.RuntimeError, match="start_timeout"):
+        controller.start(previous_pid=7)
+    started = controller.start(previous_pid=7, accept_legacy=True)
+    assert started["state"] == "failed" and started["pid"] == 41
+    assert started["service_acceptance"]["accepted_as"] == "legacy_dispatch_degraded"
+    daemon["health"] = "awaiting_coordinator"
+    with pytest.raises(rt.RuntimeError, match="stop_unconfirmed"):
+        controller.start(previous_pid=7, accept_legacy=True)

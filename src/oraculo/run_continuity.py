@@ -50,6 +50,14 @@ def terminal_chain(snapshot):
     if count > 1:
         prior_end = None
         for run in chain:
+            if cancelled_before_start(run):
+                # A queued request may be cancelled while an earlier run is
+                # still executing. It consumed no execution interval.
+                requested = timestamp(run.get("requestedAt"))
+                end = timestamp(run.get("completedAt"))
+                if end < requested or end > time.time():
+                    raise StateError("terminal_run_chain_incoherent")
+                continue
             start, end = (
                 timestamp(run.get("startedAt")),
                 timestamp(run.get("completedAt")),
@@ -64,6 +72,33 @@ def terminal_chain(snapshot):
     return chain
 
 
+def cancelled_before_start(run):
+    # Missing startedAt is unknown, not proof that the request never ran.
+    return (
+        run.get("status") == "cancelled"
+        and "startedAt" in run
+        and run["startedAt"] is None
+    )
+
+
+def execution_run(chain):
+    executed = [r for r in chain if not cancelled_before_start(r)]
+    if not executed:
+        raise StateError("executed_run_unproven")
+    return executed[-1]
+
+
+def native_terminal_run(chain):
+    """Native result recency follows completion time, including queued cancels.
+
+    A queued request can finish before the older active run. Its higher ordinal
+    therefore does not imply it owns the native latestTerminal* receipt.
+    """
+    if len(chain) == 1:
+        return chain[0]
+    return max(chain, key=lambda run: (timestamp(run["completedAt"]), run["ordinal"]))
+
+
 def report_link(task, snapshot, report, *, actor=None):
     """Use immutable submission evidence, never refresh an old report's date."""
     chain = terminal_chain(snapshot)
@@ -71,6 +106,7 @@ def report_link(task, snapshot, report, *, actor=None):
     if chain[0]["runId"] != original:
         raise StateError("original_task_run_not_observed")
     latest = chain[-1]
+    executed = next((r for r in reversed(chain) if not cancelled_before_start(r)), None)
     digest = content_hash(report)
     existing = task.get("completion_evidence")
     if existing:
@@ -90,7 +126,7 @@ def report_link(task, snapshot, report, *, actor=None):
         and e["proof"].get("report_sha256") == submitted_digest
     ]
     event = events[0] if events else None
-    if latest["runId"] != original:
+    if executed is not None and executed["runId"] != original:
         if task["transport_mode"] != "native_child":
             raise StateError("continuation_requires_native_child")
         if event is None:
@@ -102,16 +138,16 @@ def report_link(task, snapshot, report, *, actor=None):
                 type(at) not in (float, int)
                 or not math.isfinite(at)
                 or at > time.time()
-                or at < timestamp(latest.get("startedAt"))
+                or at < timestamp(executed.get("startedAt"))
             ):
                 raise StateError("latest_run_report_unproven")
             binding = event["proof"].get("submission")
             if binding and (
                 binding.get("thread_id") != task["child"]["childThreadId"]
-                or binding.get("run_id") != latest["runId"]
+                or binding.get("run_id") != executed["runId"]
             ):
                 raise StateError("latest_run_report_unproven")
-    return dict(
+    evidence = dict(
         original_run_id=original,
         latest_run_id=latest["runId"],
         thread_id=task["child"]["childThreadId"],
@@ -121,3 +157,9 @@ def report_link(task, snapshot, report, *, actor=None):
         submission_actor=event["proof"].get("submission") if event else actor,
         legacy_submission=bool(event and not event["proof"].get("submission")),
     )
+    if executed != latest:
+        evidence["execution_run_id"] = executed["runId"] if executed else None
+        evidence["unstarted_cancelled_run_ids"] = [
+            r["runId"] for r in chain if cancelled_before_start(r)
+        ]
+    return evidence

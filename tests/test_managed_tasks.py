@@ -361,8 +361,17 @@ async def test_explicit_other_project_uses_destination_git_and_memory(system):
             "succeeded",
             {"summary": "bounded example " + secret},
         )
-    result = await start(
+    # Another project is never an implicit top-level conversation.
+    refused = await start(
         system, project="beta", text="Implement bounded example using project knowledge"
+    )
+    assert refused["created"] is False
+    assert refused["blocked_reason"] == "native_child_project_mismatch"
+    result = await start(
+        system,
+        project="beta",
+        text="Implement bounded example using project knowledge",
+        independent=True,
     )
     assert result["phase"] == "executing", result
     assert result["project"]["project_id"] == "beta"
@@ -558,8 +567,8 @@ async def test_successful_work_without_publication_adapter_stays_pr_pending(syst
     assert result["publication"] is None
 
 
-async def publication_setup(system):
-    task = await start(system)
+async def publication_setup(system, **overrides):
+    task = await start(system, **overrides)
     system.host.complete(task["child"]["childThreadId"])
     finished = await system.engine.command(
         "finish", {"task_id": task["id"], "report": report(task)}

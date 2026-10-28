@@ -13,12 +13,16 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from oraculo.protocol import MAX_RESPONSE_BYTES
 from oraculo.runtime import (
+    TERMINAL_OPERATION_STATES,
     RuntimeError,
     atomic_write,
+    carry_audit,
+    carry_options,
     common_options,
     compatible,
     config_hash,
@@ -26,12 +30,86 @@ from oraculo.runtime import (
     load_config_verified,
     match_guard,
     receipt,
+    recorded_carry,
     recovery_stop,
     require_migration_complete,
     runtime_lock,
     verify,
     write_json,
 )
+
+# Health values that only the legacy objective dispatcher writes and that a
+# maintenance path may tolerate. Maintenance gates (quiescent(), the carry
+# proof) never read queued objective jobs or their outbox, so a settled
+# dispatcher condition says nothing about maintenance. Deliberately excluded:
+# awaiting_coordinator (a coordinator run is live and may still claim a grant)
+# and dispatch_identity_unknown (a sent dispatch without a run identity, so its
+# host effect is uncertain). Every other health keeps refusing.
+LEGACY_DISPATCH_HEALTH = frozenset({"dispatch_attempts_exhausted"})
+
+
+def maintenance_acceptance(controller, observed):
+    """Whether a maintenance path may treat the observed daemon as reachable.
+
+    Returns the recorded reason, or None when the caller must keep refusing.
+    `service status` itself is unchanged: it still reports failed.
+    """
+    if observed["state"] == "online":
+        return dict(
+            accepted_as="online",
+            service_state="online",
+            health=observed.get("health", "online"),
+        )
+    if (
+        observed["state"] == "failed"
+        and observed.get("error_code") == "service_unhealthy"
+        and observed.get("health") in LEGACY_DISPATCH_HEALTH
+    ):
+        return controller.legacy_dispatch_acceptance(observed)
+    return None
+
+
+def legacy_dispatch_evidence(data, max_attempts):
+    """Corroborate the scalar health with every queued job's dispatch receipt.
+
+    One dispatcher pass keeps only the last health it wrote, so an exhausted
+    job could mask another job's live coordinator, pending intent or unknown
+    run. Every queued dispatch must therefore be sent, carry its run identity
+    and be the final retry.
+    """
+    exhausted = []
+    for job in data.get("jobs") or []:
+        dispatch = (job.get("admission") or {}).get("dispatch")
+        if not dispatch:
+            continue
+        intent = dispatch.get("id") or ""
+        run_id = (dispatch.get("receipt") or {}).get("run_id")
+        final = (
+            ":retry:" not in intent
+            if max_attempts == 1
+            else intent.endswith(f":retry:{max_attempts}")
+        )
+        if (
+            dispatch.get("state") != "sent"
+            or not isinstance(run_id, str)
+            or not run_id
+            or not final
+        ):
+            raise RuntimeError(
+                "legacy_dispatch_unproven",
+                "Another dispatcher condition may be masked; wait for health online or investigate the queued jobs.",
+            )
+        exhausted.append(
+            dict(
+                job_id=job.get("id"),
+                objective_id=job.get("objective_id"),
+                dispatch_id=intent,
+                run_id=run_id,
+            )
+        )
+    if not exhausted:
+        raise RuntimeError("legacy_dispatch_unproven")
+    return exhausted
 
 
 class ServiceController:
@@ -390,6 +468,47 @@ class ServiceController:
                 result["socket"] = "unavailable"
         return result
 
+    def legacy_dispatch_acceptance(self, observed):
+        """Re-prove a daemon degraded only by the legacy objective dispatcher.
+
+        A fresh status.get must repeat the observed runtime identity, which must
+        match launchd, the current release and the configuration; the loaded job
+        must be the managed plist of that release.
+        """
+        from oraculo.config import Config
+
+        release_id = current_release(self.root)
+        data = self.request("status.get", {})
+        identity = data.get("runtime") or {}
+        if data.get("health") != observed.get("health"):
+            raise RuntimeError("service_state_unproven")
+        if (
+            not observed.get("pid")
+            or identity != observed.get("runtime")
+            or identity.get("pid") != observed["pid"]
+            or identity.get("release_id") != release_id
+            or identity.get("config_path") != str(self.config)
+            or identity.get("config_sha256") != config_hash(self.config)
+            or identity.get("protocol_version") != 1
+        ):
+            raise RuntimeError("degraded_service_identity_unproven")
+        managed = self.recovery_identity(release_id)
+        if not self.loaded_matches(observed, release_id):
+            raise RuntimeError("degraded_service_identity_unproven")
+        return dict(
+            accepted_as="legacy_dispatch_degraded",
+            service_state=observed["state"],
+            health=data["health"],
+            reason="only non-online health is a settled legacy objective dispatcher condition; maintenance gates do not read it",
+            pid=observed["pid"],
+            release_id=release_id,
+            config_sha256=identity["config_sha256"],
+            plist_sha256=managed["plist_sha256"],
+            dispatch=legacy_dispatch_evidence(
+                data, Config.load(self.config).max_dispatch_attempts
+            ),
+        )
+
     def wait(self, predicate, error):
         deadline = time.monotonic() + self.timeout
         while True:
@@ -442,7 +561,13 @@ class ServiceController:
             "unloaded", previous_pid=old_pid, source_detail="launchd_pid_socket"
         )
 
-    def start(self, release_id=None, previous_pid=None):
+    def start(self, release_id=None, previous_pid=None, *, accept_legacy=False):
+        """Bootstrap and wait for the correlated daemon.
+
+        accept_legacy (carried start only) also accepts a daemon whose only
+        non-online health is a settled legacy dispatcher condition; the receipt
+        then carries service_acceptance.
+        """
         self.require_supported()
         release_id = release_id or current_release(self.root)
         if release_id is None:
@@ -470,8 +595,22 @@ class ServiceController:
             raise RuntimeError("plist_runtime_mismatch")
         if not expected_hash or config._loaded_sha256 != expected_hash:
             raise RuntimeError("config_changed")
+
+        def reachable(observed):
+            if observed["state"] == "online":
+                return True
+            if not accept_legacy:
+                return False
+            try:
+                acceptance = maintenance_acceptance(self, observed)
+            except RuntimeError:
+                return False
+            if acceptance:
+                observed["service_acceptance"] = acceptance
+            return acceptance is not None
+
         before = self.status()
-        if before["state"] == "online":
+        if reachable(before):
             return before
         if before["state"] != "unloaded" or self.alive(previous_pid):
             raise RuntimeError("stop_unconfirmed")
@@ -484,9 +623,10 @@ class ServiceController:
         last = {}
 
         def online():
+            last.clear()
             last.update(self.status())
             return (
-                last["state"] == "online"
+                reachable(last)
                 and last.get("pid") != previous_pid
                 and last.get("runtime", {}).get("release_id") == release_id
             )
@@ -510,27 +650,71 @@ def register_parsers(subparsers):
     parser = subparsers.add_parser("service")
     actions = parser.add_subparsers(dest="service_action", required=True)
     for action in ("start", "stop", "restart", "status", "uninstall"):
-        common_options(actions.add_parser(action))
+        child = actions.add_parser(action)
+        common_options(child)
+        if action in {"start", "stop"}:
+            carry_options(child)
 
 
-def start_operation(controller, operation, journal_path, *, previous_pid=None):
-    """One guarded bootstrap path for start and restart, including recovery."""
-    runtime_journal = controller.root / "operation.json"
-    if (
-        runtime_journal.exists()
-        and json.loads(runtime_journal.read_text()).get("state") != "complete"
-    ):
+def runtime_pending(root):
+    path = root / "operation.json"
+    return (
+        path.exists()
+        and json.loads(path.read_text()).get("state") not in TERMINAL_OPERATION_STATES
+    )
+
+
+CARRY_CAPACITY_KEYS = ("configured_ceiling", "requested", "effective")
+
+
+def unacquired(operation):
+    """A plain attempt refused before acquiring maintenance left no effect."""
+    return (
+        recorded_carry(operation) is None
+        and operation.get("state") == "acquiring_maintenance"
+        and not operation.get("token")
+    )
+
+
+def start_operation(
+    controller, operation, journal_path, *, previous_pid=None, carry=None, actor=None
+):
+    """One guarded bootstrap path for start and restart, including recovery.
+
+    With an explicit carry the maintenance is proven and ended offline before
+    bootstrap, so the started release (old or new) never has to understand the
+    carry. Admission therefore opens with the bootstrap, as after any restart.
+    """
+    if runtime_pending(controller.root):
         raise RuntimeError(
             "recovery_required",
             "Resume runtime activate or runtime rollback before service start.",
         )
-    from oraculo.maintenance import maintenance_guard
+    from oraculo.maintenance import end_maintenance, maintenance_guard
 
     observed = controller.status()
     pending = operation and operation.get("state") != "complete"
+    adopted = None
+    if carry and pending and unacquired(operation):
+        # A refused plain attempt never acquired maintenance; reuse its identity.
+        adopted, pending = operation, False
+    if pending and recorded_carry(operation) != carry:
+        raise RuntimeError(
+            "carry_mismatch",
+            "Use exactly the carry list recorded in service-operation.json.",
+        )
     if not pending and observed["state"] == "online":
         return controller.start(previous_pid=previous_pid)
-    if observed["state"] not in {"unloaded", "online"}:
+    # Only a carried start that already bootstrapped (carry_starting) can find
+    # the daemon running; there the legacy dispatcher's health is tolerated.
+    resumed = (
+        carry
+        and pending
+        and operation.get("state") == "carry_starting"
+        and observed["state"] == "failed"
+        and maintenance_acceptance(controller, observed)
+    )
+    if observed["state"] not in {"unloaded", "online"} and not resumed:
         raise RuntimeError("service_state_unproven")
     selected = current_release(controller.root)
     manifest = verify(controller.root / "releases" / selected, installed=True)
@@ -543,16 +727,36 @@ def start_operation(controller, operation, journal_path, *, previous_pid=None):
     if not pending:
         operation = dict(
             schema_version=1,
-            operation_id=str(uuid.uuid4()),
+            operation_id=adopted["operation_id"] if adopted else str(uuid.uuid4()),
             token=None,
             state="acquiring_maintenance",
             config_sha256=expected_config,
         )
+        if adopted:
+            operation["adopted"] = adopted
+        if carry:
+            operation["carry"] = dict(task_ids=carry, audit=[])
         write_json(journal_path, operation)
+    carry_kwargs = dict(carry=carry, actor=actor) if carry else {}
+    if (
+        carry
+        and observed["state"] != "unloaded"
+        and operation.get("state") != "carry_starting"
+    ):
+        raise RuntimeError(
+            "carry_requires_stopped_service",
+            "Run service stop --carry-reservation with the same list first.",
+        )
 
     def prepare(guard):
         match_guard(operation, guard)
-        compatible(manifest, guard)
+        compatible(manifest, guard, carry)
+        if carry:
+            operation["carry"]["audit"].append(
+                carry_audit(
+                    "maintenance", actor, guard.get("carry_proof"), release_id=selected
+                )
+            )
         if operation.get("capacity") not in (None, guard.get("capacity")):
             raise RuntimeError("capacity_changed")
         if observed["state"] == "unloaded":
@@ -580,6 +784,39 @@ def start_operation(controller, operation, journal_path, *, previous_pid=None):
         if config_hash(controller.config) != expected_config:
             raise RuntimeError("config_changed")
 
+    if carry:
+        if operation.get("state") != "carry_starting":
+            with maintenance_guard(
+                config, operation["operation_id"], **carry_kwargs
+            ) as guard:
+                prepare(guard)
+            operation["maintenance_end_attempted"] = True
+            write_json(journal_path, operation)
+            ended = end_maintenance(
+                config, operation["operation_id"], operation["token"], **carry_kwargs
+            )
+            operation["carry"]["audit"].append(
+                carry_audit("end", actor, ended.get("carry_proof"))
+            )
+            operation["state"] = "carry_starting"
+            write_json(journal_path, operation)
+        result = controller.start(previous_pid=previous_pid, accept_legacy=True)
+        if result.get("service_acceptance"):
+            operation["service_acceptance"] = result["service_acceptance"]
+        after = controller.request("maintenance.status", {})
+        if after.get("admission_closed") or after.get("operation_id"):
+            raise RuntimeError("maintenance_unproven")
+        if any(
+            (after.get("capacity") or {}).get(k)
+            != (operation.get("capacity") or {}).get(k)
+            for k in CARRY_CAPACITY_KEYS
+        ):
+            raise RuntimeError("capacity_changed")
+        if config_hash(controller.config) != expected_config:
+            raise RuntimeError("config_changed")
+        operation["state"] = "complete"
+        write_json(journal_path, operation)
+        return dict(result, carried_reservations=carry)
     if observed["state"] == "unloaded":
         with maintenance_guard(config, operation["operation_id"]) as guard:
             prepare(guard)
@@ -619,12 +856,190 @@ def start_operation(controller, operation, journal_path, *, previous_pid=None):
     return result
 
 
+def carry_stop(controller, operation, journal_path, carry, actor):
+    """Identity-checked stop that keeps explicitly carried reservations.
+
+    The running daemon may predate carries, so its maintenance cannot close
+    admission. Instead admission must already be exhausted (capacity equal to
+    the carried occupancy) before the exact loaded job is booted out; then the
+    official offline guard proves the carry under the daemon/ledger locks and
+    keeps maintenance held for the activation that follows.
+    """
+    from oraculo.maintenance import maintenance_guard
+
+    if runtime_pending(controller.root):
+        raise RuntimeError(
+            "recovery_required",
+            "Resolve the pending runtime operation first: repeat it, roll back, or runtime abandon-operation when it never acquired maintenance.",
+        )
+    pending = operation and operation.get("state") != "complete"
+    adopted = None
+    if pending and unacquired(operation):
+        # A refused plain stop never acquired maintenance; adopt its identity.
+        adopted, pending = operation, False
+    if pending and recorded_carry(operation) != carry:
+        raise RuntimeError(
+            "carry_mismatch",
+            "Use exactly the carry list recorded in service-operation.json.",
+        )
+    before = controller.status()
+    selected = current_release(controller.root)
+    if not pending:
+        operation = dict(
+            schema_version=1,
+            operation_id=adopted["operation_id"] if adopted else str(uuid.uuid4()),
+            token=None,
+            state="carry_stopping",
+            config_sha256=config_hash(controller.config),
+            target=selected,
+            previous_pid=before.get("pid"),
+            carry=dict(task_ids=carry, audit=[]),
+            **({"adopted": adopted} if adopted else {}),
+        )
+    acceptance = maintenance_acceptance(controller, before)
+    if acceptance:
+        snapshot = controller.request("maintenance.status", {})
+        holder = snapshot.get("operation_id")
+        if holder and holder != operation["operation_id"]:
+            raise RuntimeError("maintenance_already_active")
+        capacity = snapshot.get("capacity") or {}
+        if capacity.get("occupied") != len(carry):
+            raise RuntimeError(
+                "carry_occupancy_mismatch",
+                "Occupancy must be exactly the carried reservations; finish or cancel other work first.",
+            )
+        terminal_proof = (actor or {}).get("terminal_proof")
+        if terminal_proof is not None:
+            from oraculo.terminal_carry import pre_stop
+
+            config = load_config_verified(controller.config, operation["config_sha256"])
+            evidence = pre_stop(
+                config,
+                controller,
+                terminal_proof,
+                carry,
+                controller.root
+                / "backups"
+                / (operation["operation_id"] + "-terminal-carry"),
+            )
+            operation["carry"]["terminal_preflight"] = evidence
+        if capacity.get("available") != 0 and terminal_proof is None:
+            raise RuntimeError(
+                "carry_admission_open",
+                "Close admission first: oraculo capacity --set N, with N equal to the carried reservations.",
+            )
+        operation.update(
+            state="carry_stopping",
+            previous_pid=before.get("pid"),
+            replacement=controller.recovery_identity(selected),
+        )
+        operation["carry"]["audit"].append(
+            carry_audit(
+                "pre_stop",
+                actor,
+                None,
+                service=dict(
+                    pid=before.get("pid"),
+                    release_id=selected,
+                    state=before["state"],
+                    health=before.get("health"),
+                ),
+                service_acceptance=acceptance,
+                capacity=capacity,
+            )
+        )
+        write_json(journal_path, operation)
+        controller.stop(recovery_release=selected)
+    elif before["state"] in {"loaded", "starting", "failed"}:
+        binding = operation.get("replacement")
+        if not pending or not isinstance(binding, dict):
+            raise RuntimeError("service_state_unproven")
+        release_id = binding.get("release_id")
+        if selected != release_id or binding != controller.recovery_identity(
+            release_id
+        ):
+            raise RuntimeError("recovery_identity_mismatch")
+        loaded = controller.inspect_launchd()
+        pids = set(operation.get("recovery_pids", []))
+        pids.update(pid for pid in (loaded.get("pid"), before.get("pid")) if pid)
+        operation.update(state="carry_stopping", recovery_pids=sorted(pids))
+        write_json(journal_path, operation)
+        controller.stop(recovery_release=release_id)
+        controller.wait(
+            lambda: not any(controller.alive(pid) for pid in pids), "stop_timeout"
+        )
+    elif before["state"] != "unloaded":
+        raise RuntimeError("service_state_unproven")
+    else:
+        write_json(journal_path, operation)
+    config = load_config_verified(controller.config, operation["config_sha256"])
+    try:
+        with maintenance_guard(
+            config, operation["operation_id"], carry=carry, actor=actor
+        ) as guard:
+            match_guard(operation, guard)
+            if config_hash(controller.config) != operation["config_sha256"]:
+                raise RuntimeError("config_changed")
+            operation.update(
+                token=guard["token"],
+                capacity=guard.get("capacity"),
+                state="stopped",
+                maintenance_end_attempted=False,
+                replacement_maintenance=dict(
+                    operation_id=operation["operation_id"], token=guard["token"]
+                ),
+            )
+            operation["carry"].pop("refusal", None)
+            operation["carry"]["audit"].append(
+                carry_audit("maintenance", actor, guard.get("carry_proof"))
+            )
+            write_json(journal_path, operation)
+    except ValueError as exc:
+        if type(exc).__name__ != "StateError":
+            raise
+        operation["state"] = "carry_refused"
+        operation["carry"]["refusal"] = dict(
+            error_code=str(exc), at=datetime.now(UTC).isoformat()
+        )
+        write_json(journal_path, operation)
+        raise
+    return receipt(
+        "unloaded",
+        operation_id=operation["operation_id"],
+        carried_reservations=carry,
+        maintenance="held",
+        proof_sha256=(guard.get("carry_proof") or {}).get("sha256"),
+    )
+
+
 def dispatch(args):
+    from oraculo import reservation_carry
+
     controller = ServiceController.from_args(args)
     try:
         if args.service_action == "status":
             return controller.status()
         controller.require_supported()
+        authorization = getattr(args, "carry_authorization", None)
+        try:
+            carry = reservation_carry.normalize(
+                getattr(args, "carry_reservations", None)
+            )
+            proof_path = getattr(args, "carry_terminal_proof", None)
+            actor = (
+                reservation_carry.actor(authorization, proof_path) if carry else None
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        if authorization is not None and carry is None:
+            raise RuntimeError("carry_authorization_without_carry")
+        if proof_path is not None and carry is None:
+            raise RuntimeError("carry_proof_without_carry")
+        if carry and not authorization:
+            raise RuntimeError(
+                "carry_authorization_required",
+                "State who authorized the exceptional carry with --carry-authorization.",
+            )
         if args.dry_run:
             return receipt(
                 "planned",
@@ -640,7 +1055,11 @@ def dispatch(args):
                 json.loads(journal_path.read_text()) if journal_path.exists() else None
             )
             if args.service_action == "start":
-                return start_operation(controller, operation, journal_path)
+                return start_operation(
+                    controller, operation, journal_path, carry=carry, actor=actor
+                )
+            if carry:
+                return carry_stop(controller, operation, journal_path, carry, actor)
             before = controller.status()
             if before["state"] == "online":
                 operation_id = (
@@ -682,18 +1101,12 @@ def dispatch(args):
                     "starting",
                     "failed",
                 }:
-                    runtime_path = controller.root / "operation.json"
-                    runtime_pending = (
-                        runtime_path.exists()
-                        and json.loads(runtime_path.read_text()).get("state")
-                        != "complete"
-                    )
                     return recovery_stop(
                         controller.root,
                         controller.config,
                         controller,
                         journal_name="operation.json"
-                        if runtime_pending
+                        if runtime_pending(controller.root)
                         else "service-operation.json",
                     )
                 raise RuntimeError("service_state_unproven")
