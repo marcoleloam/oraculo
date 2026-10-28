@@ -419,6 +419,7 @@ class T3Client:
         pending = list(children.get(thread_id, []))
         visited = {thread_id}
         has_pending = False
+        children_successful = True
         while pending:
             child_id = pending.pop()
             if child_id in visited:
@@ -434,7 +435,8 @@ class T3Client:
             has_pending = has_pending or not settlement_child_clear(
                 child, terminal_only=terminal_only
             )
-            if complete_runs:
+            children_successful = children_successful and settlement_child_clear(child)
+            if complete_runs and settlement_child_clear(child, terminal_only=True):
                 from oraculo.run_continuity import terminal_chain
 
                 if child.thread.latestRunId is not None:
@@ -457,6 +459,7 @@ class T3Client:
             "childrenObserved": True,
             "childrenScope": "project",
             "observedChildCount": len(visited) - 1,
+            "childrenSuccessful": children_successful,
         }
 
     async def wait(

@@ -1,5 +1,31 @@
 # Tarefas geridas por projeto
 
+## Recuperação explícita pela origem
+
+`task complete-origin` aceita validação independente de uma implementação cujo
+único run terminou `failed`, sem relatório anterior do executor. Exige a origem
+real, motivo, `expected_child_run_id`, `expected_latest_run_id`, relatório positivo
+com SHA integral do checkout limpo e checks com `result`/`proof`. A origem fornece
+esse relatório em `report` no mesmo payload de `task_id`; nenhum resultado de
+teste negativo nem relatório já registrado pode ser substituído por esse fluxo.
+O recibo `origin_completion` preserva a falha do host, identidade, histórico e
+justificativa. Memória confirmada e provas frescas após memória são obrigatórias.
+Repetir exatamente a intenção é idempotente; `task resume` retoma sua confirmação.
+
+`task supersede` registra uma tarefa substituída, com `task_id`,
+`replacement_task_id` e `reason`. A revisão substituta precisa estar vinculada ao
+mesmo projeto e origem, e pode continuar executando. Quando ainda não existe
+relatório, `report` deve descrever o resultado negativo real da tarefa antiga.
+Relatórios existentes são preservados. O checkout antigo pode já ter sido
+removido: esse encerramento não certifica um commit nem transforma a execução em
+sucesso. Identidade, histórico terminal, ausência de descendentes ativos e memória
+confirmada continuam obrigatórios. O estado visível é `superseded`/“Superada”,
+com vínculo à revisão; o resultado original `failed`/`stopped` é mantido.
+
+Ambos usam o transporte caller-bound habitual e exigem o serviço anunciando
+`origin_terminal_recovery=true`. Instalar só a CLI não atualiza esses gates no
+daemon; um serviço antigo responde `origin_recovery_service_upgrade_required`.
+
 O adapter `oraculo task` mantém o pedido ligado à conversa de origem, mesmo quando
 a execução ocorre em outro contexto. A origem recebe título, projeto, estado,
 link direto `t3-thread://v1/<identidade retornada pelo host>`, branch/worktree,
@@ -184,17 +210,47 @@ Referências primárias consultadas: [criar PR](https://learn.microsoft.com/en-u
 
 ## Contrato de transporte
 
-A escolha é automática:
+O padrão é sempre filho nativo; nunca há conversa top-level implícita:
 
-- **Filho nativo**: projeto resolvido coincide com o da origem, cwd corresponde
-  ao workspace realmente vinculado, base é o HEAD local e capabilities anuncia
-  filhos. Usa `delegate_task(isolation="worktree")`, contexto novo e chave
-  idempotente persistida. T3 notifica o pai quando o resultado está disponível;
-  turnos com revisores/filhos pendentes não são trabalho concluído.
-- **Conversa gerida**: projeto diferente, base diferente, ausência de capacidade
-  de filhos ou pedido `independent=true`. Usa `t3_thread_launch` com projeto e
-  estratégia de worktree explícitos. É uma conversa top-level, não um filho
-  nativo. O vínculo de negócio com a origem está no ledger do Oráculo.
+- **Filho nativo** (padrão, `independent` ausente ou `false`): exige
+  capabilities com `appOwnedSubagents=true`, projeto resolvido igual ao da
+  origem, `cwd` igual ao workspace realmente vinculado à origem e base igual ao
+  HEAD desse checkout. Usa `delegate_task(isolation="worktree")`, contexto novo
+  e chave idempotente persistida; o filho mantém a origem como pai. T3 notifica
+  o pai quando o resultado está disponível; turnos com revisores/filhos
+  pendentes não são trabalho concluído.
+- **Conversa gerida** (top-level): somente com o booleano JSON
+  `independent=true` pedido explicitamente. Usa `t3_thread_launch` com projeto e
+  estratégia de worktree explícitos. Não é um filho nativo; o vínculo de negócio
+  com a origem está no ledger do Oráculo.
+
+Se um pré-requisito do filho nativo falha sem `independent=true`, `start`
+responde **antes de criar a tarefa**, sem reserva, ciclo de memória, outbox nem
+chamada mutável ao host (somente leituras de capabilities, projetos e da
+conversa chamadora):
+
+```json
+{"state":"launch_rejected","created":false,"phase":"blocked",
+ "blocked_reason":"native_child_base_not_head",
+ "rejection":{"persisted":false,"correctable":true,"host_effects":"none",
+   "reason":"native_child_base_not_head","hint":"...",
+   "observed":{"requested_base":"<ref>","base_sha":"<sha>","head":"<sha>",
+     "origin_project_id":"<id>","project_id":"<id>"}}}
+```
+
+| Motivo | Como alinhar |
+| --- | --- |
+| `native_child_base_not_head` | Fazer checkout da base pedida no worktree vinculado à origem (ou vincular a origem a um worktree nessa base) e repetir a mesma chave; ou pedir `independent=true`. |
+| `native_child_workspace_mismatch` | Usar como `cwd` o worktree vinculado à origem; ou `independent=true`. |
+| `native_child_project_mismatch` | Iniciar de uma conversa do projeto de destino; ou `independent=true`. |
+| `native_child_unavailable_independent_required` | Host sem filhos gerenciados: top-level só com `independent=true`. |
+| `invalid_independent_flag` | `independent` aceita só `true`, `false` ou ausência. |
+| `implicit_top_level_intent_refused` | Intenção top-level persistida por release antiga sem `independent=true` nunca é enviada: `cancel` e novo `start`. |
+
+Erros que já eram persistidos (`dirty_source_commit_selection_required`,
+`invalid_base_ref`, projeto fora do escopo) mantêm o comportamento anterior.
+`resume` de uma tarefa ainda não lançada reaplica a mesma decisão antes de
+reservar capacidade ou consultar memória.
 
 Nenhum modo cria um executor no projeto errado para obter um callback. A UI do
 host pode omitir filhos da lista comum de Threads; o link direto e o status na
@@ -250,7 +306,11 @@ ciclos de memória e esta reconciliação. Não há edição automática de conf
 globais, instalação ou reinício de serviço nesta implementação.
 
 Perguntas, status, mensagens de controle e tarefas de memória não abrem tarefas:
-`start` aceita apenas `kind="work"`. A classificação semântica continua sendo
+`start` aceita apenas `kind="work"`. Um `text` (ou payload) que seja um evento
+`ORACULO_CONTROL_V1`, em JSON puro ou no resumo legível com detalhes técnicos,
+devolve `{"state":"control_event_not_work","created":false}`; o mesmo conteúdo
+como `evidence` de `approve` é recusado. Evento de controle nunca é pedido humano
+nem aprovação. A classificação semântica continua sendo
 responsabilidade do adapter da conversa. `continue` recebe `task_id`, `key` e
 `text`, encaminhando a mensagem ao executor existente; não cria outra tarefa.
 Novas revisões de trabalho já terminal exigem um pedido novo explícito.
@@ -571,7 +631,9 @@ A aprovação é registrada pela origem, com referência verificável ao pedido:
 ```
 
 Envie esse payload a `task approve`. O estado passa a `plan_approved`; o relatório
-original permanece imutável. Uma execução autorizada usa uma nova chave e
+original permanece imutável. Reconciliação, `resume` ou `finish` repetido com o
+mesmo relatório nunca devolvem a tarefa a `awaiting_approval` nem reescrevem
+`approval_state`. Uma execução autorizada usa uma nova chave e
 `approved_plan={"task_id":"<plan-task>","commit":"<plan-commit>"}` em `task start`.
 O serviço confere origem, commit e aprovação. O adapter não consegue provar a
 intenção humana independentemente do operador; não infere aprovação por sucesso.
@@ -613,6 +675,19 @@ mesmo State e limite de provedor. A reserva precede lançamento, sobrevive a cra
 e resposta perdida e só é liberada por término/descendentes confirmados. Estado
 incerto mantém ocupação. `executor_slots` pode reservar um orçamento maior para
 uma tarefa; não aumenta o teto configurado. Consultas não reservam executor.
+
+Lançamento nativo incerto (`launch_pending` gravado, sem filho vinculado) é
+reconciliado por `resume` da origem: com o mesmo vínculo de origem/projeto/
+checkout do lançamento, o adapter consulta o catálogo do projeto (subagentes
+incluídos) por filhos da origem com o título registrado, ignorando conversas já
+vinculadas a outras tarefas da mesma origem. Sem candidato, reemite o mesmo
+`delegate_task` persistido, com o mesmo `clientRequestId` (`<task_id>:delegate`).
+Com um candidato, o mesmo replay idempotente é a única forma de obter o
+`taskId` nativo e o recibo precisa nomear esse candidato
+(`launch_reconciliation_receipt_mismatch` caso contrário, sem vínculo). Mais de
+um candidato bloqueia sem chamada (`launch_uncertain_multiple_candidates`). A
+decisão e o catálogo ficam no evento `launch_reconciliation`; a reserva é mantida
+até o vínculo.
 
 Uma reserva cujo lançamento nunca vinculou filho pode ser descartada somente
 pela origem com `task cancel` e payload `{"task_id": ...}`. O adapter reconsulta
@@ -745,6 +820,29 @@ mesmo comando revalida as fontes e reenvia o mesmo evento sem duplicá-lo. Após
 schema 4, esse comando deixa de ser aplicável. Só então continuar o procedimento
 de quiescência e migração; reconciliar uma tarefa não certifica quiescência global.
 
+### Resultado certificado é imutável na reconciliação
+
+Uma tarefa está **certificada** quando tem `report`, `work_status` terminal
+(`succeeded`, `failed` ou `stopped`) e memória `saved`/`confirmed`. Desde então:
+
+- `reconcile` (daemon) não observa o filho, não revalida o relatório, não chama
+  `_finish` e não grava eventos. Só restam dois trabalhos possíveis: liberar uma
+  reserva que ficou presa (gates frescos idênticos aos da primeira passagem, sem
+  recertificar) ou executar uma publicação já pedida em `pr_pending`. PR, watch e
+  merge continuam orientados por evento.
+- `_finish` com o mesmo relatório é no-op (negativo mantém `work_not_successful`);
+  relatório diferente é recusado sem persistir (`terminal_report_reused`).
+- Observações (`_observe`) nunca movem uma tarefa certificada para uma fase
+  anterior (`workspace_ready`, `validating`, `memory_pending`).
+- O lote em segundo plano do serviço ignora, sem nenhuma leitura do host, tarefas
+  sem trabalho pendente e sem retorno pendente na outbox (canceladas, nativas,
+  não lançadas, certificadas e liberadas, publicadas ou integradas). Retornos
+  pendentes continuam sendo entregues.
+
+Replay exato não gera evento: a mesma fase com a mesma prova e o mesmo estado já
+é deduplicado pelo `TaskStore`; o defeito anterior era a troca de fase a cada
+ciclo (seis eventos por reconciliação de um plano top-level certificado).
+
 ### Avisos legíveis: uma mudança útil, uma intenção de envio
 
 Uma transição técnica não é uma nova execução. Antes desta política, cada evento
@@ -802,9 +900,16 @@ consultar status fresco antes de tratá-lo como estado atual.
 
 Compatibilidade e implantação:
 
-- `return_format=json` e tarefas legadas sem formato continuam enviando **todos**
-  os envelopes, em JSON puro. Consumidores que precisam de cada transição devem
-  usar esse formato. Somente o fluxo legível admite cobertura de eventos.
+- **A mesma regra semântica vale para `return_format=json` e tarefas legadas sem
+  formato**: um lote novo envia um único envelope JSON puro (o evento mais novo),
+  e nada quando o significado é igual ao último aviso confirmado. Cada transição
+  continua no histórico (`task history`) e na outbox com disposição auditável;
+  consumidores que precisam de cada transição leem o histórico, não a
+  notificação. O último aviso confirmado de entregas antigas sem linha em
+  `task_notifications` é derivado do snapshot congelado da própria entrega, de
+  modo que eventos de ciclos repetidos já gravados por um daemon antigo não
+  acordam a origem depois da atualização. Entregas antigas sem apresentação
+  congelada não têm significado conhecido e não suprimem nada.
 - Entregas já congeladas, legíveis ou JSON, são barreiras imutáveis: não se muda
   mensagem/chave nem se suprime uma emissão possivelmente já enviada. Um backlog
   congelado antes da atualização ainda pode mostrar repetições. Não é possível

@@ -8,6 +8,7 @@ import os
 import uuid
 from contextlib import contextmanager
 
+from oraculo.protocol import content_hash
 from oraculo.state import State, StateError
 
 
@@ -40,38 +41,96 @@ def quiescent(state):
     )
 
 
-def begin(state, operation_id):
+def _carry(state, config, operation_id, carry, prior, actor, phase):
+    """Validate an explicit carry against the operation's recorded carry.
+
+    Without a carry, a maintenance opened with one cannot be re-entered or
+    ended: every step of that operation repeats the same explicit list.
+    """
+    from oraculo import reservation_carry
+
+    recorded = ((prior or {}).get("carry") or {}).get("task_ids")
+    if carry is None:
+        if recorded:
+            raise StateError("maintenance_carry_required")
+        return None
+    carry = reservation_carry.normalize(carry)
+    if prior and recorded != carry:
+        raise StateError("maintenance_carry_mismatch")
+    if config is None:
+        raise StateError("carry_ledger_unavailable")
+    # The first acquisition requires every listed reservation; later steps
+    # accept ones the daemon released meanwhile, never new occupancy.
+    terminal = (actor or {}).get("terminal_proof")
+    recorded_terminal = ((prior or {}).get("carry") or {}).get("terminal_proof_sha256")
+    if prior and recorded_terminal != (content_hash(terminal) if terminal else None):
+        raise StateError("maintenance_terminal_proof_mismatch")
+    proof = reservation_carry.prove(
+        state,
+        config,
+        carry,
+        exact=prior is None,
+        terminal_proof=terminal,
+        fresh=prior is None,
+    )
+    state.audit(
+        "maintenance.carry",
+        dict(
+            operation_id=operation_id,
+            phase=phase,
+            actor=actor or reservation_carry.actor(),
+            proof=proof,
+        ),
+    )
+    return proof
+
+
+def begin(state, operation_id, carry=None, *, config=None, actor=None):
     if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 200:
         raise StateError("maintenance_operation_id_required")
     with state.transaction():
         old = state.get_meta("runtime_maintenance")
         if old and old["operation_id"] != operation_id:
             raise StateError("maintenance_already_active")
-        if not quiescent(state):
-            raise StateError("maintenance_work_active_or_uncertain")
         completed = state.get_meta("runtime_maintenance_completed")
         if not old and completed and completed["operation_id"] == operation_id:
             # A filesystem journal may fail after end committed. Reacquire the
             # same operation only after proving quiescence again, retaining its
             # durable token rather than stranding the caller with a new one.
             old = completed
-        state.set_meta(
-            "runtime_maintenance",
-            old or dict(operation_id=operation_id, token=uuid.uuid4().hex),
-        )
-        return status(state)
+        proof = _carry(state, config, operation_id, carry, old, actor, "begin")
+        if proof is None and not quiescent(state):
+            raise StateError("maintenance_work_active_or_uncertain")
+        record = old or dict(operation_id=operation_id, token=uuid.uuid4().hex)
+        if proof is not None:
+            recorded = dict(task_ids=proof["task_ids"])
+            if proof.get("terminal_proof_sha256"):
+                recorded["terminal_proof_sha256"] = proof["terminal_proof_sha256"]
+            record = dict(record, carry=recorded)
+        state.set_meta("runtime_maintenance", record)
+        result = status(state)
+        if proof is not None:
+            result.update(carry_quiescent=True, carry_proof=proof)
+        return result
 
 
-def end(state, operation_id, token):
+def end(state, operation_id, token, carry=None, *, config=None, actor=None):
     with state.transaction():
         old = state.get_meta("runtime_maintenance")
-        if not old or old != dict(operation_id=operation_id, token=token):
+        if not old or (old.get("operation_id"), old.get("token")) != (
+            operation_id,
+            token,
+        ):
             raise StateError("maintenance_token_mismatch")
-        if not quiescent(state):
+        proof = _carry(state, config, operation_id, carry, old, actor, "end")
+        if proof is None and not quiescent(state):
             raise StateError("maintenance_work_active_or_uncertain")
         state.set_meta("runtime_maintenance_completed", old)
         state.set_meta("runtime_maintenance", None)
-        return status(state)
+        result = status(state)
+        if proof is not None:
+            result.update(carry_quiescent=True, carry_proof=proof)
+        return result
 
 
 def check_legacy_tasks(config):
@@ -93,7 +152,7 @@ def check_legacy_tasks(config):
 
 
 @contextmanager
-def maintenance_guard(config, operation_id):
+def maintenance_guard(config, operation_id, carry=None, actor=None):
     from oraculo.service import Singleton
 
     if not config.db_path.exists():
@@ -108,18 +167,21 @@ def maintenance_guard(config, operation_id):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             state = State(config.db_path, max_executors=config.max_executors)
-            check_legacy_tasks(config)
-            yield begin(state, operation_id)
+            if carry is None:
+                check_legacy_tasks(config)
+            # With a carry, the proof applies the same ledger rule minus the
+            # explicitly listed tasks.
+            yield begin(state, operation_id, carry, config=config, actor=actor)
         finally:
             if state:
                 state.close()
             os.close(fd)
 
 
-def end_maintenance(config, operation_id, token):
-    with maintenance_guard(config, operation_id):
+def end_maintenance(config, operation_id, token, carry=None, actor=None):
+    with maintenance_guard(config, operation_id, carry, actor):
         state = State(config.db_path, max_executors=config.max_executors)
         try:
-            return end(state, operation_id, token)
+            return end(state, operation_id, token, carry, config=config, actor=actor)
         finally:
             state.close()

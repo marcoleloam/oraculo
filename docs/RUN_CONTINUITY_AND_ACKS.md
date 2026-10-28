@@ -22,6 +22,23 @@ visible descendant is read. Successful work still requires original and latest
 runs completed, successful descendants, a positive valid report, and the bound
 clean checkout/commit/base. Negative work stays negative.
 
+### Stopped original, completed continuation
+
+Native `task_status.status` follows the delegated task, not `childRunId`: after a
+cancelled original and a completed continuation it reports `completed` while
+`childRunId` still names the cancelled run. Success is accepted for such a chain
+only when, in the same child thread, the original (`childRunId`, ordinal 1) is
+`cancelled` or `interrupted`, every run is `cancelled`/`interrupted`/`completed`
+(never `failed` or `rolled_back`), the latest run is `completed` and equals the
+thread's `latestRunId`/status, native `status`, `latestTerminalRunId` and
+`latestTerminalStatus` equal that latest run, `hasPendingChildRuns` and
+`hasPendingQuestion` are false, and the report is the executor's own submission
+bound to the latest run (legacy unbound events and origin-authored reports are
+refused with `latest_run_report_unproven`). `completion_evidence.continuation`
+records the basis, original/latest IDs and statuses, the submission run and the
+native status fields; `childRunId` is never rewritten. A single cancelled run,
+an open run or any failed run keeps the previous negative/blocking behavior.
+
 A new executor submission records its actual caller thread/run. For legacy
 submissions, the immutable `validation_submitted` event's report digest and
 service timestamp must place submission during the last run or after it; the
@@ -36,6 +53,20 @@ proof again, compares the exact proven chain/report, and checks the same final
 snapshot's checkout before releasing admission. A change keeps the reservation
 and confirmed receipt; retry does not rewrite memory. These observations remain
 sequential, not a distributed lock. Use a cooperative window without new runs.
+
+An origin-owned `finish` uses two complete snapshots: one before memory and one
+after confirmed memory. The first snapshot also supplies execution validation;
+it is not collected a second time for that purpose. Repeated read/list/read/status
+calls at these two boundaries are finite validation, not a polling loop. A live
+origin or a live sibling task is outside the executor's descendant tree and does
+not prevent completion.
+
+Requests with explicit `status=cancelled` and `startedAt=null` consumed no execution
+interval. Their request/end timestamps must be coherent, and their full history
+remains in the receipt. They can overlap an earlier executing run without erasing
+its result. Missing `startedAt` is unknown; a failed run or a cancellation after
+execution began still blocks successful certification. A request cancelled before
+any execution records a stopped outcome, with no invented execution run.
 
 T3 exposes `runLimit` but no run-history cursor. This implementation requests
 50 recent runs. More than 50, a missing ordinal, or a host omitting the complete
@@ -76,6 +107,15 @@ are correlated; the receiver also rejects regressing revisions/counts, changed
 terminal runs, changed bindings and inconsistent known task/thread observations.
 
 ### Programmatic relay
+
+Steering can create a newer queued run and cancel it before it starts while the
+original run is still active. In that state T3 can legitimately return different
+`activeRunId` and `latestRunId` values. An identity read with `runLimit=1` may
+contain only the newer cancelled request. The bridge preserves both IDs and
+accepts that bounded read; if the active run is present in the returned window,
+it must not already be terminal. This does not establish quiescence: completion
+still requires no active run, the complete history and the task's own descendant
+proofs. Other tasks can remain active in the same project.
 
 Prefer `CommandTransport` through the host-provided `T3_ACP_MCP_NODE` and optional
 `T3_ACP_MCP_ENTRYPOINT`. Do not set those to guessed executables. No ACP transport
@@ -203,3 +243,13 @@ completion evidence ending at run 3, positive valid report/clean commit,
 incomplete history, live descendant, stale report, busy adapter or uncertain ACK
 is a blocker with the existing ID; it never authorizes a fabricated receipt.
 No operational recovery, publication or activation is claimed by this runbook.
+
+### Native terminal-result recency
+
+`thread.latestRunId` follows ordinal order. Native `latestTerminalRunId` follows
+completion time: a newer queued request can be cancelled before the older active
+run finishes. The final receipt can therefore name the completed older run while
+the thread's newest ordinal names an unstarted cancellation. The bridge accepts
+this distinction during bounded identity reads; a complete terminal chain must
+still prove the exact native result and status before certification. Missing or
+contradictory native identity, timestamps or active work continue to block.

@@ -14,7 +14,12 @@ import time
 import zlib
 
 from oraculo.protocol import canonical_json, content_hash
-from oraculo.run_continuity import timestamp
+from oraculo.run_continuity import (
+    cancelled_before_start,
+    native_terminal_run,
+    terminal_chain,
+    timestamp,
+)
 from oraculo.state import StateError
 
 ACK_PROTOCOL = "ORACULO_HOST_ACK_V2"
@@ -214,8 +219,21 @@ class HostResults:
                 thread["latestRunId"] and thread["latestRunId"] not in ids
             ):
                 raise StateError("native_bridge_result_incoherent")
-            if thread["activeRunId"] and thread["activeRunId"] != thread["latestRunId"]:
-                raise StateError("native_bridge_result_incoherent")
+            # A queued or cancelled steering run can be newer than the run
+            # still executing. A bounded recentRuns window may omit that active
+            # run; its absence is not contradictory evidence. Closure gates
+            # separately require activeRunId=None and a complete terminal chain.
+            active = thread["activeRunId"]
+            if active is not None:
+                if not isinstance(active, str) or not active or not thread["runCount"]:
+                    raise StateError("native_bridge_result_incoherent")
+                from oraculo.t3.contracts import TERMINAL_STATUSES
+
+                if any(
+                    run["runId"] == active and run["status"] in TERMINAL_STATUSES
+                    for run in value["recentRuns"]
+                ):
+                    raise StateError("native_bridge_result_incoherent")
             for item in value["items"]:
                 required(
                     item,
@@ -360,11 +378,31 @@ class HostResults:
                 thread = known["thread"]
                 if thread["activeRunId"] or thread["pendingRequestCount"]:
                     raise StateError("native_bridge_result_incoherent")
+                latest = [
+                    r
+                    for r in known["recentRuns"]
+                    if r["runId"] == thread["latestRunId"]
+                ]
+                unstarted_latest = len(latest) == 1 and cancelled_before_start(
+                    latest[0]
+                )
                 if (
                     thread["latestRunId"] != value["childRunId"]
                     and value["latestTerminalRunId"] != thread["latestRunId"]
                 ):
-                    raise StateError("native_bridge_result_incoherent")
+                    if not unstarted_latest:
+                        raise StateError("native_bridge_result_incoherent")
+                # Identity reads can have a truncated window. Completion
+                # gates independently require the complete terminal chain.
+                if unstarted_latest and 1 < thread["runCount"] == len(
+                    known["recentRuns"]
+                ):
+                    terminal = native_terminal_run(terminal_chain(known))
+                    if (
+                        value["latestTerminalRunId"],
+                        value["latestTerminalStatus"],
+                    ) != (terminal["runId"], terminal["status"]):
+                        raise StateError("native_bridge_result_incoherent")
             self.tasks[value["taskId"]] = value
         elif tool == "t3_thread_send":
             required(value, ("threadId", "messageId"))

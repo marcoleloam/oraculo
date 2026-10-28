@@ -92,6 +92,7 @@ async def test_cancelled_background_waiter_retains_busy_until_worker_exits(
     running_service, monkeypatch, early_cancel
 ):
     service = running_service
+    monkeypatch.setattr("oraculo.managed_service.CALLER_QUEUE_TIMEOUT", 0.03)
     store = TaskStore(service.config.state_dir / "managed-tasks.sqlite3")
     store.create({"thread_id": "origin", "run_id": "run"}, "key", {"text": "fixture"})
     store.close()
@@ -146,6 +147,7 @@ async def test_silent_ack_times_out_and_status_identifies_owner(
     running_service, monkeypatch
 ):
     monkeypatch.setattr("oraculo.managed_service.HOST_ACK_TIMEOUT", 0.15)
+    monkeypatch.setattr("oraculo.managed_service.CALLER_QUEUE_TIMEOUT", 0.03)
     service = running_service
     reader, writer = await open_operation(service)
     frame = json.loads(await reader.readline())
@@ -175,6 +177,8 @@ async def test_live_slow_ack_retains_operation_and_default_minutes(
 ):
     from oraculo.managed_service import HOST_ACK_TIMEOUT, HOST_FRAME_TIMEOUT
     from oraculo.task_transport import StdioHostTransport
+
+    monkeypatch.setattr("oraculo.managed_service.CALLER_QUEUE_TIMEOUT", 0.03)
 
     assert (
         HOST_FRAME_TIMEOUT
@@ -280,6 +284,7 @@ async def test_client_disconnect_during_memory_retains_real_wait(
     running_service, monkeypatch
 ):
     service = running_service
+    monkeypatch.setattr("oraculo.managed_service.CALLER_QUEUE_TIMEOUT", 0.03)
     initialize(service.config.projects_root / "alpha")
     host = Caller(service.config.projects_root)
     entered, release = asyncio.Event(), asyncio.Event()

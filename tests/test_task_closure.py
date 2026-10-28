@@ -37,8 +37,8 @@ class Lifecycle:
         return self.inspect(pr, policy, cwd)
 
 
-async def setup(system):
-    task, spec, _ = await publication_setup(system)
+async def setup(system, **overrides):
+    task, spec, _ = await publication_setup(system, **overrides)
     result = await system.engine.command(
         "publish", {"task_id": task["id"], "publication": spec}
     )
@@ -286,7 +286,8 @@ async def test_merge_must_reject_unresolved_execution(
         return result
 
     monkeypatch.setattr(system.host, "call", no_native)
-    task, policy, lifecycle, calls = await setup(system)
+    # Without app-owned children a top-level conversation must be explicit.
+    task, policy, lifecycle, calls = await setup(system, independent=not native)
     child_id = task["child"]["childThreadId"]
     original_run = task["child"]["childRunId"]
     call_before = system.host.call

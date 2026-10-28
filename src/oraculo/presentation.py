@@ -75,6 +75,18 @@ PHASES = {
     ),
     "settled": ("Encerrada", "O encerramento foi registrado."),
     "cancelled": ("Cancelada", "O cancelamento foi registrado."),
+    "supersession_pending": (
+        "Registrando substituição",
+        "Confirmando o encerramento da tarefa substituída.",
+    ),
+    "superseded": (
+        "Superada",
+        "Esta tarefa foi substituída por uma revisão explícita.",
+    ),
+    "origin_validation_accepted": (
+        "Validação da origem registrada",
+        "Confirmando o resultado e a memória.",
+    ),
     "failed": ("Falhou", "O resultado não foi aprovado."),
     "stopped": ("Interrompida", "A execução foi interrompida."),
     "blocked": ("Bloqueada", "Uma condição impede a próxima etapa."),
@@ -150,11 +162,17 @@ def task_view(task: dict) -> dict:
     ):
         activity = plain(latest["proof"]["progress"], 600)
     work = task.get("work_status")
-    if work in {"failed", "stopped", "cancelled"}:
+    if phase not in {"superseded", "supersession_pending"} and work in {
+        "failed",
+        "stopped",
+        "cancelled",
+    }:
         label, activity = PHASES[work]
     blocked = phase == "blocked"
     action = (
-        "A origem deve verificar o impedimento e retomar a mesma tarefa."
+        "Nenhuma ação necessária nesta tarefa; acompanhe a revisão substituta."
+        if phase == "superseded"
+        else "A origem deve verificar o impedimento e retomar a mesma tarefa."
         if blocked
         else "A origem deve revisar o resultado negativo e definir a retomada."
         if work in {"failed", "stopped"}
@@ -172,7 +190,9 @@ def task_view(task: dict) -> dict:
         )
     else:
         result = (
-            "Resultado negativo registrado."
+            "Substituição registrada; o histórico da execução foi preservado."
+            if phase == "superseded"
+            else "Resultado negativo registrado."
             if work in {"failed", "stopped"}
             else "Cancelamento registrado."
             if work == "cancelled"
