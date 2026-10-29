@@ -9,7 +9,7 @@ from threading import Thread
 import pytest
 
 from oraculo.presentation import task_tracking
-from oraculo.task_panel import PAGE, make_server, project_tasks
+from oraculo.task_panel import make_server, project_tasks
 from oraculo.task_store import TaskStore
 
 
@@ -216,9 +216,93 @@ def test_http_loopback_fixed_project_no_files_no_parameters_and_no_cache(monkeyp
         status, body, _ = get(http, "/api/tasks")
         assert status == 503 and json.loads(body)["tasks"] == []
         assert "PRIVATE" not in body
-    assert "tasks=[];render()" in PAGE
-    assert "Estado atual desconhecido" in PAGE
-    assert "textContent=text" in PAGE and "innerHTML" not in PAGE
+
+
+async def test_project_identity_and_history_are_projected_without_private_metadata(
+    monkeypatch,
+):
+    import oraculo.cli as cli
+
+    active, stopped, completed, unverified = [row() for _ in range(4)]
+    for i, task in enumerate((active, stopped, completed, unverified)):
+        task.update(
+            id=f"task-demo-{i}-full-id",
+            project={"project_id": "alpha", "project_path": "/private/demo/alpha"},
+            observed_at=1793260800 + i,
+            report={"summary": "PRIVATE_REPORT"},
+        )
+    active["title"] = '<img src=x onerror="alert(1)"> & demo'
+    stopped.update(work_status="stopped", observed={"status": "interrupted"})
+    completed.update(
+        phase="pr_pending",
+        work_status="succeeded",
+        completion_evidence={"private": "PRIVATE_EVIDENCE"},
+    )
+    unverified.update(observed={"status": "completed"})
+    tasks = [active, stopped, completed, unverified]
+    before = copy.deepcopy(tasks)
+
+    async def request(*_):
+        return dict(
+            ok=True, data=dict(source="service", protocol_version=1, tasks=tasks)
+        )
+
+    monkeypatch.setattr(cli, "request", request)
+    result = await project_tasks(None, "alpha")
+    assert result["project_title"] == "alpha"
+    assert [t["history"] for t in result["tasks"]] == [False, True, True, False]
+    assert [t["tracking"]["state"] for t in result["tasks"]] == [
+        "running",
+        "blocked",
+        "completed",
+        "waiting",
+    ]
+    for projected, original in zip(result["tasks"], tasks, strict=True):
+        assert projected["id"] == original["id"]
+        assert projected["short_id"] == original["id"].removeprefix("task-")[:10]
+        assert projected["project_id"] == "alpha"
+        assert projected["project_title"] == "alpha"
+        assert projected["observed_at"] == original["observed_at"]
+        assert projected["tracking"]["next_action"]
+    assert tasks == before
+    encoded = json.dumps(result)
+    assert "PRIVATE_" not in encoded and "/private/" not in encoded
+    # Text remains text in JSON; the HTML shell never interpolates service data.
+    assert "<img" in result["tasks"][0]["title"]
+
+
+@pytest.mark.parametrize("observed_at", [None, True, {}, "unknown", float("inf")])
+async def test_invalid_recency_is_unknown(monkeypatch, observed_at):
+    import oraculo.cli as cli
+
+    task = row()
+    task["observed_at"] = observed_at
+
+    async def request(*_):
+        return dict(
+            ok=True, data=dict(source="service", protocol_version=1, tasks=[task])
+        )
+
+    monkeypatch.setattr(cli, "request", request)
+    assert (await project_tasks(None, "alpha"))["tasks"][0]["observed_at"] is None
+
+
+def test_http_task_text_roundtrips_as_json_without_entering_the_html(monkeypatch):
+    import oraculo.task_panel as module
+
+    title = '</script><img src=x onerror="alert(1)"> & demo'
+
+    async def query(*_):
+        return dict(project_title="alpha", tasks=[dict(id="demo", title=title)])
+
+    monkeypatch.setattr(module, "project_tasks", query)
+    with server() as http:
+        status, body, headers = get(http, "/api/tasks")
+        assert status == 200
+        assert headers["Content-Type"].startswith("application/json")
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert json.loads(body)["tasks"][0]["title"] == title
+        assert title not in get(http)[1]
 
 
 async def test_panel_matches_exact_existing_managed_read_contract(monkeypatch):
