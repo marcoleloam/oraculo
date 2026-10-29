@@ -202,7 +202,9 @@ def parser() -> argparse.ArgumentParser:
     snapshot = views.add_parser("snapshot")
     snapshot.add_argument("--project", required=True)
     panel = views.add_parser("serve")
-    panel.add_argument("--project", required=True)
+    panel_scope = panel.add_mutually_exclusive_group(required=True)
+    panel_scope.add_argument("--project")
+    panel_scope.add_argument("--all-projects", action="store_true")
     panel.add_argument("--port", type=int, default=8765)
     readable = views.add_parser("status")
     readable.add_argument("--file", type=Path, required=True)
@@ -471,7 +473,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.action == "serve":
                 from oraculo.task_panel import serve
 
-                serve(Config.load(args.config), args.project, args.port)
+                if args.all_projects:
+                    serve(Config.load(args.config), None, args.port, all_projects=True)
+                else:
+                    serve(Config.load(args.config), args.project, args.port)
             elif args.action == "snapshot":
                 print_json(
                     asyncio.run(
