@@ -22,6 +22,7 @@ PHASES = {
         "Execução preparada",
         "Aguardando confirmação do ambiente de trabalho.",
     ),
+    "workspace_ready": ("Ambiente confirmado", "Aguardando observação da execução."),
     "executing": ("Em execução", "O agente está trabalhando na tarefa."),
     "validating": ("Em revisão", "Verificando resultado e evidências da execução."),
     "validation_submitted": (
@@ -97,7 +98,8 @@ BLOCKERS = {
     "memory_write_unconfirmed": "O salvamento da memória ainda não foi confirmado.",
     "terminal_execution_unproven": "O término da execução ainda não foi comprovado.",
     "terminal_execution_or_descendants_unproven": "Há execução ou revisão cujo término precisa ser confirmado.",
-    "dirty_source_commit_selection_required": "A origem contém alterações que precisam de uma seleção explícita de commit.",
+    "dirty_source_commit_selection_required": "A origem contém alterações locais. Informe em base o SHA completo de 40 caracteres do commit selecionado; as alterações locais não serão copiadas.",
+    "invalid_base_ref": "A base informada não identifica um commit existente neste repositório.",
     "validated_commit_or_clean_workspace_required": "O commit e o ambiente precisam ser revalidados antes de concluir.",
     "managed_adapter_busy_retry_same_key": "O serviço está atendendo outra operação; a origem deve retomar a mesma intenção.",
 }
@@ -156,7 +158,7 @@ def task_view(task: dict) -> dict:
         ("Estado não reconhecido", "Consulte os detalhes técnicos para investigar."),
     )
     events = task.get("events") or []
-    latest = events[-1] if events else {}
+    latest = events[-1] if events else task.get("latest_event") or {}
     if latest.get("phase") == phase and isinstance(
         (latest.get("proof") or {}).get("progress"), str
     ):
@@ -217,6 +219,121 @@ def task_view(task: dict) -> dict:
         url=thread_url(child.get("childThreadId") or origin.get("thread_id")),
         task_id=task.get("id"),
         snapshot_revision=task.get("snapshot_revision"),
+    )
+
+
+def task_memory_confirmed(task: dict) -> bool:
+    cycle = task.get("memory") or {}
+    receipt = cycle.get("write_receipt") or {}
+    return bool(
+        cycle.get("id")
+        and cycle.get("write_state") == "saved"
+        and receipt.get("state") == "confirmed"
+        and receipt.get("operation_id") == cycle["id"]
+        and receipt.get("commit")
+    )
+
+
+def task_tracking(task: dict) -> dict:
+    """Read-only project tracking; a terminal host run is never a work verdict."""
+    view = task_view(task)
+    supplied = task.get("presentation")
+    if isinstance(supplied, dict):
+        # Official task status can omit its event history. Keep the daemon's
+        # bounded display fields, never its prose as a completion certificate.
+        for key, limit in (("title", 240), ("activity", 600), ("updated_at", 80)):
+            value = supplied.get(key)
+            if isinstance(value, str) and value.strip():
+                view[key] = plain(value, limit)
+    phase, work = task.get("phase"), task.get("work_status")
+    observed = task.get("observed") or {}
+    status = observed.get("status")
+    if phase == "blocked" and task.get("blocked_reason") == "managed_capacity_wait":
+        state, label = "waiting", "Aguardando / fila"
+        view = dict(
+            view,
+            phase="Aguardando capacidade",
+            activity="A tarefa aguarda uma vaga no serviço.",
+            blocker="Não há vaga disponível na última observação registrada.",
+            next_action="A origem deve retomar a mesma tarefa quando houver vaga.",
+        )
+    elif (
+        phase == "blocked"
+        or work in {"failed", "stopped", "cancelled"}
+        or status in {"failed", "interrupted", "cancelled", "rolled_back"}
+    ):
+        state, label = "blocked", "Bloqueada / parada"
+    elif phase in {
+        "validating",
+        "validation_submitted",
+        "validation_recovered",
+        "memory_pending",
+        "awaiting_approval",
+        "origin_validation_accepted",
+        "supersession_pending",
+    } or (
+        task.get("deliverable_kind") == "plan"
+        and task.get("approval_state") != "approved"
+    ):
+        state, label = "waiting", "Aguardando / fila"
+    elif (
+        work == "succeeded"
+        and task.get("completion_evidence")
+        and (task.get("memory_confirmed") is True or task_memory_confirmed(task))
+    ):
+        state, label = "completed", "Concluída"
+    elif status in {
+        "preparing",
+        "queued",
+        "starting",
+        "waiting",
+        "completed",
+    } or phase in {
+        "received",
+        "project_resolved",
+        "memory_read",
+        "launch_pending",
+        "launch_acknowledged",
+        "workspace_ready",
+        "awaiting_approval",
+        "validation_submitted",
+        "validating",
+        "validation_recovered",
+        "memory_pending",
+        "pr_waiting",
+    }:
+        state, label = "waiting", "Aguardando / fila"
+    elif phase == "executing":
+        state, label = "running", "Executando"
+    else:
+        state, label = "waiting", "Aguardando / fila"
+    if (
+        status in {"failed", "interrupted", "cancelled", "rolled_back"}
+        and work == "pending"
+    ):
+        view = dict(
+            view,
+            activity="A última observação indica execução parada; resultado ainda pendente.",
+            blocker=view["blocker"] or "A origem deve verificar a execução parada.",
+            next_action="A origem deve verificar o impedimento e retomar a mesma tarefa.",
+        )
+    return dict(
+        title=view["title"],
+        state=state,
+        label=label,
+        phase=view["phase"],
+        activity=view["activity"],
+        result="Resultado ainda não verificado."
+        if work == "succeeded" and not task.get("completion_evidence")
+        else view["result"],
+        blocker=view["blocker"],
+        blocked_reason=plain(task.get("blocked_reason")) or None,
+        next_action=view["next_action"],
+        observed_status=plain(status) or "desconhecido",
+        observed_work_state=plain(observed.get("workState")) or "desconhecido",
+        updated_at=view["updated_at"],
+        origin_url=thread_url((task.get("origin") or {}).get("thread_id")),
+        child_url=thread_url((task.get("child") or {}).get("childThreadId")),
     )
 
 

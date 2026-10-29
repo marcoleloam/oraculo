@@ -80,7 +80,13 @@ def world(tmp_path):
     blocked_task = add_task(state, store, "blocked_task", "blocked")
     state.close()
     store.close()
-    return dict(conf=conf, config=loaded, submitted_task=submitted_task, blocked_task=blocked_task, carry=sorted([submitted_task, blocked_task]))
+    return dict(
+        conf=conf,
+        config=loaded,
+        submitted_task=submitted_task,
+        blocked_task=blocked_task,
+        carry=sorted([submitted_task, blocked_task]),
+    )
 
 
 def mutate(world, action):
@@ -261,7 +267,11 @@ def test_carry_refuses_uncertain_operation_and_pending_memory(world):
 def test_carry_requires_explicit_valid_complete_list(world):
     with pytest.raises(StateError, match="carry_reservation_missing"):
         guard(world, world["carry"] + ["task-" + "0" * 64])
-    for bad in ([], ["submitted_task"], [world["submitted_task"], world["submitted_task"]]):
+    for bad in (
+        [],
+        ["submitted_task"],
+        [world["submitted_task"], world["submitted_task"]],
+    ):
         with pytest.raises(StateError, match="carry_reservations_invalid"):
             guard(world, bad)
 
@@ -276,7 +286,9 @@ def test_carried_operation_never_falls_back_to_plain_or_other_list(world):
         with pytest.raises(StateError, match="maintenance_carry_required"):
             maintenance.end(state, "op-carry", token)
         with pytest.raises(StateError, match="maintenance_carry_mismatch"):
-            maintenance.begin(state, "op-carry", [world["submitted_task"]], config=world["config"])
+            maintenance.begin(
+                state, "op-carry", [world["submitted_task"]], config=world["config"]
+            )
         with pytest.raises(StateError, match="maintenance_already_active"):
             maintenance.begin(state, "op-other", world["carry"], config=world["config"])
     finally:
@@ -287,7 +299,9 @@ def test_end_accepts_daemon_release_but_not_new_occupancy(world):
     token = guard(world, world["carry"])["token"]
 
     def release_blocked_task(state, store):
-        state.release_managed(world["blocked_task"], dict(DONE, hasPendingChildRuns=False))
+        state.release_managed(
+            world["blocked_task"], dict(DONE, hasPendingChildRuns=False)
+        )
         task = store.get(world["blocked_task"])
         store.update(
             world["blocked_task"], "settled", {"fixture": True}, work_status="succeeded"
@@ -314,7 +328,9 @@ def test_end_accepts_daemon_release_but_not_new_occupancy(world):
     finally:
         state.close()
     assert ended["carry_proof"]["released"] == [world["blocked_task"]]
-    assert [t["task_id"] for t in ended["carry_proof"]["tasks"]] == [world["submitted_task"]]
+    assert [t["task_id"] for t in ended["carry_proof"]["tasks"]] == [
+        world["submitted_task"]
+    ]
 
 
 class Service:

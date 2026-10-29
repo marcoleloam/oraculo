@@ -201,6 +201,9 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("--output", type=Path, required=True)
     snapshot = views.add_parser("snapshot")
     snapshot.add_argument("--project", required=True)
+    panel = views.add_parser("serve")
+    panel.add_argument("--project", required=True)
+    panel.add_argument("--port", type=int, default=8765)
     readable = views.add_parser("status")
     readable.add_argument("--file", type=Path, required=True)
     readable.add_argument("--json", action="store_true")
@@ -465,7 +468,11 @@ def main(argv: list[str] | None = None) -> int:
             from oraculo.experience import export_files, project_model, write_export
             from oraculo.presentation import summary_markdown, task_view
 
-            if args.action == "snapshot":
+            if args.action == "serve":
+                from oraculo.task_panel import serve
+
+                serve(Config.load(args.config), args.project, args.port)
+            elif args.action == "snapshot":
                 print_json(
                     asyncio.run(
                         experience_snapshot(Config.load(args.config), args.project)

@@ -18,7 +18,7 @@ from oraculo.memory.schema import (
     resolve_link,
     safe_path,
 )
-from oraculo.presentation import markdown, plain, task_view, timestamp
+from oraculo.presentation import markdown, plain, task_tracking, task_view, timestamp
 from oraculo.protocol import canonical_json
 
 KINDS = {
@@ -242,6 +242,7 @@ def project_model(snapshot: dict, project: str) -> dict:
                 sources=sources,
                 metrics=metrics,
                 presentation=view,
+                tracking=task_tracking(task),
             )
         )
         for field, kind in (

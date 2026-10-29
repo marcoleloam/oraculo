@@ -7,7 +7,9 @@ from pathlib import Path
 
 from oraculo.memory.context import Context
 from oraculo.memory.transport import MemoryArtifacts
+from oraculo.presentation import task_memory_confirmed
 from oraculo.protocol import MAX_ENVELOPE_BYTES, canonical_json
+from oraculo.task_panel import project_binding
 from oraculo.task_store import TaskStore
 
 
@@ -28,7 +30,7 @@ def snapshot(service, project_id):
         if store:
             for row in store.db.execute("SELECT id FROM managed_tasks ORDER BY rowid"):
                 task = store.get(row[0])
-                if (task.get("project") or {}).get("project_id") != project_id:
+                if project_binding(task) != project_id:
                     continue
                 tasks.append(
                     {
@@ -45,6 +47,8 @@ def snapshot(service, project_id):
                             "snapshot_revision",
                             "memory",
                             "completion_evidence",
+                            "deliverable_kind",
+                            "approval_state",
                         )
                     }
                     | {"title": (task.get("request") or {}).get("title")}
@@ -59,7 +63,17 @@ def snapshot(service, project_id):
                     "thread_id": (task.get("origin") or {}).get("thread_id")
                 }
                 tasks[-1]["memory"] = {"id": (task.get("memory") or {}).get("id")}
+                tasks[-1]["memory_confirmed"] = task_memory_confirmed(task)
                 tasks[-1]["completion_evidence"] = bool(task.get("completion_evidence"))
+                tasks[-1]["observed"] = {
+                    k: (task.get("observed") or {}).get(k)
+                    for k in ("status", "workState", "hasPendingChildRuns")
+                }
+                latest = (task.get("events") or [{}])[-1]
+                tasks[-1]["latest_event"] = {
+                    "phase": latest.get("phase"),
+                    "proof": {"progress": (latest.get("proof") or {}).get("progress")},
+                }
     finally:
         if owned:
             store.close()

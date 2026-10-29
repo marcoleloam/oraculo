@@ -238,7 +238,10 @@ def test_invalid_terminal_proof_cannot_change_state_or_release_reservation(
 def test_changed_ledger_invalidates_fresh_host_proof(world):
     proof = witness(world)
     mutate(
-        world, lambda _, store: store.update(world["submitted_task"], "executing", {"new": True})
+        world,
+        lambda _, store: store.update(
+            world["submitted_task"], "executing", {"new": True}
+        ),
     )
     with pytest.raises(StateError, match="binding_changed"):
         prove(world, proof)
