@@ -83,7 +83,7 @@ permanece acessível. Não há alegação de suporte nativo a eventos invisívei
 
 ## Tarefas por projeto com o daemon já instalado
 
-`experience serve` é um painel pequeno de tarefas, separado do pacote de memória.
+`experience serve` é uma central de tarefas, separada do pacote de memória.
 A CLI candidata pode executá-lo contra um daemon que já ofereça `task list/status`
 (`managed.read`, protocolo 1), sem ativar uma release ou reiniciar o serviço:
 
@@ -110,10 +110,40 @@ projeto pela URL, listagem de diretórios ou arquivos locais. Bind é exclusivam
 IPv4 loopback; não há opção para publicar na rede. Continua sendo uma interface
 privada local, sem autenticação entre usuários/processos da mesma máquina.
 
+O projeto aparece no cabeçalho e em cada linha, junto do título e de um ID curto
+de dez caracteres (atalho visual, sem substituir o ID completo). A lista compacta
+mostra atividade ou impedimento, estado e última mudança. Expandir uma linha revela
+atividade completa, próxima ação, motivo e resultado do trabalho, além dos links
+separados de origem e executor. **Identificação e observações** expõe ID completo,
+projeto canônico, etapa, horário, execução observada, código de impedimento e revisão.
+Títulos, atividades e motivos são texto, sem interpretar HTML/Markdown. Datas na
+lista usam o fuso do navegador; os detalhes preservam a data fornecida pelo serviço.
+Ausência de horário permanece desconhecida e fica depois das datas conhecidas.
+
+**Em aberto** é a seleção inicial; **Histórico** reúne trabalho concluído,
+resultados negativos/parados/cancelados e substituições registradas. Um run
+`completed` sem certificação continua em aberto, aguardando validação. Bloqueio
+com resultado ainda pendente também permanece em aberto. **Todas** permite
+pesquisar ambas as seleções. Essa organização de leitura não modifica o lifecycle.
+
+A busca local inclui título, ID completo ou curto (também com `#`), projeto,
+atividade, etapa e motivo/código de impedimento; ignora maiúsculas e acentos.
+Os botões de resumo contam a seleção de período e busca, antes do filtro de estado;
+clicar em um estado aplica esse filtro, clicar novamente o remove. A contagem da
+lista mostra quantas tarefas passaram pelo filtro e o total da seleção. A ordenação
+inicial coloca bloqueadas/paradas antes de aguardando e executando, usando a última
+mudança como desempate; **Mudança mais recente** ordena só por data. Não há
+classificação inferida de severidade ou urgência. O projeto continua fixo, sem
+seletor global nem expansão de acesso a outros projetos.
+
 O botão **Atualizar agora** e a atualização a cada 15 segundos consultam o serviço.
-Falha/timeout limpa os cards e indica **estado atual desconhecido**, preservando
-somente a hora da última consulta bem-sucedida. Respostas usam `Cache-Control:
-no-store`. Filtros de estado e busca funcionam sobre a observação recebida:
+Falha/timeout oculta a lista, substitui as contagens por **—** e indica **estado
+atual desconhecido**, preservando a hora da última consulta bem-sucedida. Não exibe
+zero tarefas como resposta de falha. Filtros, detalhes abertos e foco são preservados
+na recuperação e nas atualizações de linhas que continuam presentes; linhas são
+reutilizadas pelo ID completo. Nenhum snapshot antigo é exibido como estado atual.
+Uma consulta válida sem tarefas possui mensagem de vazio própria. Respostas usam
+`Cache-Control: no-store`. Os estados preservam a projeção `task_tracking`:
 
 - **Aguardando / fila:** preparação, espera por capacidade, validação, gravação
   de memória, aprovação pendente ou run terminado sem certificação suficiente.
@@ -128,6 +158,14 @@ O resultado do trabalho, a fase de publicação e a implantação permanecem cam
 conceitualmente separados: trabalho concluído não prova PR integrado ou rollout.
 Links de origem e executor aparecem separadamente quando disponíveis. Não há ETA,
 percentual ou sucesso inferido apenas de um run `completed`.
+
+O desenho usa grafite, âmbar discreto e estados com rótulos textuais; não depende
+somente de cor. Layout adapta-se a 390px sem rolagem horizontal. Busca e filtros
+têm labels, foco visível e mensagens de consulta/contagem acessíveis. Detalhes usam
+disclosure HTML nativo, com teclado; **Fechar detalhes** ou Escape devolvem foco à
+linha. Sem imagens, fontes remotas, CDN ou dependência nova. CSP e limite loopback
+continuam iguais. A origem valida e inicia o processo HTTP candidato; esta mudança
+não instala, reinicia ou altera o daemon.
 
 ### Botão de projeto no T3
 
