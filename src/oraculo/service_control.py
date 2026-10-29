@@ -72,10 +72,10 @@ def maintenance_acceptance(controller, observed):
 def legacy_dispatch_evidence(data, max_attempts):
     """Corroborate the scalar health with every queued job's dispatch receipt.
 
-    One dispatcher pass keeps only the last health it wrote, so an exhausted
-    job could mask another job's live coordinator, pending intent or unknown
-    run. Every queued dispatch must therefore be sent, carry its run identity
-    and be the final retry.
+    Older daemons keep only the last health written in a dispatcher pass.
+    Newer daemons aggregate current job diagnostics, but every queued dispatch
+    must still be sent, carry its run identity and be the final retry. When a
+    diagnostic is present, require its explicit exhaustion observation too.
     """
     exhausted = []
     for job in data.get("jobs") or []:
@@ -94,6 +94,15 @@ def legacy_dispatch_evidence(data, max_attempts):
             or not isinstance(run_id, str)
             or not run_id
             or not final
+            or (
+                "reason" in dispatch
+                and (
+                    dispatch["reason"] != "dispatch_attempts_exhausted"
+                    or (dispatch.get("observation") or {}).get("run_id") != run_id
+                    or (dispatch.get("observation") or {}).get("basis")
+                    != "coordinator_read"
+                )
+            )
         ):
             raise RuntimeError(
                 "legacy_dispatch_unproven",

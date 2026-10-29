@@ -256,10 +256,15 @@ operações continuam exigidos como antes.
 O aceite exige um segundo `status.get` com o mesmo `health` e a mesma identidade
 (PID do launchd, release `current`, caminho e hash da configuração, protocolo 1),
 plist gerenciado igual ao da release e job carregado igual a ele
-(`degraded_service_identity_unproven`, `plist_runtime_mismatch`). Como `health`
-guarda só o último sinal de cada passagem do despachante, todo job enfileirado
-com despacho precisa estar enviado, com `run_id` e na última tentativa
-(`legacy_dispatch_unproven`); assim um job esgotado não mascara outro. Ficam
+(`degraded_service_identity_unproven`, `plist_runtime_mismatch`). Daemons antigos
+guardavam só o último sinal de cada passagem; os novos agregam diagnósticos dos
+jobs atuais e preservam observações de exaustão durante drenagem/restart. Com
+capacidade zero, somente despachos finais já enviados podem ser observados para
+corroborar também o primeiro bootstrap legado, sem abrir admissão. Em ambos,
+todo job enfileirado com despacho precisa estar enviado, com `run_id` e na última
+tentativa (`legacy_dispatch_unproven`). Quando o diagnóstico novo está presente,
+o aceite também exige reason de exaustão e observação do mesmo run via
+`coordinator_read`; assim um job esgotado não mascara outro. Ficam
 fora da lista `awaiting_coordinator` (coordenador vivo pode reivindicar uma
 vaga) e `dispatch_identity_unknown` (efeito no host incerto); qualquer outro
 `health` continua recusado com `service_state_unproven`. O `health` observado e
