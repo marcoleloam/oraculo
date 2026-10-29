@@ -1,5 +1,6 @@
 """Synthetic project view through the real daemon socket and loopback HTTP."""
 
+import asyncio
 import copy
 import json
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ from threading import Thread
 import pytest
 
 from oraculo.presentation import task_tracking
-from oraculo.task_panel import make_server, project_tasks
+from oraculo.task_panel import all_project_tasks, make_server, project_tasks
 from oraculo.task_store import TaskStore
 
 
@@ -156,8 +157,10 @@ async def test_no_offline_ledger_fallback_on_socket_failure(service_config):
 
 
 @contextmanager
-def server(config=None):
-    with make_server(config, "alpha", 0) as http:
+def server(config=None, *, all_projects=False):
+    with make_server(
+        config, None if all_projects else "alpha", 0, all_projects=all_projects
+    ) as http:
         thread = Thread(target=http.serve_forever)
         thread.start()
         try:
@@ -413,3 +416,293 @@ def test_invalid_daemon_presentation_fields_use_structured_fallback():
     assert tracking["title"] == task["title"]
     assert tracking["activity"] == "O agente está trabalhando na tarefa."
     assert tracking["updated_at"] == "desconhecida"
+
+
+@pytest.fixture
+def global_catalog(running_service):
+    """Only alpha/beta/gamma are allowed; gamma has no tasks."""
+    service = running_service
+    for identifier in ("beta", "gamma", "excluded", "removed"):
+        path = service.config.projects_root / identifier
+        path.mkdir()
+        service.state.register_project(
+            identifier,
+            str(path),
+            "unregistered" if identifier == "removed" else "registered",
+        )
+    service.state.register_project(
+        "outside", str(service.config.projects_root.parent / "outside")
+    )
+    service.config.allowed_projects = [
+        service.config.projects_root / identifier
+        for identifier in ("alpha", "beta", "gamma", "removed")
+    ]
+    return service
+
+
+async def test_global_catalog_scope_binding_empty_and_minimal_projection(
+    global_catalog,
+):
+    service = global_catalog
+    store = TaskStore(service.config.state_dir / "managed-tasks.sqlite3")
+    fixtures = [
+        ("alpha", None, "Título igual"),
+        ("beta", None, "Título igual"),
+        ("alpha", "beta", "Destino resolvido"),
+        ("unknown", "alpha", "Origem desconhecida, destino válido"),
+        ("alpha", "unknown", "PRIVATE_UNKNOWN_DESTINATION"),
+        ("alpha", "excluded", "PRIVATE_EXCLUDED_DESTINATION"),
+        ("alpha", "removed", "PRIVATE_REMOVED_DESTINATION"),
+        ("alpha", "outside", "PRIVATE_OUTSIDE_DESTINATION"),
+        ("unknown", None, "PRIVATE_UNKNOWN_ORIGIN"),
+        ("excluded", None, "PRIVATE_EXCLUDED_ORIGIN"),
+        ("removed", None, "PRIVATE_REMOVED_ORIGIN"),
+        ("outside", None, "PRIVATE_OUTSIDE_ORIGIN"),
+    ]
+    for i, (origin, destination, title) in enumerate(fixtures):
+        task = store.create(
+            dict(thread_id=f"origin-{i}", run_id="run", project_id=origin),
+            f"synthetic-{i}",
+            dict(title=title, text="PRIVATE_PROMPT", cwd="PRIVATE_CWD"),
+        )
+        store.update(
+            task["id"],
+            "executing",
+            {"synthetic": True},
+            project=dict(
+                project_id=destination,
+                project_path="/PRIVATE_REQUESTED_PATH/forged-name",
+            )
+            if destination
+            else None,
+            report={"summary": "PRIVATE_REPORT"},
+            context={"body": "PRIVATE_CONTEXT"},
+            observed={"status": "completed"},
+        )
+    original = [
+        store.get(t[0]) for t in store.db.execute("SELECT id FROM managed_tasks")
+    ]
+    snapshot = await all_project_tasks(service.config)
+    assert snapshot["mode"] == "all"
+    assert snapshot["source"] == "service" and snapshot["fetched_at"]
+    assert snapshot["projects"] == [
+        dict(id=p, title=p) for p in ("alpha", "beta", "gamma")
+    ]
+    assert len(snapshot["tasks"]) == 4
+    assert [t["project_id"] for t in snapshot["tasks"]].count("alpha") == 2
+    assert [t["project_id"] for t in snapshot["tasks"]].count("beta") == 2
+    identical = [t for t in snapshot["tasks"] if t["title"] == "Título igual"]
+    assert len({t["id"] for t in identical}) == 2
+    assert {t["project_id"] for t in identical} == {"alpha", "beta"}
+    assert all(
+        t["tracking"]["state"] == "waiting" and not t["history"]
+        for t in snapshot["tasks"]
+    )
+    assert all(t["project_title"] == t["project_id"] for t in snapshot["tasks"])
+    assert not any(t["project_id"] == "gamma" for t in snapshot["tasks"])
+    assert "PRIVATE_" not in json.dumps(snapshot)
+    assert set(snapshot) == {"mode", "projects", "source", "fetched_at", "tasks"}
+    assert set(snapshot["tasks"][0]) == {
+        "id",
+        "short_id",
+        "project_id",
+        "project_title",
+        "title",
+        "tracking",
+        "history",
+        "observed_at",
+        "snapshot_revision",
+    }
+    assert original == [
+        store.get(t[0]) for t in store.db.execute("SELECT id FROM managed_tasks")
+    ]
+    assert service.memory_cycles.list() == []
+    assert not service.state.connection.execute(
+        "SELECT * FROM managed_reservations"
+    ).fetchall()
+    store.close()
+
+
+async def test_global_catalog_names_come_only_from_registered_paths(global_catalog):
+    service = global_catalog
+    root = service.config.projects_root
+    long_name = '<img src=x onerror="alert(1)">' + "muito-longo-" * 20
+    # Similar display names never merge IDs or capture tasks in an empty project.
+    for identifier in ("alpha", "beta"):
+        path = root / identifier / long_name
+        service.state.register_project(identifier, str(path))
+    service.config.allowed_projects = None
+    result = await all_project_tasks(service.config)
+    named = [p for p in result["projects"] if p["id"] in {"alpha", "beta"}]
+    assert len(named) == 2 and named[0]["title"] == named[1]["title"]
+    assert "<img" in named[0]["title"]
+    assert all(set(p) == {"id", "title"} for p in result["projects"])
+    assert str(root) not in json.dumps(result)
+
+
+@pytest.mark.parametrize("failed_kind", ["status.get", "managed.read"])
+async def test_global_partial_failure_never_serves_partial_snapshot(
+    global_catalog, monkeypatch, failed_kind
+):
+    import oraculo.cli as cli
+
+    service = global_catalog
+    original = cli.request
+    sent = []
+
+    async def request(config, envelope):
+        sent.append(envelope)
+        if envelope["kind"] == failed_kind:
+            return dict(ok=False, error={"message": "PRIVATE_SERVICE_ERROR"})
+        return await original(config, envelope)
+
+    monkeypatch.setattr(cli, "request", request)
+    with server(service.config, all_projects=True) as http:
+        status, body, headers = await asyncio.to_thread(get, http, "/api/tasks")
+        assert status == 503
+        assert json.loads(body)["error"] == "service_unavailable"
+        assert "projects" not in json.loads(body) and "PRIVATE" not in body
+        assert headers["Cache-Control"] == "no-store"
+    assert all(e["kind"] in {"status.get", "managed.read"} for e in sent)
+    for envelope in sent:
+        assert envelope["project_id"] == "*"
+        assert envelope["payload"] == (
+            {} if envelope["kind"] == "status.get" else dict(action="list", payload={})
+        )
+
+
+async def test_global_http_and_fixed_mode_isolation_through_real_socket(global_catalog):
+    service = global_catalog
+    store = TaskStore(service.config.state_dir / "managed-tasks.sqlite3")
+    for project in ("alpha", "beta"):
+        store.create(
+            dict(project_id=project, thread_id=project, run_id="run"),
+            "same",
+            {"title": f"Visible {project}"},
+        )
+    with (
+        server(service.config) as fixed,
+        server(service.config, all_projects=True) as global_http,
+    ):
+        status, body, _ = await asyncio.to_thread(get, global_http, "/api/tasks")
+        assert status == 200
+        assert {t["project_id"] for t in json.loads(body)["tasks"]} == {"alpha", "beta"}
+        status, body, _ = await asyncio.to_thread(get, fixed, "/api/tasks")
+        assert status == 200 and "Visible beta" not in body
+        assert "projects" not in json.loads(body)
+        assert 'data-mode="all"' in (await asyncio.to_thread(get, global_http))[1]
+        assert 'data-mode="project"' in (await asyncio.to_thread(get, fixed))[1]
+        for http in (fixed, global_http):
+            for path in (
+                "/?project=unknown",
+                "/api/tasks?project=beta",
+                "/api/tasks?all-projects=true",
+                "/config.toml",
+            ):
+                assert (await asyncio.to_thread(get, http, path))[0] == 404
+            assert (await asyncio.to_thread(get, http, headers={"Host": "localhost"}))[
+                0
+            ] == 403
+            assert (
+                await asyncio.to_thread(
+                    get, http, "/api/tasks", {"Sec-Fetch-Site": "cross-site"}
+                )
+            )[0] == 403
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {},
+        {"projects": None},
+        {"projects": []},
+        {"runtime": "invalid", "projects": []},
+        {"runtime": {"protocol_version": 1}, "projects": [None]},
+        {
+            "runtime": {"protocol_version": 1},
+            "projects": [{"id": "alpha", "status": "registered"}],
+        },
+    ],
+)
+async def test_invalid_catalog_is_unavailable_instead_of_empty(monkeypatch, data):
+    import oraculo.cli as cli
+
+    async def request(*_):
+        return dict(ok=True, data=data)
+
+    monkeypatch.setattr(cli, "request", request)
+    with server(all_projects=True) as http:
+        assert get(http, "/api/tasks")[0] == 503
+
+
+async def test_global_socket_unavailable_has_no_offline_fallback(service_config):
+    with pytest.raises(OSError):
+        await all_project_tasks(service_config[0])
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {"source": "local_ledger", "protocol_version": 1, "tasks": []},
+        {"source": "service", "protocol_version": 2, "tasks": []},
+        {"source": "service", "protocol_version": 1, "tasks": None},
+        {"source": "service", "protocol_version": 1, "tasks": [None]},
+    ],
+)
+async def test_invalid_task_list_never_uses_successful_catalog(
+    global_catalog, monkeypatch, data
+):
+    import oraculo.cli as cli
+
+    original = cli.request
+
+    async def request(config, envelope):
+        if envelope["kind"] == "managed.read":
+            return dict(ok=True, data=data)
+        return await original(config, envelope)
+
+    monkeypatch.setattr(cli, "request", request)
+    with server(global_catalog.config, all_projects=True) as http:
+        status, body, _ = await asyncio.to_thread(get, http, "/api/tasks")
+        assert status == 503 and "projects" not in json.loads(body)
+
+
+async def test_entire_authorized_catalog_can_be_empty(global_catalog):
+    service = global_catalog
+    service.config.allowed_projects = []
+    result = await all_project_tasks(service.config)
+    assert result["projects"] == [] and result["tasks"] == []
+    assert result["source"] == "service" and result["fetched_at"]
+
+
+def test_global_scope_must_be_explicit_and_exclusive():
+    for project, all_projects in (
+        (None, False),
+        ("alpha", True),
+        ("*", False),
+        (None, "true"),
+    ):
+        with pytest.raises(ValueError):
+            make_server(None, project, 0, all_projects=all_projects)
+
+
+def test_cli_global_scope_and_exclusion(monkeypatch, service_config):
+    from oraculo.cli import main
+
+    calls = []
+
+    def serve(config, project, port, **kwargs):
+        calls.append((project, port, kwargs))
+
+    monkeypatch.setattr("oraculo.task_panel.serve", serve)
+    args = ["--config", str(service_config[1]), "experience", "serve"]
+    assert main([*args, "--all-projects", "--port", "8768"]) == 0
+    assert calls == [(None, 8768, {"all_projects": True})]
+    for scope in ([], ["--all-projects", "--project", "alpha"]):
+        with pytest.raises(SystemExit) as error:
+            main([*args, *scope])
+        assert error.value.code == 2
+    assert len(calls) == 1

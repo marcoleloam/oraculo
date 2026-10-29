@@ -81,7 +81,7 @@ de usar mensagens legíveis; parser oficial aceita os dois formatos. Detalhes HT
 podem não colapsar em todos os clientes T3: o resumo continua primeiro e o protocolo
 permanece acessível. Não há alegação de suporte nativo a eventos invisíveis.
 
-## Tarefas por projeto com o daemon já instalado
+## Central de tarefas com o daemon já instalado
 
 `experience serve` é uma central de tarefas, separada do pacote de memória.
 A CLI candidata pode executá-lo contra um daemon que já ofereça `task list/status`
@@ -89,19 +89,25 @@ A CLI candidata pode executá-lo contra um daemon que já ofereça `task list/st
 
 ```sh
 oraculo --config /caminho/privado/config.toml experience serve --project alpha --port 8765
+# Visão global, explicitamente habilitada no processo local:
+oraculo --config /caminho/privado/config.toml experience serve --all-projects --port 8766
 ```
 
 O processo permanece em primeiro plano. Abra `http://127.0.0.1:8765/` e encerre com
 Ctrl-C. Não usa launchd, não cria tarefa, não inicia executor e não modifica
-capacidade/memória. Consulta somente a API oficial `managed.read` com ação `list`;
-não abre SQLite/vault e não faz fallback offline. A listagem recebida do daemon
+capacidade/memória. O modo fixo consulta somente a API oficial `managed.read` com
+ação `list`. O modo global usa também `status.get`, já disponível no protocolo 1,
+porque a listagem de tarefas não contém projetos vazios. Não exige upgrade do daemon.
+Não abre SQLite/vault e não faz fallback offline. A listagem recebida do daemon
 pode conter vários projetos; o servidor filtra antes de produzir a resposta HTTP
 com somente título, identidade, apresentação, observações e links necessários.
 Nenhum relatório, contexto, conteúdo de fonte, recibo ou caminho de projeto é
 servido. Uma consulta não observa novamente o host: mostra a última observação
 registrada pelo daemon, com data distinta da hora da consulta ao serviço.
 
-O projeto fica fixo no argumento de inicialização. A atribuição canônica resolvida
+`--project` e `--all-projects` são mutuamente exclusivos e uma das opções é
+obrigatória. Com `--project`, o projeto fica fixo no argumento de inicialização;
+não há catálogo global na resposta HTTP. A atribuição canônica resolvida
 prevalece; antes dessa resolução, a tarefa aparece no projeto da origem vinculada
 pelo host. Nunca se infere projeto por título, basename ou caminho solicitado.
 IDs desconhecidos não expõem tarefas de outro projeto. O servidor só aceita o Host
@@ -109,6 +115,31 @@ IDs desconhecidos não expõem tarefas de outro projeto. O servidor só aceita o
 projeto pela URL, listagem de diretórios ou arquivos locais. Bind é exclusivamente
 IPv4 loopback; não há opção para publicar na rede. Continua sendo uma interface
 privada local, sem autenticação entre usuários/processos da mesma máquina.
+
+No modo global, a visão inicial é **Todos os projetos**, com tarefas agrupadas por
+projeto e contagens por grupo; a ordenação escolhida vale dentro de cada grupo.
+O catálogo aceita somente
+projetos com `status=registered` cujo caminho passa por `config.project_in_scope`
+(raiz e `allowed_projects`). Os demais campos privados de `status.get` são
+descartados no processo local; o catálogo HTTP contém apenas **`id` e `title`**.
+O nome vem do último componente do caminho registrado, sem servir o caminho;
+IDs completos diferenciam nomes iguais ou parecidos. Não há varredura de fontes
+ou diretórios de clientes. Projetos autorizados sem tarefas permanecem no catálogo
+com zero verdadeiro. Tarefas desconhecidas, não registradas ou fora do escopo não
+entram na lista, nas contagens ou na busca. Um destino resolvido fora do catálogo
+não volta ao projeto de origem; o fallback de origem vale só antes da resolução e
+quando a origem está no catálogo autorizado. Títulos e caminhos solicitados não
+atribuem projetos.
+
+O seletor **Projeto** mostra nome, ID e contagem por projeto nos filtros atuais
+(período, busca e estado). Selecionar um projeto restringe lista, resumo, busca e
+histórico; **Todos os projetos** restaura a visão geral sem apagar os outros filtros.
+Cada linha mostra também o ID do projeto no modo global. A seleção é local ao
+navegador dentro do snapshot global explicitamente habilitado; parâmetros de URL
+não alteram o escopo de nenhum dos modos. Se um projeto selecionado sair do
+catálogo, a central mantém seu ID e informa **Projeto selecionado indisponível**,
+com contagens desconhecidas, até o usuário escolher outro projeto ou voltar a Todos.
+Um catálogo ainda desconhecido não apresenta um projeto fictício como válido.
 
 O projeto aparece no cabeçalho e em cada linha, junto do título e de um ID curto
 de dez caracteres (atalho visual, sem substituir o ID completo). A lista compacta
@@ -128,13 +159,15 @@ pesquisar ambas as seleções. Essa organização de leitura não modifica o lif
 
 A busca local inclui título, ID completo ou curto (também com `#`), projeto,
 atividade, etapa e motivo/código de impedimento; ignora maiúsculas e acentos.
-Os botões de resumo contam a seleção de período e busca, antes do filtro de estado;
+Os botões de resumo contam a seleção de projeto, período e busca, antes do filtro de estado;
 clicar em um estado aplica esse filtro, clicar novamente o remove. A contagem da
-lista mostra quantas tarefas passaram pelo filtro e o total da seleção. A ordenação
+lista mostra quantas tarefas passaram pelo filtro e o total da seleção. Os períodos
+contam projeto, busca e estado; o seletor de projetos conta período, busca e estado.
+O texto junto do resumo identifica a seleção atual e explica seu total antes do
+filtro de estado. A ordenação
 inicial coloca bloqueadas/paradas antes de aguardando e executando, usando a última
 mudança como desempate; **Mudança mais recente** ordena só por data. Não há
-classificação inferida de severidade ou urgência. O projeto continua fixo, sem
-seletor global nem expansão de acesso a outros projetos.
+classificação inferida de severidade ou urgência.
 
 O botão **Atualizar agora** e a atualização a cada 15 segundos consultam o serviço.
 Falha/timeout oculta a lista, substitui as contagens por **—** e indica **estado
@@ -166,6 +199,15 @@ disclosure HTML nativo, com teclado; **Fechar detalhes** ou Escape devolvem foco
 linha. Sem imagens, fontes remotas, CDN ou dependência nova. CSP e limite loopback
 continuam iguais. A origem valida e inicia o processo HTTP candidato; esta mudança
 não instala, reinicia ou altera o daemon.
+
+No modo global, catálogo e lista precisam ter consultas completas bem-sucedidas;
+uma falha em qualquer uma torna a central indisponível, sem combinar resposta parcial
+com catálogo ou tarefas anteriores. São leituras sequenciais do serviço, sem
+transação distribuída nem nova observação do host. Seleção de projeto, busca,
+ordenação, foco e disclosures de linhas presentes sobrevivem aos refreshes.
+O snapshot global contém campos mínimos das tarefas de todos os projetos autorizados;
+use `--project` para servir somente um projeto a este navegador. A origem decide
+quando iniciar o modo global; os scripts existentes de outros projetos continuam fixos.
 
 ### Botão de projeto no T3
 

@@ -1,4 +1,4 @@
-"""Loopback project task view using the daemon's existing read-only API only."""
+"""Loopback task views using the daemon's existing read-only APIs only."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def project_binding(task):
     return (task.get("origin") or {}).get("project_id")
 
 
-async def project_tasks(config, project_id):
+async def read_tasks(config):
     # Same official socket request as `task list`, with no offline fallback.
     from oraculo.cli import make_envelope, request
 
@@ -32,43 +32,120 @@ async def project_tasks(config, project_id):
     if result.get("ok") is not True:
         raise ValueError("task_panel_service_unavailable")
     data = result["data"]
+    if not isinstance(data, dict):
+        raise ValueError("task_panel_service_unproven")
     if data.get("source") != "service" or data.get("protocol_version") != 1:
         raise ValueError("task_panel_service_unproven")
+    if not isinstance(data.get("tasks"), list) or not all(
+        isinstance(task, dict) for task in data["tasks"]
+    ):
+        raise ValueError("task_panel_tasks_invalid")
+    return data["tasks"]
+
+
+def task_row(task, project_id, title):
+    tracking = task_tracking(task)
+    observed_at = task.get("observed_at")
+    if (
+        type(observed_at) not in {int, float}
+        or not math.isfinite(observed_at)
+        or observed_at < 0
+    ):
+        observed_at = None
+    return dict(
+        id=task["id"],
+        short_id=task["id"].removeprefix("task-")[:10],
+        project_id=project_id,
+        project_title=title,
+        title=tracking["title"],
+        tracking=tracking,
+        history=tracking["state"] == "completed"
+        or task.get("work_status") in {"failed", "stopped", "cancelled"}
+        or task.get("phase") == "superseded",
+        observed_at=observed_at,
+        snapshot_revision=task.get("snapshot_revision"),
+    )
+
+
+async def project_tasks(config, project_id):
+    tasks = await read_tasks(config)
     rows = []
     title = project_id
-    for task in data["tasks"]:
+    for task in tasks:
         if project_binding(task) != project_id:
             continue
         path = (task.get("project") or {}).get("project_path")
         if path:
             title = plain(PurePosixPath(path).name)
-        tracking = task_tracking(task)
-        observed_at = task.get("observed_at")
-        if (
-            type(observed_at) not in {int, float}
-            or not math.isfinite(observed_at)
-            or observed_at < 0
-        ):
-            observed_at = None
-        rows.append(
-            dict(
-                id=task["id"],
-                short_id=task["id"].removeprefix("task-")[:10],
-                project_id=project_id,
-                title=tracking["title"],
-                tracking=tracking,
-                history=tracking["state"] == "completed"
-                or task.get("work_status") in {"failed", "stopped", "cancelled"}
-                or task.get("phase") == "superseded",
-                observed_at=observed_at,
-                snapshot_revision=task.get("snapshot_revision"),
-            )
-        )
+        rows.append(task_row(task, project_id, title))
     for row in rows:
         row["project_title"] = title
     return dict(
         project_id=project_id,
         project_title=title,
+        source="service",
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+        tasks=rows,
+    )
+
+
+async def project_catalog(config):
+    from oraculo.cli import make_envelope, request
+
+    # Protocol 1 has no project-only read endpoint. Do not retain the other
+    # private status fields or forward the status response to HTTP.
+    result = await request(config, make_envelope("status.get", "*", {}))
+    if result.get("ok") is not True:
+        raise ValueError("task_panel_catalog_unavailable")
+    data = result["data"]
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("runtime"), dict)
+        or data["runtime"].get("protocol_version") != 1
+    ):
+        raise ValueError("task_panel_catalog_unproven")
+    projects = data["projects"]
+    del result, data
+    if not isinstance(projects, list):
+        raise ValueError("task_panel_catalog_invalid")
+    catalog = {}
+    for project in projects:
+        if not isinstance(project, dict):
+            raise ValueError("task_panel_catalog_invalid")
+        if project["status"] != "registered":
+            continue
+        identifier, path = project["id"], project["path"]
+        if not isinstance(identifier, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,200}", identifier
+        ):
+            raise ValueError("task_panel_catalog_invalid")
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError("task_panel_catalog_invalid")
+        if not config.project_in_scope(path):
+            continue
+        if identifier in catalog:
+            raise ValueError("task_panel_catalog_duplicate")
+        catalog[identifier] = dict(
+            id=identifier, title=plain(PurePosixPath(path).name) or identifier
+        )
+    return catalog
+
+
+async def all_project_tasks(config):
+    catalog = await project_catalog(config)
+    tasks = await read_tasks(config)
+    rows = []
+    for task in tasks:
+        # A resolved destination always wins, even if it is no longer allowed.
+        # Origin is a fallback only for an unresolved task in this catalog.
+        identifier = project_binding(task)
+        if identifier in catalog:
+            rows.append(task_row(task, identifier, catalog[identifier]["title"]))
+    return dict(
+        mode="all",
+        projects=sorted(
+            catalog.values(), key=lambda p: (p["title"].casefold(), p["id"])
+        ),
         source="service",
         fetched_at=datetime.now(timezone.utc).isoformat(),
         tasks=rows,
@@ -113,6 +190,11 @@ button[aria-pressed=true]{border-color:var(--gold);background:#353025;color:#f4d
 .eyebrow{color:var(--gold);font-size:11px;letter-spacing:.12em;font-weight:700;text-transform:uppercase;margin:0 0 6px}
 h1{font-size:clamp(28px,4vw,34px);line-height:1.15;letter-spacing:-.035em;margin:0 0 10px;font-weight:650}
 .intro p:last-child{color:var(--muted);margin:0;max-width:620px}
+.project-navigation{display:flex;flex-wrap:wrap;align-items:end;gap:10px 16px;margin:0 0 20px}
+.project-navigation label{flex:1;min-width:0;max-width:740px}
+.project-navigation select{width:100%;min-width:0;text-overflow:ellipsis}
+.project-navigation button{font-size:12px;min-height:39px;flex-shrink:0}
+.project-navigation p{flex-basis:100%;margin:0;color:var(--muted);font-size:11px}
 .connection{display:flex;align-items:center;gap:15px;justify-content:space-between;border-block:1px solid var(--line);padding:12px 0;margin-bottom:20px;min-height:56px}
 .connection p{margin:0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 .connection.failed p{color:var(--blocked)}
@@ -128,7 +210,7 @@ h1{font-size:clamp(28px,4vw,34px);line-height:1.15;letter-spacing:-.035em;margin
 .blocked{color:var(--blocked)}
 .completed{color:var(--completed)}
 .metric .metric-top{color:var(--ink)}
-.metric-note{font-size:11px;color:var(--muted);margin:10px 0 24px}
+.metric-note{font-size:11px;color:var(--muted);margin:10px 0 24px;overflow-wrap:anywhere}
 .toolbar{display:flex;align-items:end;gap:18px;justify-content:space-between;margin:20px 0 16px}
 .segments{display:flex;flex-wrap:wrap;gap:4px}
 .segments button{font-size:12px;padding:8px 12px;background:transparent}
@@ -145,6 +227,8 @@ select{max-width:100%}
 .list-heading button{font-size:11px;padding:5px 9px}
 .columns,.task-summary{display:grid;grid-template-columns:minmax(220px,1.5fr) minmax(180px,1.15fr) 165px 135px;gap:22px;align-items:center}
 .columns{padding:10px 20px;color:var(--muted);font-size:10px;letter-spacing:.09em;text-transform:uppercase}
+.project-group-heading{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 14px;margin:22px 8px 12px;font-size:13px;overflow-wrap:anywhere}
+.project-group-heading span{font-size:11px;color:var(--muted);font-weight:400}
 .task{border-top:1px solid var(--line)}
 .task:last-child{border-bottom:1px solid var(--line)}
 .task[open]{background:var(--surface);border:1px solid #59503f;border-radius:8px;margin:6px 0}
@@ -154,6 +238,7 @@ select{max-width:100%}
 .identity{min-width:0}
 .identity-line{display:flex;gap:9px;font-size:11px;color:var(--muted);align-items:baseline;margin-bottom:5px;flex-wrap:wrap}
 .project-name{color:#d4c4a6}
+.project-name{overflow-wrap:anywhere;min-width:0}
 .short-id{font:11px ui-monospace,SFMono-Regular,Consolas,monospace}
 .task-title{font-size:14px;font-weight:600;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
 .activity{color:#c4c6c8;font-size:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
@@ -207,6 +292,7 @@ select{max-width:100%}
 .private{font-size:10px}
 .scope{margin:16px 0 18px;gap:8px}
 .scope>span:last-child{display:none}
+.project-navigation label{flex-basis:100%}
 .project-pill{flex-wrap:wrap;gap:4px 10px}
 .intro{margin-bottom:20px}
 .intro p:last-child{font-size:13px}
@@ -249,12 +335,13 @@ h1{font-size:30px}
 
 </style>
 </head>
-<body>
+<body data-mode="project">
 <a class="skip" href="#workspace">Ir para tarefas</a>
 <header class="topbar"><div class="shell"><span class="brand">ORÁCULO</span><span class="private">Central local · somente leitura</span></div></header>
 <main class="shell">
-<nav class="scope" aria-label="Projeto selecionado"><span>PROJETO</span><div class="project-pill"><strong id="project">Consultando…</strong><span id="project-id"></span></div><span>Escopo fixo nesta central</span></nav>
+<nav class="scope" aria-label="Projeto selecionado"><span>PROJETO</span><div class="project-pill"><strong id="project">Projeto ainda não consultado</strong><span id="project-id"></span></div><span id="scope-note">Escopo fixo nesta central</span></nav>
 <div class="intro"><div><p class="eyebrow">Central de operações</p><h1>Central de tarefas</h1><p>O trabalho em andamento, os impedimentos e a próxima ação.</p></div></div>
+<nav id="project-nav" class="project-navigation" aria-label="Navegar por projeto" hidden><label for="project-select">Projeto · tarefas nos filtros atuais<select id="project-select" disabled><option disabled>Catálogo ainda indisponível</option></select></label><button id="all-projects" type="button" disabled>Todos os projetos</button><p id="project-count-note">Aguardando catálogo autorizado.</p></nav>
 <div id="connection" class="connection"><p id="health" role="status" aria-live="polite">Consultando serviço…</p><button id="refresh" type="button">Atualizar agora</button></div>
 <section aria-label="Resumo por estado"><div class="metrics" id="metrics">
 <button class="metric" data-state="running" aria-pressed="false"><span class="metric-top">Executando <i class="dot running" aria-hidden="true"></i></span><strong>—</strong><small>Trabalho em andamento</small></button>
@@ -262,7 +349,7 @@ h1{font-size:30px}
 <button class="metric" data-state="blocked" aria-pressed="false"><span class="metric-top">Bloqueadas / paradas <i class="dot blocked" aria-hidden="true"></i></span><strong>—</strong><small>Confira o motivo e a ação</small></button>
 <button class="metric" data-state="completed" aria-pressed="false"><span class="metric-top">Concluídas <i class="dot completed" aria-hidden="true"></i></span><strong>—</strong><small>Trabalho validado</small></button>
 </div><p id="metric-note" class="metric-note">Contagens disponíveis após a consulta.</p></section>
-<section id="workspace" aria-label="Tarefas do projeto" tabindex="-1">
+<section id="workspace" aria-label="Tarefas na seleção" tabindex="-1">
 <div class="toolbar"><div class="segments" role="group" aria-label="Período das tarefas">
 <button type="button" data-period="active" aria-pressed="true">Em aberto<span>—</span></button><button type="button" data-period="history" aria-pressed="false">Histórico<span>—</span></button><button type="button" data-period="all" aria-pressed="false">Todas<span>—</span></button>
 </div><div class="filters"><label class="search" for="query">Buscar tarefa<input id="query" type="search" placeholder="Título, ID, atividade ou motivo" autocomplete="off"></label><label for="state">Estado<select id="state"><option value="">Todos os estados</option><option value="running">Executando</option><option value="waiting">Aguardando / fila</option><option value="blocked">Bloqueada / parada</option><option value="completed">Concluída</option></select></label><label for="sort">Ordenar<select id="sort"><option value="attention">Impedimentos primeiro</option><option value="recent">Mudança mais recente</option></select></label></div></div>
@@ -278,8 +365,14 @@ h1{font-size:30px}
 const byId = id => document.getElementById(id);
 const stateNames = {running:'Executando', waiting:'Aguardando / fila', blocked:'Bloqueada / parada', completed:'Concluída'};
 const periodNames = {active:'Em aberto', history:'Histórico', all:'Todas as tarefas'};
-const entries = new Map();
+const entries = new Map(), projectGroups = new Map();
+const globalMode = document.body.dataset.mode === 'all', projectOptions = new Map();
+let projects = [], selectedProject = '', selectedProjectTitle = '';
 let tasks = [], period = 'active', busy = false, available = false, lastSuccess = null;
+if (globalMode) {
+  byId('project-nav').hidden = false; setText(byId('project'), 'Todos os projetos');
+  setText(byId('scope-note'), 'Projetos autorizados · catálogo ainda indisponível');
+}
 function node(tag, text = '', cls = '') {
   const n = document.createElement(tag); n.textContent = text; if (cls) n.className = cls; return n;
 }
@@ -332,7 +425,7 @@ function createEntry(id) {
 }
 function updateEntry(entry, t) {
   const s = t.tracking;
-  setText(entry.project, t.project_title); setText(entry.short, '#' + t.short_id); entry.short.title = t.id;
+  setText(entry.project, t.project_title + (globalMode ? ' · ' + t.project_id : '')); setText(entry.short, '#' + t.short_id); entry.short.title = t.id;
   setText(entry.title, t.title); setText(entry.fullTitle, t.title);
   setText(entry.activity, s.blocker || s.activity); entry.activity.title = s.blocker || s.activity;
   entry.status.className = 'status ' + s.state; setText(entry.label, stateNames[s.state]);
@@ -347,42 +440,108 @@ function updateEntry(entry, t) {
   }
   entry.links.hidden = entry.origin.hidden && entry.executor.hidden;
 }
+function renderProjects(filtered, projectExists) {
+  const select = byId('project-select');
+  select.disabled = !available; byId('all-projects').disabled = !available;
+  byId('all-projects').setAttribute('aria-pressed', String(!selectedProject));
+  if (!available && !projectOptions.size) return;
+  const counts = new Map(); for (const t of filtered) counts.set(t.project_id, (counts.get(t.project_id) || 0) + 1);
+  const catalog = [{id:'', title:'Todos os projetos'}, ...projects];
+  if (!projectExists) catalog.push({id:selectedProject, title:'Projeto indisponível', missing:true});
+  const ids = new Set(catalog.map(p => p.id));
+  for (const [id, option] of projectOptions) if (!ids.has(id)) { option.remove(); projectOptions.delete(id); }
+  // Reuse options as well as task rows, keeping keyboard focus through refresh.
+  let previous = null;
+  for (const p of catalog) {
+    let option = projectOptions.get(p.id);
+    if (!option) { option = node('option'); option.value = p.id; projectOptions.set(p.id, option); }
+    option.disabled = !!p.missing;
+    const count = available && !p.missing ? (p.id ? counts.get(p.id) || 0 : filtered.length) : '—';
+    setText(option, p.title + (p.id ? ' · ' + p.id : '') + ' · ' + count);
+    const next = previous ? previous.nextSibling : select.firstChild;
+    if (next !== option) select.insertBefore(option, next);
+    previous = option;
+  }
+  for (const option of [...select.options]) if (!projectOptions.has(option.value) || projectOptions.get(option.value) !== option) option.remove();
+  select.value = selectedProject;
+  const current = projects.find(p => p.id === selectedProject);
+  if (current) selectedProjectTitle = current.title;
+  setText(byId('project'), selectedProject ? (projectExists ? selectedProjectTitle : 'Projeto indisponível') : 'Todos os projetos');
+  setText(byId('project-id'), selectedProject);
+  setText(byId('scope-note'), available ? 'Catálogo autorizado · ' + projects.length + ' projetos' : 'Catálogo indisponível · seleção preservada');
+  setText(byId('project-count-note'), available ? 'Contagens por projeto: período, busca e estado atuais. O resumo abaixo usa o projeto selecionado.' : 'Contagens por projeto indisponíveis. Aguarde uma consulta completa.');
+}
 function render() {
   const focus = document.activeElement;
   const query = normalize(byId('query').value).replace(/^#/, ''), state = byId('state').value;
-  const searched = tasks.filter(t => matches(t, query));
+  const projectExists = !globalMode || !selectedProject || projects.some(p => p.id === selectedProject);
+  const known = available && projectExists;
+  const inPeriod = t => period === 'all' || (period === 'history' ? t.history : !t.history);
+  const inState = t => !state || t.tracking.state === state;
+  const searchedAll = tasks.filter(t => matches(t, query));
+  const searched = searchedAll.filter(t => !globalMode || !selectedProject || t.project_id === selectedProject);
   const scoped = searched.filter(t => period === 'all' || (period === 'history' ? t.history : !t.history));
-  const selected = scoped.filter(t => !state || t.tracking.state === state);
+  const selected = scoped.filter(inState);
+  if (globalMode) {
+    renderProjects(searchedAll.filter(t => inPeriod(t) && inState(t)), projectExists);
+  }
   const priority = {blocked:0, waiting:1, running:2, completed:3};
   selected.sort((a,b) => (byId('sort').value === 'attention' ? priority[a.tracking.state] - priority[b.tracking.state] : 0) || recency(b)-recency(a) || a.id.localeCompare(b.id));
   for (const button of document.querySelectorAll('[data-state]')) {
     const key = button.dataset.state, count = scoped.filter(t => t.tracking.state === key).length;
-    setText(button.querySelector('strong'), available ? count : '—'); button.disabled = !available;
+    setText(button.querySelector('strong'), known ? count : '—'); button.disabled = !known;
     button.setAttribute('aria-pressed', String(state === key));
   }
   for (const button of document.querySelectorAll('[data-period]')) {
     const key = button.dataset.period;
-    const count = searched.filter(t => key === 'all' || (key === 'history' ? t.history : !t.history)).length;
-    setText(button.querySelector('span'), ' ' + (available ? count : '—')); button.setAttribute('aria-pressed', String(key === period));
+    const count = searched.filter(inState).filter(t => key === 'all' || (key === 'history' ? t.history : !t.history)).length;
+    setText(button.querySelector('span'), ' ' + (known ? count : '—')); button.setAttribute('aria-pressed', String(key === period));
   }
-  setText(byId('metric-note'), available ? 'Contagens nesta seleção: ' + periodNames[period].toLocaleLowerCase('pt-BR') + (query ? ' para esta busca' : '') + ' · selecione um estado para filtrar.' : 'Contagens indisponíveis. Estado atual desconhecido.');
+  const scopeName = globalMode ? selectedProject ? selectedProjectTitle + ' · ' + selectedProject : 'Todos os projetos' : byId('project').textContent;
+  setText(byId('metric-note'), known ? scopeName + ' · ' + periodNames[period].toLocaleLowerCase('pt-BR') + (query ? ' para esta busca' : '') + ' · resumo antes do filtro de estado.' : 'Contagens indisponíveis. Estado atual desconhecido.');
   setText(byId('list-title'), periodNames[period]);
-  setText(byId('count'), available ? selected.length + (selected.length === 1 ? ' tarefa' : ' tarefas') + ' de ' + scoped.length + (state ? ' · ' + stateNames[state] : '') : 'Contagem indisponível');
+  setText(byId('count'), known ? selected.length + (selected.length === 1 ? ' tarefa' : ' tarefas') + ' de ' + scoped.length + (state ? ' · ' + stateNames[state] : '') : 'Contagem indisponível');
   byId('clear').hidden = !query && !state && period === 'active';
-  byId('columns').hidden = !available || !selected.length;
-  const root = byId('tasks'); root.hidden = !available;
+  byId('columns').hidden = !known || !selected.length;
+  const root = byId('tasks'); root.hidden = !known;
   const ids = new Set(tasks.map(t => t.id)), visibleIds = new Set(selected.map(t => t.id));
   for (const [id, entry] of entries) { if (!ids.has(id)) { entry.detail.remove(); entries.delete(id); } else entry.detail.hidden = !visibleIds.has(id); }
-  let previous = null;
-  for (const t of selected) {
-    let entry = entries.get(t.id); if (!entry) { entry = createEntry(t.id); entries.set(t.id, entry); }
-    updateEntry(entry, t); entry.detail.hidden = false;
-    const next = previous ? previous.nextSibling : root.firstChild;
-    if (next !== entry.detail) root.insertBefore(entry.detail, next);
-    previous = entry.detail;
+  const groups = globalMode ? projects.map(p => ({...p, rows:selected.filter(t => t.project_id === p.id)})) : [{rows:selected}];
+  for (const [id, group] of projectGroups) {
+    if (!projects.some(p => p.id === id)) { group.section.remove(); projectGroups.delete(id); }
+    else group.section.hidden = !selected.some(t => t.project_id === id);
   }
-  byId('empty').hidden = available && selected.length > 0;
-  if (available) {
+  let previousGroup = null;
+  for (const p of groups) {
+    if (!p.rows.length) continue;
+    let container = root;
+    if (globalMode) {
+      let group = projectGroups.get(p.id);
+      if (!group) {
+        const section = node('section', '', 'project-group'), heading = node('h3', '', 'project-group-heading'), name = node('strong'), count = node('span'), list = node('div');
+        heading.append(name, count); section.append(heading, list); group = {section, heading, name, count, list}; projectGroups.set(p.id, group);
+      }
+      group.section.hidden = false; group.section.setAttribute('aria-label', p.title + ' · ' + p.id);
+      setText(group.name, p.title + ' · ' + p.id); setText(group.count, p.rows.length + (p.rows.length === 1 ? ' tarefa' : ' tarefas'));
+      group.heading.hidden = !!selectedProject;
+      const next = previousGroup ? previousGroup.nextSibling : root.firstChild;
+      if (next !== group.section) root.insertBefore(group.section, next);
+      previousGroup = group.section; container = group.list;
+    }
+    let previous = null;
+    for (const t of p.rows) {
+      let entry = entries.get(t.id); if (!entry) { entry = createEntry(t.id); entries.set(t.id, entry); }
+      updateEntry(entry, t); entry.detail.hidden = false;
+      const next = previous ? previous.nextSibling : container.firstChild;
+      if (next !== entry.detail) container.insertBefore(entry.detail, next);
+      previous = entry.detail;
+    }
+  }
+  byId('empty').hidden = known && selected.length > 0;
+  if (available && !projectExists) {
+    setText(byId('empty-title'), 'Projeto selecionado indisponível');
+    setText(byId('empty-message'), 'O projeto ' + selectedProject + ' saiu do catálogo autorizado. Escolha um projeto disponível ou volte a Todos os projetos. A seleção foi mantida.');
+  } else if (known) {
     const filtered = !!query || !!state;
     setText(byId('empty-title'), filtered ? 'Nenhuma tarefa corresponde aos filtros' : period === 'active' ? 'Nenhuma tarefa em aberto' : 'Nenhuma tarefa neste período');
     setText(byId('empty-message'), filtered ? 'Tente outro título, ID, atividade ou motivo, ou limpe os filtros.' : period === 'active' ? 'Consulte o histórico para ver trabalhos encerrados e seus resultados.' : 'A consulta foi concluída. Não há tarefas registradas nesta seleção.');
@@ -396,8 +555,12 @@ async function refresh() {
     let data;
     try { const response = await fetch('/api/tasks', {cache:'no-store', signal:controller.signal}); if (!response.ok) throw Error('unavailable'); data = await response.json(); } finally { clearTimeout(timer); }
     if (!Array.isArray(data.tasks) || data.source !== 'service' || !data.fetched_at) throw Error('invalid');
+    if (globalMode) {
+      if (data.mode !== 'all' || !Array.isArray(data.projects) || !data.projects.every(p => typeof p.id === 'string' && p.id && typeof p.title === 'string')) throw Error('invalid catalog');
+      projects = data.projects;
+    }
     tasks = data.tasks; lastSuccess = data.fetched_at; available = true;
-    setText(byId('project'), data.project_title); setText(byId('project-id'), data.project_id);
+    if (!globalMode) { setText(byId('project'), data.project_title); setText(byId('project-id'), data.project_id); }
     byId('connection').className = 'connection'; setText(byId('health'), 'Consulta ao serviço: ' + stamp(lastSuccess) + ' · estados da última observação registrada.'); render();
   } catch (_) {
     available = false;
@@ -407,6 +570,8 @@ async function refresh() {
   } finally { busy = false; byId('refresh').removeAttribute('aria-busy'); }
 }
 byId('refresh').addEventListener('click', refresh);
+byId('project-select').addEventListener('change', () => { selectedProject = byId('project-select').value; render(); });
+byId('all-projects').addEventListener('click', () => { selectedProject = ''; render(); });
 for (const id of ['state', 'query', 'sort']) byId(id).addEventListener('input', render);
 for (const button of document.querySelectorAll('[data-state]')) button.addEventListener('click', () => { byId('state').value = byId('state').value === button.dataset.state ? '' : button.dataset.state; render(); });
 for (const button of document.querySelectorAll('[data-period]')) button.addEventListener('click', () => { period = button.dataset.period; render(); });
@@ -416,9 +581,12 @@ render(); refresh(); setInterval(refresh,15000);
 </body></html>"""
 
 
-def make_server(config, project_id, port=8765):
-    if not isinstance(project_id, str) or not re.fullmatch(
-        r"[A-Za-z0-9_.-]{1,200}", project_id
+def make_server(config, project_id, port=8765, *, all_projects=False):
+    if type(all_projects) is not bool or (all_projects and project_id is not None):
+        raise ValueError("task_panel_scope_conflict")
+    if not all_projects and (
+        not isinstance(project_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", project_id)
     ):
         raise ValueError("task_panel_project_required")
     if type(port) is not int or not 0 <= port <= 65535:
@@ -444,17 +612,26 @@ def make_server(config, project_id, port=8765):
             self.wfile.write(body)
 
         def do_GET(self):
-            # Fix project at process launch; no query parameters or file serving.
+            # Fix scope at process launch; no query parameters or file serving.
             expected = f"127.0.0.1:{self.server.server_port}"
             if self.headers.get("Host") != expected:
                 self.respond(403, "Forbidden", "text/plain")
             elif self.headers.get("Sec-Fetch-Site") == "cross-site":
                 self.respond(403, "Forbidden", "text/plain")
             elif self.path == "/":
-                self.respond(200, PAGE, "text/html")
+                page = (
+                    PAGE.replace('data-mode="project"', 'data-mode="all"')
+                    if all_projects
+                    else PAGE
+                )
+                self.respond(200, page, "text/html")
             elif self.path == "/api/tasks":
                 try:
-                    result = asyncio.run(project_tasks(config, project_id))
+                    result = asyncio.run(
+                        all_project_tasks(config)
+                        if all_projects
+                        else project_tasks(config, project_id)
+                    )
                 except (OSError, TimeoutError, ValueError, KeyError, TypeError):
                     self.respond(
                         503,
@@ -471,14 +648,15 @@ def make_server(config, project_id, port=8765):
     return HTTPServer(("127.0.0.1", port), Handler)
 
 
-def serve(config, project_id, port):
+def serve(config, project_id, port, *, all_projects=False):
     from oraculo.stdio import print_json
 
-    with make_server(config, project_id, port) as server:
+    with make_server(config, project_id, port, all_projects=all_projects) as server:
         print_json(
             dict(
                 state="serving",
                 project_id=project_id,
+                all_projects=all_projects,
                 url=f"http://127.0.0.1:{server.server_port}/",
                 source="managed.read",
                 read_only=True,
