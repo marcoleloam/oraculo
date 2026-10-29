@@ -75,20 +75,43 @@ class LaunchPreflightError(StateError):
         self.observed = observed or {}
 
 
-def git(cwd: str | Path, *args: str) -> str:
+def git(
+    cwd: str | Path,
+    *args: str,
+    strip=True,
+    error="workspace_git_metadata_unavailable",
+) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C")
     try:
-        return subprocess.run(
+        output = subprocess.run(
             ["git", "-C", str(cwd), *args],
             env=env,
             check=True,
             capture_output=True,
             text=True,
             timeout=15,
-        ).stdout.strip()
+        ).stdout
+        return output.strip() if strip else output
     except (OSError, subprocess.SubprocessError):
-        raise StateError("workspace_git_metadata_unavailable") from None
+        raise StateError(error) from None
+
+
+def unselected_paths(path: str | Path) -> list[str]:
+    """Porcelain -z keeps whitespace literal; renames carry two path records."""
+    records = iter(
+        git(
+            path, "status", "--porcelain=v1", "-z", "--untracked-files=all", strip=False
+        ).split("\0")
+    )
+    paths = set()
+    for record in records:
+        if not record:
+            continue
+        paths.add(record[3:])
+        if "R" in record[:2] or "C" in record[:2]:
+            paths.add(next(records))
+    return sorted(paths)
 
 
 def workspace(path: str | Path) -> dict:
@@ -495,15 +518,30 @@ class ManagedTasks:
             else project["project_path"]
         )
         ws = workspace(parent_path)
-        if ws["dirty"]:
-            raise StateError("dirty_source_commit_selection_required")
         requested_base = req.get("base", "HEAD")
         if not isinstance(requested_base, str) or requested_base.startswith("-"):
             raise StateError("invalid_base_ref")
+        full_sha = bool(re.fullmatch(r"[a-fA-F0-9]{40}", requested_base))
+        if ws["dirty"] and not full_sha:
+            raise StateError("dirty_source_commit_selection_required")
+        if full_sha:
+            requested_base = requested_base.lower()
         base_sha = git(
-            parent_path, "rev-parse", "--verify", requested_base + "^{commit}"
+            parent_path,
+            "rev-parse",
+            "--verify",
+            requested_base + "^{commit}",
+            error="invalid_base_ref",
         )
-        plan = dict(project=project, ws=ws, base_sha=base_sha, native=False)
+        plan = dict(
+            project=project,
+            ws=ws,
+            base_sha=base_sha,
+            native=False,
+            source_dirty=ws["dirty"],
+            source_commit=base_sha,
+            unselected_paths=unselected_paths(parent_path) if ws["dirty"] else [],
+        )
         if independent:
             return plan
         caller = await self._thread(actor["thread_id"])
@@ -655,11 +693,20 @@ class ManagedTasks:
             self.store.update(
                 task_id,
                 "memory_read",
-                {"cycle_id": cycle["id"], "read_receipt": cycle["read_receipt"]},
+                {
+                    "cycle_id": cycle["id"],
+                    "read_receipt": cycle["read_receipt"],
+                    "source_dirty": plan["source_dirty"],
+                    "source_commit": plan["source_commit"],
+                    "unselected_paths": plan["unselected_paths"],
+                },
                 memory=cycle,
                 context=context,
                 base_sha=base_sha,
                 parent_workspace=ws,
+                source_dirty=plan["source_dirty"],
+                source_commit=plan["source_commit"],
+                unselected_paths=plan["unselected_paths"],
             )
             task = self.store.get(task_id)
         if not task.get("launch_arguments"):

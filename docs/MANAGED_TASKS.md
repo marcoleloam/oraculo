@@ -247,10 +247,22 @@ conversa chamadora):
 | `invalid_independent_flag` | `independent` aceita só `true`, `false` ou ausência. |
 | `implicit_top_level_intent_refused` | Intenção top-level persistida por release antiga sem `independent=true` nunca é enviada: `cancel` e novo `start`. |
 
-Erros que já eram persistidos (`dirty_source_commit_selection_required`,
-`invalid_base_ref`, projeto fora do escopo) mantêm o comportamento anterior.
-`resume` de uma tarefa ainda não lançada reaplica a mesma decisão antes de
-reservar capacidade ou consultar memória.
+Erros de seleção de base e de escopo continuam persistidos. Em origem suja,
+`base` precisa ser um SHA completo de 40 caracteres hexadecimais de um commit
+existente no repositório. `HEAD`, branch e SHA abreviado resultam em
+`dirty_source_commit_selection_required`: informe o SHA completo explicitamente.
+SHA inexistente resulta em `invalid_base_ref`, inclusive em origem limpa.
+Nenhuma alteração local é copiada para o filho: a seleção inclui somente o commit.
+Snapshot e prova `memory_read` registram `source_dirty`, `source_commit` resolvido
+e `unselected_paths` (somente caminhos, incluindo origem/destino de renomeações,
+sem conteúdo). Esses caminhos pertencem ao recibo privado, não à publicação.
+
+`resume` de uma tarefa persistida ainda não lançada reavalia a mesma base antes de
+reservar capacidade ou consultar memória. Um pedido antigo com SHA completo pode
+avançar no mesmo ID; um pedido com `HEAD` continua bloqueado em origem suja.
+O gate `native_child_base_not_head` permanece: o SHA completo de um filho nativo
+precisa ser igual ao HEAD do worktree vinculado à origem. Nenhum fallback para
+conversa independente é inferido.
 
 Nenhum modo cria um executor no projeto errado para obter um callback. A UI do
 host pode omitir filhos da lista comum de Threads; o link direto e o status na

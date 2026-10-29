@@ -30,11 +30,29 @@ def dashboard(model: dict) -> str:
             )
         view = entry.get("presentation") or {}
         action = f'<p class="action">{e(view["next_action"])}</p>' if view else ""
+        tracking = entry.get("tracking") or {}
+        if tracking:
+            action = (
+                f"<p><strong>{e(tracking['label'])}</strong> · {e(tracking['phase'])}</p>"
+                f"<p>{e(tracking['activity'])}</p>"
+                f"<p>{e(tracking.get('blocker') or tracking['result'])}</p>"
+                f'<p class="action">{e(tracking["next_action"])}</p>'
+                f"<p>Última observação de execução: {e(tracking['observed_status'])}</p>"
+            )
         conversation = (
             f'<a href="{e(view["url"])}">Abrir conversa da tarefa ↗</a>'
             if view.get("url")
             else ""
         )
+        if tracking:
+            conversation = " · ".join(
+                f'<a href="{e(tracking[key])}">{label} ↗</a>'
+                for key, label in (
+                    ("origin_url", "Conversa de origem"),
+                    ("child_url", "Conversa do executor"),
+                )
+                if tracking.get(key)
+            )
         recurrence = (
             f"<p>Ocorrências declaradas em tarefas: {entry['occurrences']}</p>"
             if entry.get("occurrences")

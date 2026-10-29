@@ -374,3 +374,80 @@ async def test_chunk_integrity_failure_is_not_a_successful_export(
     monkeypatch.setattr(cli, "request", corrupt)
     with pytest.raises(ValueError, match="integrity"):
         await cli.experience_snapshot(service.config, "alpha")
+
+
+async def test_snapshot_includes_early_blocked_progress_and_plan_state(running_service):
+    from oraculo.task_store import TaskStore
+
+    service = running_service
+    store = TaskStore(service.config.state_dir / "managed-tasks.sqlite3")
+    early = store.create(
+        dict(thread_id="demo-origin", run_id="run", project_id="alpha"),
+        "early",
+        {"title": "Demo antes da resolução"},
+    )
+    store.update(
+        early["id"],
+        "blocked",
+        {"reason": "workspace_git_metadata_unavailable"},
+        blocked_reason="workspace_git_metadata_unavailable",
+    )
+    plan = store.create(
+        dict(thread_id="demo-origin", run_id="run", project_id="alpha"),
+        "plan",
+        {"title": "Plano demo"},
+    )
+    store.update(
+        plan["id"],
+        "awaiting_approval",
+        {"progress": "Plano aguardando origem"},
+        project={"project_id": "alpha"},
+        deliverable_kind="plan",
+        approval_state="pending",
+        work_status="succeeded",
+        completion_evidence={"demo": True},
+        observed={"status": "completed"},
+    )
+    value = (
+        await request(service.config, make_envelope("experience.snapshot", "alpha", {}))
+    )["data"]
+    rows = {t["id"]: t for t in value["tasks"]}
+    assert early["id"] in rows and rows[early["id"]]["project"]["project_id"] == "alpha"
+    assert rows[plan["id"]]["deliverable_kind"] == "plan"
+    model = project_model(value, "alpha")
+    rendered = export_files(model)["index.html"]
+    assert "Plano aguardando origem" in rendered
+    assert "Planejamento entregue; aprovação ainda pendente." in rendered
+    assert "Conversa de origem" in rendered
+    assert "Bloqueada / parada" in rendered
+    store.close()
+
+
+def test_cli_panel_uses_fixed_project_and_loopback_entrypoint(
+    monkeypatch, service_config
+):
+    import oraculo.task_panel as panel
+
+    config, path = service_config
+    calls = []
+    monkeypatch.setattr(
+        panel,
+        "serve",
+        lambda cfg, project, port: calls.append((cfg.socket_path, project, port)),
+    )
+    assert (
+        main(
+            [
+                "--config",
+                str(path),
+                "experience",
+                "serve",
+                "--project",
+                "alpha",
+                "--port",
+                "8767",
+            ]
+        )
+        == 0
+    )
+    assert calls == [(config.socket_path, "alpha", 8767)]

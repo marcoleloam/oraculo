@@ -196,7 +196,14 @@ def test_native_stdio_pty_accepts_large_ack_without_canonical_truncation():
     try:
         request = json.loads(process.stdout.readline())
         raw = (
-            json.dumps(make_ack(request, json.dumps({"data": __import__("secrets").token_hex(6000)}).encode()))
+            json.dumps(
+                make_ack(
+                    request,
+                    json.dumps(
+                        {"data": __import__("secrets").token_hex(6000)}
+                    ).encode(),
+                )
+            )
             + "\n"
         ).encode()
         while raw:
