@@ -133,6 +133,117 @@ class Service:
             raise StateError("project_not_registered_or_outside_scope")
         return project
 
+    @property
+    def health(self) -> str:
+        # Connection/core failures take precedence. Dispatcher observations are
+        # tied to current queued jobs, never to the last assignment in a tick.
+        dispatch_health = (
+            "legacy_dispatch_oversize_requires_reconciliation",
+            "dispatch_identity_unknown",
+            "awaiting_coordinator",
+            "dispatch_attempts_exhausted",
+        )
+        if self._health not in {"online", *dispatch_health}:
+            return self._health
+        reasons = {
+            diagnostic["reason"]
+            for job in self.state.list_jobs()
+            if (diagnostic := self.dispatch_diagnostic(job))
+        }
+        return next(
+            (reason for reason in dispatch_health if reason in reasons), "online"
+        )
+
+    @health.setter
+    def health(self, value: str) -> None:
+        self._health = value
+
+    def dispatch_diagnostic(self, job: dict) -> dict | None:
+        """Durable control-delivery evidence, separate from grant admission.
+
+        A terminal coordinator receipt is not an executor result. Observations
+        remain historical host evidence; retries still require a fresh read.
+        """
+        if job["state"] != "queued":
+            return None
+        objective = self.state.get_objective(job["objective_id"])
+        if objective["status"] in {"cancel_requested", "stopped"}:
+            return None
+        count = self.state.connection.execute(
+            "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
+        ).fetchone()[0]
+        base = self.dispatch_key(job["id"], count)
+        latest = self.state._one("SELECT * FROM outbox WHERE id=?", (base,))
+        if not latest:
+            return None
+        number = 1
+        for retry in range(2, self.config.max_dispatch_attempts + 1):
+            following = self.state._one(
+                "SELECT * FROM outbox WHERE id=?", (f"{base}:retry:{retry}",)
+            )
+            if not following:
+                break
+            number, latest = retry, following
+        receipt = self.state.get_meta(f"dispatch_receipt:{latest['id']}", {})
+        run_id = receipt.get("run_id")
+        identified = isinstance(run_id, str) and bool(run_id)
+        observation = self.state.get_meta(f"dispatch_observation:{latest['id']}")
+        # A changed receipt cannot inherit a previous observation.
+        if observation and observation.get("run_id") != receipt.get("run_id"):
+            observation = None
+        reason = "awaiting_coordinator"
+        if latest["state"] == "pending":
+            reason = (
+                observation["reason"]
+                if observation
+                and observation["reason"]
+                == "legacy_dispatch_oversize_requires_reconciliation"
+                else "dispatch_pending"
+            )
+        elif latest["state"] == "sent" and not identified:
+            reason = "dispatch_identity_unknown"
+        elif observation:
+            reason = observation["reason"]
+        action = "Await coordinator; replay only the same durable dispatch intent"
+        if reason == "dispatch_attempts_exhausted":
+            action = (
+                "Resolve the coordinator's reported impediment, then explicitly "
+                "use grant.acquire for this same job with the current coordinator "
+                "identity; do not reset counters or create another job"
+            )
+        elif reason == "dispatch_identity_unknown":
+            action = (
+                "Reconcile the original dispatch identity; do not resend with a new key"
+            )
+        return {
+            "id": latest["id"],
+            "state": latest["state"],
+            "receipt": receipt,
+            "reason": reason,
+            "dispatch_attempts": number,
+            "max_dispatch_attempts": self.config.max_dispatch_attempts,
+            "automatic_retry": reason in {"dispatch_pending", "awaiting_coordinator"}
+            and (
+                latest["state"] == "pending"
+                or (identified and number < self.config.max_dispatch_attempts)
+            ),
+            "observation": observation,
+            "action": action,
+        }
+
+    def observe_dispatch(
+        self, key: str, reason: str, run_id: str | None, *, basis="coordinator_read"
+    ) -> None:
+        self.state.set_meta(
+            f"dispatch_observation:{key}",
+            {
+                "reason": reason,
+                "run_id": run_id,
+                "observed_at": time.time(),
+                "basis": basis,
+            },
+        )
+
     def owner(self, envelope: Envelope, *, executor: bool = False) -> dict:
         payload = envelope.payload
         attempt = self.state.validate_grant(
@@ -253,27 +364,23 @@ class Service:
                         "providers": self.router.last_blockers,
                     }
                 )
-        # Dispatch acceptance is separate from admission; expose its real receipt.
-        count = self.state.connection.execute(
-            "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
-        ).fetchone()[0]
-        key = self.dispatch_key(job["id"], count)
-        intents = [
-            dict(row)
-            for row in self.state.connection.execute(
-                "SELECT id,state FROM outbox WHERE id=? OR id LIKE ? ORDER BY id",
-                (key, key + ":retry:%"),
+        grant_eligible = not blockers
+        dispatch = self.dispatch_diagnostic(job)
+        if dispatch and dispatch["reason"] == "dispatch_attempts_exhausted":
+            blockers.append(
+                {
+                    "reason": dispatch["reason"],
+                    "action": dispatch["action"],
+                    "owner": "project coordinator",
+                    "category": "dispatch",
+                }
             )
-        ]
-        dispatch = None
-        if intents and job["state"] == "queued":
-            latest = intents[-1]
-            dispatch = dict(
-                latest,
-                receipt=self.state.get_meta(f"dispatch_receipt:{latest['id']}", {}),
-                action="Await coordinator; replay only the same durable dispatch intent",
-            )
-        return {"eligible": not blockers, "blockers": blockers, "dispatch": dispatch}
+        return {
+            "eligible": not blockers,
+            "grant_eligible": grant_eligible,
+            "blockers": blockers,
+            "dispatch": dispatch,
+        }
 
     def dispatch_key(self, job_id: str, attempt_count: int) -> str:
         return self.state.get_meta(
@@ -1212,6 +1319,7 @@ class Service:
 
     async def dispatch(self, client: Any) -> None:
         if not self.state.capacity()["available"]:
+            await self.inspect_exhausted_dispatches(client)
             return
         candidates = [j for j in self.state.list_jobs() if j["state"] == "queued"]
         candidates.sort(
@@ -1265,11 +1373,15 @@ class Service:
                     if snapshot["thread"]["threadId"] != persisted[
                         "thread_id"
                     ] or not dispatch_retry_safe(snapshot, run_id):
+                        self.observe_dispatch(key, "awaiting_coordinator", run_id)
                         self.health = "awaiting_coordinator"
                         continue
                     if not self.dispatch_current(job, attempt_count):
                         continue
                     if dispatch_number > self.config.max_dispatch_attempts:
+                        self.observe_dispatch(
+                            key, "dispatch_attempts_exhausted", run_id
+                        )
                         self.health = "dispatch_attempts_exhausted"
                         continue
                     key = f"{base_key}:retry:{dispatch_number}"
@@ -1410,19 +1522,69 @@ class Service:
         self.state.set_meta(f"work_memory_reference:{job['id']}:{number}", reference)
         return cycle
 
-    def dispatch_current(self, job: dict, attempt_count: int) -> bool:
-        """Recheck admission after remote reads or context preparation yielded."""
+    async def inspect_exhausted_dispatches(self, client: Any) -> None:
+        """Observe already-sent final controls while admission remains closed.
+
+        A legacy restart may have receipts but no durable observation yet. Do
+        not require an available executor slot to read that evidence, and never
+        enqueue, send, prepare memory or acquire a grant on this path.
+        """
+        from oraculo.t3.contracts import dispatch_retry_safe
+
+        for job in self.state.list_jobs():
+            diagnostic = self.dispatch_diagnostic(job)
+            if (
+                not diagnostic
+                or diagnostic["state"] != "sent"
+                or diagnostic["dispatch_attempts"] != self.config.max_dispatch_attempts
+                or diagnostic["reason"] == "dispatch_identity_unknown"
+            ):
+                continue
+            objective = self.state.get_objective(job["objective_id"])
+            try:
+                self.project(objective["project_id"])
+            except StateError:
+                continue
+            count = self.state.connection.execute(
+                "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
+            ).fetchone()[0]
+            row = self.state._one(
+                "SELECT * FROM outbox WHERE id=?", (diagnostic["id"],)
+            )
+            payload = json.loads(row["payload"])
+            snapshot = await client.read_thread(payload["thread_id"])
+            if not self.dispatch_namespace_current(job, count):
+                continue
+            run_id = diagnostic["receipt"]["run_id"]
+            terminal = snapshot["thread"]["threadId"] == payload[
+                "thread_id"
+            ] and dispatch_retry_safe(snapshot, run_id)
+            self.observe_dispatch(
+                row["id"],
+                "dispatch_attempts_exhausted" if terminal else "awaiting_coordinator",
+                run_id,
+            )
+
+    def dispatch_namespace_current(self, job: dict, attempt_count: int) -> bool:
         current = self.state.get_job(job["id"])
         objective = self.state.get_objective(job["objective_id"])
         count = self.state.connection.execute(
             "SELECT count(*) FROM attempts WHERE job_id=?", (job["id"],)
         ).fetchone()[0]
         return (
-            not self.state.admission_blockers(current)
-            and current["state"] == "queued"
+            current["state"] == "queued"
             and objective["status"] not in {"cancel_requested", "stopped"}
-            and not self.state._scope_conflicts(current, objective["project_id"])
             and count == attempt_count
+        )
+
+    def dispatch_current(self, job: dict, attempt_count: int) -> bool:
+        """Recheck admission after remote reads or context preparation yielded."""
+        current = self.state.get_job(job["id"])
+        objective = self.state.get_objective(job["objective_id"])
+        return (
+            self.dispatch_namespace_current(job, attempt_count)
+            and not self.state.admission_blockers(current)
+            and not self.state._scope_conflicts(current, objective["project_id"])
         )
 
     def parallel_dispatches(self, primary: dict, candidates: list[dict]) -> list[dict]:
@@ -1509,7 +1671,9 @@ class Service:
         if utf16_units(payload["message"]) > MAX_MESSAGE_UNITS:
             # A legacy pending row may already have been accepted remotely.
             # Never replace its bytes under the same idempotency key.
-            self.health = "legacy_dispatch_oversize_requires_reconciliation"
+            reason = "legacy_dispatch_oversize_requires_reconciliation"
+            self.observe_dispatch(row["id"], reason, None, basis="outbox_size")
+            self.health = reason
             return
         receipt = await client.send(
             payload["thread_id"], payload["message"], row["id"], mode="queue"

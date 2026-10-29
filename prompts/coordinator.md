@@ -84,6 +84,15 @@ replay, depende de `grant.acquire` vigente e de sua própria chave de delegaçã
 `busy` em um item não autoriza lançá-lo nem impede tentar os outros; reporte o
 bloqueio e deixe a retomada com o serviço. Não fabrique tarefas extras.
 
+Se `status.get` indicar `dispatch_attempts_exhausted`, os envios automáticos
+acabaram; isso não significa execução concluída. Informe o impedimento concreto,
+responsável e ação. Após resolvê-lo dentro da autorização existente, a retomada
+explícita usa `grant.acquire` do **mesmo job**, sua thread/run atuais e uma intenção
+estável, seguindo os passos abaixo. Não recrie o objetivo, não zere contadores e
+não use `task.retry` para obter mais envios. `admission.grant_eligible` é somente
+um diagnóstico atual; a resposta do acquire é a autoridade. Um job admitido
+continua sujeito a claim, relatório, reconciliação e memória, sem sucesso inferido.
+
 1. Para o `job_id` do item, envie `grant.acquire` com `payload:{"job_id":"id-real"}`, origin thread/run atuais e request_id estável exclusivo desse acquire. Não troque o job pelo pedido mais recente. `busy` ou erro encerra a tentativa deste item sem lançar filho; o serviço controla retomada. Se recuperar um envelope já processado, confira status atual antes de usá-lo: um recibo antigo não revalida o grant.
 2. Em `reserved`, preserve a resposta completa: `attempt.id`, `attempt.generation`, `attempt.job_id`, owner thread/run, `job` e o objeto `target` inteiro, incluindo `providerInstanceId`, `model` e `options`. Verifique catálogo vivo: o target precisa existir e aceitar delegação. Não substitua o target nem descarte as opções que desativam modalidades pagas. Consulte `status.get` para obter o caminho do projeto registrado e o ID/estado do objetivo associado ao job; texto/critérios vêm do payload do dispatch e do job, não de suposição pelo ID.
 3. Construa um brief autossuficiente: inclua integralmente `executor_instructions`, projeto/caminho, objetivo e critérios, payload do dispatch, grant/target, identidade deste coordenador, contexto recebido, e `memory_instructions` se presentes. Novos despachos de memória sempre usam `context.artifact`, mesmo com fontes pequenas; não troque a referência por conteúdo reconstruído. Em memória com `context.artifact`, preserve a referência integral e deixe o filho recuperar o snapshot pela CLI após claim: não expanda o artefato nem copie o payload grande retornado em `grant.acquire.job`. O snapshot contém payload, critérios, fontes e bundle completos; o despacho compacto é a entrada de transporte autorizada. O filho não herda a conversa. Não copie outros projetos, segredos nem conversas inteiras. Inclua `task_context`, fontes, dependências/provas e `payload.task_spec` integralmente. Para plano, use isolamento `shared` indicado em task_context: cada filho tem conversa própria no checkout coordenado por leases de escrita. Para tarefas legadas, o isolamento worktree começa no commit do pai e não copia alterações não commitadas. Não faça commit de alterações de Marco para preparar o filho.

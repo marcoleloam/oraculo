@@ -221,6 +221,60 @@ No reinício, o serviço usa o estado persistido para retomar a reconciliação.
 
 Despachos novos registram o run retornado pelo T3. Se esse run terminar sem adquirir grant, sem execução ou pedidos pendentes, o serviço pode reenviar a mesma mensagem com nova chave de controle, até `max_dispatch_attempts`. O run pode estar no histórico, desde que sua terminalidade seja comprovada e o estado atual do coordenador também esteja ocioso e terminal. Isso não relaxa a identidade exigida para concluir um executor. Resposta perdida conserva chave e conteúdo originais. Recibos legados sem run identificado ficam bloqueados para recuperação explícita; outros jobs podem avançar. Uma outbox legada acima do limite de transporte conserva a mensagem original, porque mudar conteúdo sob a mesma chave poderia contradizer uma aceitação remota anterior. Essa repetição de controle não autoriza repetir merge/deploy.
 
+A exaustão é um bloqueio real de **entrega de controle**, não conclusão nem
+falha certificada de um executor. Um coordenador pode receber todos os envios e
+adiar o grant por um impedimento externo. `status.get.jobs[].admission.dispatch`
+agora informa `reason`, `dispatch_attempts`, `max_dispatch_attempts`,
+`automatic_retry`, `observation` e `action`. A observação guarda a identidade do
+run e o instante da leitura; não é uma consulta nova ao host. Só uma leitura
+terminal segura após o último envio registra `dispatch_attempts_exhausted`.
+Recibos antigos sem essa observação precisam de leitura fresca pelo scheduler.
+
+O job esgotado continua `queued`, com `admission.eligible:false` e blocker de
+despacho; `grant_eligible` informa separadamente se os gates atuais permitem
+pedir um grant. Isso não reserva vaga nem autoriza execução. A observação
+persistida conserva o alerta mesmo com capacidade zero e após reabrir o serviço.
+Com capacidade zero, o serviço também pode ler o coordenador de um último
+despacho já enviado para obter ou atualizar essa prova, inclusive no primeiro
+restart vindo de daemon legado. Esse caminho não cria outbox, envio, memória ou
+grant; revalida o namespace após a leitura. O health agrega os jobs atuais:
+identidade desconhecida e coordenador ainda pendente precedem exaustão; erros de conexão/autorização/elegibilidade continuam
+visíveis. Quando um grant admite o job, ou o objetivo é cancelado pelo protocolo,
+o despacho antigo permanece no histórico e deixa de contribuir para o health.
+Nenhum contador, job, lease, memória ou resultado é apagado ou reclassificado.
+
+**Recuperação explícita, pela origem responsável:** confirme o impedimento real
+na conversa do coordenador e resolva-o dentro da autorização existente. Consulte
+`status.get` e preserve objetivo/job/payload/contexto originais. Na própria thread
+coordenadora registrada, obtenha thread/run atuais pelo host e envie pela CLI:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "intencao-estavel-de-retomada",
+  "kind": "grant.acquire",
+  "project_id": "projeto-selecionado",
+  "origin": {"thread_id": "coordenador-registrado", "run_id": "run-atual"},
+  "payload": {"job_id": "job-original"}
+}
+```
+
+Grave JSON com serializador em arquivo privado e use
+`oraculo --config CAMINHO request --file ARQUIVO`. Os valores acima são exemplos;
+nunca omita a identidade para contornar autorização. Repetir a **mesma intenção**
+usa exatamente o mesmo envelope/request_id; uma nova intenção usa ID novo.
+Somente `ok:true` com `data.state:reserved` permite seguir os passos normais de
+delegação e `grant.claim`, com a chave do attempt retornado. `busy`, erro ou
+resposta incerta não autorizam lançar filho. O mesmo job pode receber seu primeiro
+grant após esgotar envios; o limite de despacho não é um limite de execução.
+Memória preparada é reutilizada, e replays do acquire devolvem o mesmo grant.
+Capacidade, manutenção, dependências, escopo, projeto, provedor e autorização
+continuam sendo revalidados. Não aumentar `max_dispatch_attempts`, zerar outbox,
+criar objetivo substituto, liberar reserva ou usar `task.retry` como atalho.
+Tarefas gerenciadas `task-*` têm outro protocolo (`task resume`); este procedimento
+se aplica somente aos jobs de objetivos legados. Não execute recuperação de outro
+projeto a partir da conversa de manutenção.
+
 Para validar continuidade com interfaces fechadas, siga [TESTES_AT020.md](TESTES_AT020.md). Inicie e observe a tarefa antes de fechar a janela T3, mantenha desktop/backend vivos e registre a transição dentro do intervalo fechado. Encerrar o aplicativo inteiro interrompe os runs e é um cenário diferente de fechar sua janela. O reinício do daemon Oráculo também é distinto do reinício do T3: uma thread retomada pelo T3 pode receber outro `run_id`, que não herda autorização do grant anterior.
 
 Logs ficam em `~/Library/Logs/Oraculo`: `service.jsonl` com rotação, além de `stdout.log` e `stderr.log` do LaunchAgent. Estado SQLite, staging e recibos ficam fora do vault em `~/Library/Application Support/Oraculo`; o socket é local ao usuário. Não publique esse diretório como memória nem copie credenciais para logs.
