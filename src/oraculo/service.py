@@ -19,9 +19,10 @@ from oraculo.config import Config, resources_root
 from oraculo.memory.bridge import MemoryBridge, artifact_context, public_cycle
 from oraculo.memory.context import Context
 from oraculo.memory.cycles import MemoryCycles
-from oraculo.memory.maintenance import Maintenance
+from oraculo.memory.maintenance import Maintenance, nightly_compilation_receipt
 from oraculo.memory.publish import Publisher
 from oraculo.memory.review import ReviewManager
+from oraculo.memory.schema import MemoryError
 from oraculo.plans import Plans
 from oraculo.protocol import (
     CONTROL_MARKER,
@@ -928,7 +929,14 @@ class Service:
                 if metadata["project_id"] != envelope.project_id:
                     raise StateError("review_project_mismatch")
                 return await asyncio.to_thread(self.reviews.close, session_id)
-            self.owner(envelope, executor=True)
+            attempt = self.owner(envelope, executor=True)
+            job = self.state.get_job(attempt["job_id"])
+            job_payload = json.loads(job["payload"])
+            if job["kind"] == "memory" and (
+                job_payload.get("memory_operation", "query") in {"query", "lint"}
+                or job_payload.get("read_only") is True
+            ):
+                raise StateError("read_only_memory_operation")
             name = p["artifact"]
             if Path(name).name != name or name in {".", ".."}:
                 raise StateError("invalid_artifact_path")
@@ -944,6 +952,16 @@ class Service:
             ):
                 raise StateError("artifact_integrity_error")
             proposal = json.loads(raw)
+            if job_payload.get("knowledge_routine") == "nightly":
+                from oraculo.knowledge import validate_nightly_proposal
+
+                await asyncio.to_thread(
+                    validate_nightly_proposal,
+                    self.publisher,
+                    envelope.project_id,
+                    proposal,
+                    job_payload.get("knowledge_sources"),
+                )
             if proposal.get("scope") == "shared":
                 attempt = self.owner(envelope, executor=True)
                 job = self.state.get_job(attempt["job_id"])
@@ -1042,6 +1060,10 @@ class Service:
             self.memory_operations -= 1
 
     async def handle(self, envelope: Envelope) -> dict:
+        if envelope.kind.startswith("knowledge."):
+            from oraculo.knowledge_service import handle
+
+            return await handle(self, envelope)
         prepared_cycle = None
         if envelope.kind == "experience.snapshot":
             from oraculo.experience_service import response as experience_response
@@ -1223,13 +1245,17 @@ class Service:
             else:
                 response = await self.handle(envelope)
         except Exception as exc:
+            from pydantic import ValidationError
+
             response = {
                 "request_id": request_id,
                 "ok": False,
                 "state": "error",
                 "error": {
                     "code": type(exc).__name__,
-                    "message": str(exc),
+                    "message": "invalid_envelope_or_proposal"
+                    if isinstance(exc, ValidationError)
+                    else str(exc),
                     "retryable": False,
                 },
             }
@@ -1691,12 +1717,52 @@ class Service:
     async def memory_context(self, project: dict, payload: dict) -> dict:
         async with self.memory_lock:
             operation = payload.get("memory_operation", "query")
-            result = await asyncio.to_thread(
-                Maintenance(self.publisher).request,
-                project["id"],
-                operation,
-                payload.get("query", ""),
+            nightly = (
+                payload.get("knowledge_routine") == "nightly" and operation == "ingest"
             )
+            try:
+                result = await asyncio.to_thread(
+                    Maintenance(self.publisher).request,
+                    project["id"],
+                    operation,
+                    payload.get("query", ""),
+                    sources=payload.get("knowledge_sources"),
+                )
+            except MemoryError as exc:
+                if not nightly:
+                    raise
+                scope = (
+                    "shared"
+                    if payload.get("memory_scope") == "shared"
+                    else project["id"]
+                )
+                result = {
+                    "kind": "memory",
+                    "project_id": project["id"],
+                    "operation": operation,
+                    "query": payload.get("query", ""),
+                    "context": {"raw_sources": []},
+                    "requires_executor_grant": True,
+                    "billing": "existing_subscription_only",
+                    "memory_scope": scope,
+                }
+                result["bundle"] = await asyncio.to_thread(
+                    self.consistent_bundle,
+                    scope,
+                    payload.get("query", ""),
+                    operation=operation,
+                    raw_sources=[],
+                    read_only=payload.get("read_only") is True,
+                )
+                result["prepared_compilation"] = await asyncio.to_thread(
+                    nightly_compilation_receipt,
+                    self.publisher,
+                    project["id"],
+                    payload,
+                    result["bundle"],
+                    blocked_code=str(exc),
+                )
+                return result
             source = payload.get("source_path")
             if operation == "ingest" and source:
                 path = Path(source)
@@ -1719,7 +1785,11 @@ class Service:
                     },
                 )
                 result["source_content"] = raw.decode("utf-8")
-            if operation == "ingest" and payload.get("execution_evidence"):
+            if (
+                operation == "ingest"
+                and payload.get("execution_evidence")
+                and not payload.get("knowledge_routine")
+            ):
                 content = canonical_json(payload["execution_evidence"])
                 result["raw_path"] = await asyncio.to_thread(
                     self.publisher.snapshot,
@@ -1733,14 +1803,53 @@ class Service:
             )
             result["memory_scope"] = scope
             result["bundle"] = await asyncio.to_thread(
-                self.consistent_bundle, scope, payload.get("query", "")
+                self.consistent_bundle,
+                scope,
+                payload.get("query", ""),
+                operation=operation,
+                raw_sources=(result.get("context") or {}).get("raw_sources"),
+                read_only=operation == "lint" or payload.get("read_only") is True,
             )
+            if nightly:
+                result["prepared_compilation"] = await asyncio.to_thread(
+                    nightly_compilation_receipt,
+                    self.publisher,
+                    project["id"],
+                    payload,
+                    result["bundle"],
+                )
             return result
 
-    def consistent_bundle(self, project_id: str, query: str) -> dict:
+    def consistent_bundle(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        operation: str = "query",
+        raw_sources: list | None = None,
+        read_only: bool = False,
+    ) -> dict:
+        from oraculo.memory.retrieval import useful_terms
+
         with self.publisher.locked():
-            self.publisher._recover()
-            result = Context(self.config.vault_root).bundle(project_id, query)
+            self.publisher._check_integrity()
+            # Empty-query retrieval abstains once the legacy bundle exceeds the
+            # detail budget, even with strict_abstain disabled. Ingest and lint
+            # need an operation snapshot; a synthetic query would not be one.
+            if operation == "lint" or (
+                operation == "ingest" and not useful_terms(query or "")
+            ):
+                maintenance = Maintenance(self.publisher)
+                if operation == "lint":
+                    result = maintenance.lint_bundle(project_id, read_only=True)
+                else:
+                    result = maintenance.ingest_bundle(
+                        project_id, raw_sources or [], read_only=read_only
+                    )
+            else:
+                result = Context(self.config.vault_root).bundle(
+                    project_id, query, mode="budgeted", strict_abstain=False
+                )
             result["base_commit"] = self.publisher.git.head()
             for document in result["documents"]:
                 document["sha256"] = hashlib.sha256(
@@ -1782,6 +1891,9 @@ class Service:
         await self.reconcile_managed_tasks(client)
         self.health = "online"
         self.discover()
+        from oraculo.knowledge_service import tick as knowledge_tick
+
+        await knowledge_tick(self)
         await self.dispatch(client)
 
     async def reconcile_managed_tasks(self, client: Any) -> None:

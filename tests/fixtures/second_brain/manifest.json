@@ -1,0 +1,1276 @@
+{
+  "base_sha": "cfa2b3564b03a60341c901018ee75a7f7a3e4bd4",
+  "homonym_display_name": "Atlas",
+  "notes": [
+    "Synthetic pages only. Labels are the planted evidence spans.",
+    "Tuning and acceptance are disjoint question ids.",
+    "No-answer questions are excluded from recall and MRR."
+  ],
+  "projects": [
+    "atlas-harbor",
+    "atlas-ridge"
+  ],
+  "questions": [
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-harbor/wiki/concepts/z-direct.md",
+          "span": "O código vigente do cais norte é HQ-17-CARMINE."
+        }
+      ],
+      "id": "atlas-harbor-direct-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "código do cais norte",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-direct.md"
+      ],
+      "split": "tuning",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-harbor/wiki/concepts/z-direct.md",
+          "span": "O código vigente do cais norte é HQ-17-CARMINE."
+        }
+      ],
+      "id": "atlas-harbor-direct-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "código vigente do cais norte",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-harbor/wiki/concepts/z-direct.md",
+          "span": "O código vigente do cais norte é HQ-17-CARMINE."
+        }
+      ],
+      "id": "atlas-harbor-direct-pt-acceptance-2",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "marca do cais norte",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-harbor/wiki/concepts/z-direct.md",
+          "span": "The standing north quay code is HQ-17-CARMINE."
+        }
+      ],
+      "id": "atlas-harbor-direct-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "north quay code",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-direct.md"
+      ],
+      "split": "tuning",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-harbor/wiki/concepts/z-direct.md",
+          "span": "The standing north quay code is HQ-17-CARMINE."
+        }
+      ],
+      "id": "atlas-harbor-direct-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "standing north quay code",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-harbor/wiki/concepts/z-direct.md",
+          "span": "The standing north quay code is HQ-17-CARMINE."
+        }
+      ],
+      "id": "atlas-harbor-direct-en-acceptance-2",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "mark of the north quay",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-harbor/wiki/concepts/z-paraphrase.md",
+          "span": "O plano carmim fixa o calado em quatro metros."
+        }
+      ],
+      "id": "atlas-harbor-paraphrase-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "plano carmim do ancoradouro",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "tuning",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-harbor/wiki/concepts/z-paraphrase.md",
+          "span": "O plano carmim fixa o calado em quatro metros."
+        }
+      ],
+      "id": "atlas-harbor-paraphrase-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "desenho carmim do ancoradouro",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "acceptance",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-harbor/wiki/concepts/z-paraphrase.md",
+          "span": "The crimson berth plan fixes the draft at four meters."
+        }
+      ],
+      "id": "atlas-harbor-paraphrase-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "crimson berth plan",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "tuning",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-harbor/wiki/concepts/z-paraphrase.md",
+          "span": "The crimson berth plan fixes the draft at four meters."
+        }
+      ],
+      "id": "atlas-harbor-paraphrase-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "crimson berth drawing",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "acceptance",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-harbor/wiki/concepts/z-hop-target.md",
+          "span": "O calado operacional medido é quatro metros e meio."
+        }
+      ],
+      "id": "atlas-harbor-multihop-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "mapa do cais norte",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-hop-source.md",
+        "projects/atlas-harbor/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "tuning",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-harbor/wiki/concepts/z-hop-target.md",
+          "span": "O calado operacional medido é quatro metros e meio."
+        }
+      ],
+      "id": "atlas-harbor-multihop-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "carta do cais norte",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-hop-source.md",
+        "projects/atlas-harbor/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "acceptance",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-harbor/wiki/concepts/z-hop-target.md",
+          "span": "The measured operating draft is four and a half meters."
+        }
+      ],
+      "id": "atlas-harbor-multihop-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "north quay map",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-hop-source.md",
+        "projects/atlas-harbor/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "tuning",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-harbor/wiki/concepts/z-hop-target.md",
+          "span": "The measured operating draft is four and a half meters."
+        }
+      ],
+      "id": "atlas-harbor-multihop-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "north quay chart",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-hop-source.md",
+        "projects/atlas-harbor/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "acceptance",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2026",
+          "path": "projects/atlas-harbor/wiki/concepts/z-farol-2026.md",
+          "span": "Em 2026 o farol opera em verde."
+        }
+      ],
+      "id": "atlas-harbor-temporal-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "estado do farol em 2026",
+      "relevant_ids": [
+        "farol-2026"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-farol-2026.md"
+      ],
+      "split": "tuning",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2023",
+          "path": "projects/atlas-harbor/wiki/concepts/z-farol-2023.md",
+          "span": "Em 2023 o farol opera em âmbar."
+        }
+      ],
+      "id": "atlas-harbor-temporal-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "estado do farol em 2023",
+      "relevant_ids": [
+        "farol-2023"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-farol-2023.md"
+      ],
+      "split": "acceptance",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2026",
+          "path": "projects/atlas-harbor/wiki/concepts/z-farol-2026.md",
+          "span": "In 2026 the lighthouse shows green."
+        }
+      ],
+      "id": "atlas-harbor-temporal-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "lighthouse state in 2026",
+      "relevant_ids": [
+        "farol-2026"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-farol-2026.md"
+      ],
+      "split": "tuning",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2023",
+          "path": "projects/atlas-harbor/wiki/concepts/z-farol-2023.md",
+          "span": "In 2023 the lighthouse shows amber."
+        }
+      ],
+      "id": "atlas-harbor-temporal-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "lighthouse state in 2023",
+      "relevant_ids": [
+        "farol-2023"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-farol-2023.md"
+      ],
+      "split": "acceptance",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-harbor/wiki/concepts/z-decision.md",
+          "span": "Decisão: o canal norte permanece aberto no inverno."
+        }
+      ],
+      "id": "atlas-harbor-decision-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "decisão do canal norte",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-decision.md"
+      ],
+      "split": "tuning",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-harbor/wiki/concepts/z-decision.md",
+          "span": "Decisão: o canal norte permanece aberto no inverno."
+        }
+      ],
+      "id": "atlas-harbor-decision-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "decisão registrada do canal norte",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-decision.md"
+      ],
+      "split": "acceptance",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-harbor/wiki/concepts/z-decision.md",
+          "span": "Decision: the north channel stays open in winter."
+        }
+      ],
+      "id": "atlas-harbor-decision-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "north channel decision",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-decision.md"
+      ],
+      "split": "tuning",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-harbor/wiki/concepts/z-decision.md",
+          "span": "Decision: the north channel stays open in winter."
+        }
+      ],
+      "id": "atlas-harbor-decision-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "recorded north channel decision",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-decision.md"
+      ],
+      "split": "acceptance",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+          "span": "O canal sul está fechado para dragas."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-open.md",
+          "span": "O canal sul está aberto para barcaças."
+        }
+      ],
+      "id": "atlas-harbor-contradiction-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "panorama do canal sul",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-harbor/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "tuning",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+          "span": "O canal sul está fechado para dragas."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-open.md",
+          "span": "O canal sul está aberto para barcaças."
+        }
+      ],
+      "id": "atlas-harbor-contradiction-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "retrato do canal sul",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-harbor/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "acceptance",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+          "span": "The south channel is closed to dredgers."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-open.md",
+          "span": "The south channel is open to barges."
+        }
+      ],
+      "id": "atlas-harbor-contradiction-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "picture of the south channel",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-harbor/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "tuning",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+          "span": "The south channel is closed to dredgers."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-harbor/wiki/concepts/z-contra-open.md",
+          "span": "The south channel is open to barges."
+        }
+      ],
+      "id": "atlas-harbor-contradiction-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "view of the south channel",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-harbor/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-harbor/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "acceptance",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-harbor-no-answer-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "xilofone9",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "tuning",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-harbor-no-answer-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-harbor",
+      "query": "oboe8",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "acceptance",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-harbor-no-answer-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "xylophoneprotocol9",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "tuning",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-harbor-no-answer-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-harbor",
+      "query": "oboeprotocol8",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "acceptance",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-ridge/wiki/concepts/z-direct.md",
+          "span": "O código vigente do cais norte é RQ-44-INDIGO."
+        }
+      ],
+      "id": "atlas-ridge-direct-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "código do cais norte",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-direct.md"
+      ],
+      "split": "tuning",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-ridge/wiki/concepts/z-direct.md",
+          "span": "O código vigente do cais norte é RQ-44-INDIGO."
+        }
+      ],
+      "id": "atlas-ridge-direct-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "código vigente do cais norte",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-ridge/wiki/concepts/z-direct.md",
+          "span": "O código vigente do cais norte é RQ-44-INDIGO."
+        }
+      ],
+      "id": "atlas-ridge-direct-pt-acceptance-2",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "marca do cais norte",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-ridge/wiki/concepts/z-direct.md",
+          "span": "The standing north quay code is RQ-44-INDIGO."
+        }
+      ],
+      "id": "atlas-ridge-direct-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "north quay code",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-direct.md"
+      ],
+      "split": "tuning",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-ridge/wiki/concepts/z-direct.md",
+          "span": "The standing north quay code is RQ-44-INDIGO."
+        }
+      ],
+      "id": "atlas-ridge-direct-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "standing north quay code",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "direct",
+          "path": "projects/atlas-ridge/wiki/concepts/z-direct.md",
+          "span": "The standing north quay code is RQ-44-INDIGO."
+        }
+      ],
+      "id": "atlas-ridge-direct-en-acceptance-2",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "mark of the north quay",
+      "relevant_ids": [
+        "direct"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-direct.md"
+      ],
+      "split": "acceptance",
+      "type": "direct"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-ridge/wiki/concepts/z-paraphrase.md",
+          "span": "O plano carmim fixa o calado em quatro metros."
+        }
+      ],
+      "id": "atlas-ridge-paraphrase-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "plano carmim do ancoradouro",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "tuning",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-ridge/wiki/concepts/z-paraphrase.md",
+          "span": "O plano carmim fixa o calado em quatro metros."
+        }
+      ],
+      "id": "atlas-ridge-paraphrase-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "desenho carmim do ancoradouro",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "acceptance",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-ridge/wiki/concepts/z-paraphrase.md",
+          "span": "The crimson berth plan fixes the draft at four meters."
+        }
+      ],
+      "id": "atlas-ridge-paraphrase-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "crimson berth plan",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "tuning",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "paraphrase",
+          "path": "projects/atlas-ridge/wiki/concepts/z-paraphrase.md",
+          "span": "The crimson berth plan fixes the draft at four meters."
+        }
+      ],
+      "id": "atlas-ridge-paraphrase-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "crimson berth drawing",
+      "relevant_ids": [
+        "paraphrase"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-paraphrase.md"
+      ],
+      "split": "acceptance",
+      "type": "paraphrase"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-ridge/wiki/concepts/z-hop-target.md",
+          "span": "O calado operacional medido é quatro metros e meio."
+        }
+      ],
+      "id": "atlas-ridge-multihop-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "mapa do cais norte",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-hop-source.md",
+        "projects/atlas-ridge/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "tuning",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-ridge/wiki/concepts/z-hop-target.md",
+          "span": "O calado operacional medido é quatro metros e meio."
+        }
+      ],
+      "id": "atlas-ridge-multihop-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "carta do cais norte",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-hop-source.md",
+        "projects/atlas-ridge/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "acceptance",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-ridge/wiki/concepts/z-hop-target.md",
+          "span": "The measured operating draft is four and a half meters."
+        }
+      ],
+      "id": "atlas-ridge-multihop-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "north quay map",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-hop-source.md",
+        "projects/atlas-ridge/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "tuning",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "hop-target",
+          "path": "projects/atlas-ridge/wiki/concepts/z-hop-target.md",
+          "span": "The measured operating draft is four and a half meters."
+        }
+      ],
+      "id": "atlas-ridge-multihop-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "north quay chart",
+      "relevant_ids": [
+        "hop-source",
+        "hop-target"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-hop-source.md",
+        "projects/atlas-ridge/wiki/concepts/z-hop-target.md"
+      ],
+      "split": "acceptance",
+      "type": "multihop"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2026",
+          "path": "projects/atlas-ridge/wiki/concepts/z-farol-2026.md",
+          "span": "Em 2026 o farol opera em verde."
+        }
+      ],
+      "id": "atlas-ridge-temporal-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "estado do farol em 2026",
+      "relevant_ids": [
+        "farol-2026"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-farol-2026.md"
+      ],
+      "split": "tuning",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2023",
+          "path": "projects/atlas-ridge/wiki/concepts/z-farol-2023.md",
+          "span": "Em 2023 o farol opera em âmbar."
+        }
+      ],
+      "id": "atlas-ridge-temporal-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "estado do farol em 2023",
+      "relevant_ids": [
+        "farol-2023"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-farol-2023.md"
+      ],
+      "split": "acceptance",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2026",
+          "path": "projects/atlas-ridge/wiki/concepts/z-farol-2026.md",
+          "span": "In 2026 the lighthouse shows green."
+        }
+      ],
+      "id": "atlas-ridge-temporal-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "lighthouse state in 2026",
+      "relevant_ids": [
+        "farol-2026"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-farol-2026.md"
+      ],
+      "split": "tuning",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "farol-2023",
+          "path": "projects/atlas-ridge/wiki/concepts/z-farol-2023.md",
+          "span": "In 2023 the lighthouse shows amber."
+        }
+      ],
+      "id": "atlas-ridge-temporal-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "lighthouse state in 2023",
+      "relevant_ids": [
+        "farol-2023"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-farol-2023.md"
+      ],
+      "split": "acceptance",
+      "type": "temporal"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-ridge/wiki/concepts/z-decision.md",
+          "span": "Decisão: o canal norte permanece aberto no inverno."
+        }
+      ],
+      "id": "atlas-ridge-decision-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "decisão do canal norte",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-decision.md"
+      ],
+      "split": "tuning",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-ridge/wiki/concepts/z-decision.md",
+          "span": "Decisão: o canal norte permanece aberto no inverno."
+        }
+      ],
+      "id": "atlas-ridge-decision-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "decisão registrada do canal norte",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-decision.md"
+      ],
+      "split": "acceptance",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-ridge/wiki/concepts/z-decision.md",
+          "span": "Decision: the north channel stays open in winter."
+        }
+      ],
+      "id": "atlas-ridge-decision-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "north channel decision",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-decision.md"
+      ],
+      "split": "tuning",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "decision",
+          "path": "projects/atlas-ridge/wiki/concepts/z-decision.md",
+          "span": "Decision: the north channel stays open in winter."
+        }
+      ],
+      "id": "atlas-ridge-decision-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "recorded north channel decision",
+      "relevant_ids": [
+        "decision"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-decision.md"
+      ],
+      "split": "acceptance",
+      "type": "decision"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+          "span": "O canal sul está fechado para dragas."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-open.md",
+          "span": "O canal sul está aberto para barcaças."
+        }
+      ],
+      "id": "atlas-ridge-contradiction-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "panorama do canal sul",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-ridge/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "tuning",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+          "span": "O canal sul está fechado para dragas."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-open.md",
+          "span": "O canal sul está aberto para barcaças."
+        }
+      ],
+      "id": "atlas-ridge-contradiction-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "retrato do canal sul",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-ridge/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "acceptance",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+          "span": "The south channel is closed to dredgers."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-open.md",
+          "span": "The south channel is open to barges."
+        }
+      ],
+      "id": "atlas-ridge-contradiction-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "picture of the south channel",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-ridge/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "tuning",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [
+        {
+          "page_id": "contra-closed",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+          "span": "The south channel is closed to dredgers."
+        },
+        {
+          "page_id": "contra-open",
+          "path": "projects/atlas-ridge/wiki/concepts/z-contra-open.md",
+          "span": "The south channel is open to barges."
+        }
+      ],
+      "id": "atlas-ridge-contradiction-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "view of the south channel",
+      "relevant_ids": [
+        "contra-closed",
+        "contra-open"
+      ],
+      "relevant_paths": [
+        "projects/atlas-ridge/wiki/concepts/z-contra-closed.md",
+        "projects/atlas-ridge/wiki/concepts/z-contra-open.md"
+      ],
+      "split": "acceptance",
+      "type": "contradiction"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-ridge-no-answer-pt-tuning-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "zarabatana3",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "tuning",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-ridge-no-answer-pt-acceptance-1",
+      "language": "pt",
+      "project_id": "atlas-ridge",
+      "query": "quilombo4",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "acceptance",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-ridge-no-answer-en-tuning-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "blowgunprotocol3",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "tuning",
+      "type": "no-answer"
+    },
+    {
+      "evidence": [],
+      "id": "atlas-ridge-no-answer-en-acceptance-1",
+      "language": "en",
+      "project_id": "atlas-ridge",
+      "query": "hammockprotocol4",
+      "relevant_ids": [],
+      "relevant_paths": [],
+      "split": "acceptance",
+      "type": "no-answer"
+    }
+  ],
+  "scales": [
+    50,
+    500,
+    5000
+  ],
+  "schema": "second-brain-f0-v1",
+  "seed": 20261101,
+  "shared": "sanitized-synthetic",
+  "token_estimator": "utf8_bytes_div_4_v1"
+}

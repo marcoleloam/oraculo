@@ -202,6 +202,9 @@ class ReviewManager:
                         "state": "imported",
                         "session_id": session_id,
                     }
+                    session["knowledge_findings"] = list(
+                        session["receipt"].get("knowledge_findings") or []
+                    )
                     session["state"] = "imported"
                     self._save(metadata_path, session)
             if session["state"] == "imported":
@@ -270,6 +273,7 @@ class ReviewManager:
             session.update(
                 state="imported",
                 receipt=receipt,
+                knowledge_findings=list(receipt.get("knowledge_findings") or []),
                 imported_at=datetime.now(timezone.utc).isoformat(),
             )
             self._save(metadata_path, session)

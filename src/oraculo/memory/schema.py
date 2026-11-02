@@ -18,6 +18,10 @@ class ConflictError(MemoryError):
     pass
 
 
+# Page envelope stays schema_version 1. Typed claims opt in separately.
+KNOWLEDGE_SCHEMA_VERSION = 1
+
+
 class PageChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
     page_id: str
@@ -152,7 +156,24 @@ def validate_page(
             date.fromisoformat(str(meta[key]))
         except (ValueError, KeyError) as exc:
             raise MemoryError("invalid_date") from exc
+    knowledge_domain(meta)
     return meta
+
+
+def knowledge_domain(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the opt-in typed block, or None when the page is legacy.
+
+    Missing knowledge_schema means not evaluated. A present but unapproved
+    version is refused instead of being rewritten into the installed contract.
+    """
+    if "knowledge_schema" not in meta and "claims" not in meta:
+        return None
+    claims = meta.get("claims")
+    if meta.get("knowledge_schema") != KNOWLEDGE_SCHEMA_VERSION or not isinstance(
+        claims, list
+    ):
+        raise MemoryError("invalid_knowledge_schema")
+    return {"knowledge_schema": KNOWLEDGE_SCHEMA_VERSION, "claims": claims}
 
 
 def links(content: str) -> list[str]:
@@ -188,7 +209,27 @@ def resolve_link(target: str, paths: set[str], source: str = "") -> str:
     return next(iter(matches))
 
 
+def _shield_claims(content: str) -> tuple[str, Any]:
+    """Keep claim quotes out of link rewriting.
+
+    Evidence quotes are byte locators. A quote may contain wiki syntax from
+    the captured source; rewriting it would break the hash and the citation.
+    """
+    if not content.startswith("---\n"):
+        return content, None
+    try:
+        meta, body = parse_page(content)
+    except MemoryError:
+        return content, None
+    if "claims" not in meta:
+        return content, None
+    claims = meta.pop("claims")
+    return render_page(meta, body), claims
+
+
 def rewrite_links(content: str, mapping: dict[str, str], source: str = "") -> str:
+    content, claims = _shield_claims(content)
+
     def replace(match: re.Match[str]) -> str:
         raw = match.group(1)
         target, *alias = raw.split("|", 1)
@@ -226,6 +267,10 @@ def rewrite_links(content: str, mapping: dict[str, str], source: str = "") -> st
         if isinstance(note, str) and not note.startswith("[["):
             meta["source_note"] = mapping[resolve_link(note, set(mapping), source)]
             result = render_page(meta, body)
+    if claims is not None and result.startswith("---\n"):
+        meta, body = parse_page(result)
+        meta["claims"] = claims
+        result = render_page(meta, body)
     return result
 
 

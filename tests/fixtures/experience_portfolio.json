@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "kind": "portfolio",
+  "observed_at": "2026-11-01T09:00:00Z",
+  "demonstration": true,
+  "counts": {"projects": 3, "tasks": 3, "documents": 2},
+  "projects": [
+    {
+      "schema_version": 1,
+      "project_id": "alfa",
+      "project_title": "Atlas",
+      "export_root": "projetos/atlas-alfa",
+      "demonstration": true,
+      "waves": ["Onda 2", "Sem onda informada"],
+      "observed_at": "2026-11-01T08:00:00Z",
+      "entries": [
+        {
+          "id": "local-1",
+          "identity": "task-alfa-root",
+          "kind": "task",
+          "title": "Organizar o acervo",
+          "topics": ["Acervo"],
+          "wave": "Onda 2",
+          "wave_basis": "metadado wave",
+          "updated_at": "2026-11-01T08:00:00Z",
+          "state": "Em leitura",
+          "text": "A tarefa raiz descreve a organização do acervo.",
+          "decisions": ["Preservar a decisão de acentuação."],
+          "lessons": ["Uma lição não é uma subtarefa."],
+          "sources": ["projects/alfa/wiki/nota.md"],
+          "subtask_ids": ["local-child"],
+          "parent_entry_id": null,
+          "ancestor_ids": [],
+          "relationship_status": "linked",
+          "unavailable_sources": 0
+        },
+        {
+          "id": "local-child",
+          "identity": "task-alfa-child",
+          "kind": "task",
+          "title": "Revisar a subtarefa do acervo",
+          "topics": ["Acervo"],
+          "wave": "Onda 2",
+          "wave_basis": "metadado wave",
+          "updated_at": "2026-11-01T08:10:00Z",
+          "state": "Em leitura",
+          "text": "Subtarefa explícita do acervo.",
+          "sources": [],
+          "subtask_ids": [],
+          "parent_entry_id": "local-1",
+          "ancestor_ids": ["local-1"],
+          "relationship_status": "linked",
+          "unavailable_sources": 0
+        },
+        {
+          "id": "dec-1",
+          "kind": "decision",
+          "title": "Decisão de preservação",
+          "text": "Preservar a decisão de acentuação no texto integral.",
+          "topics": ["Acervo"],
+          "wave": "Onda 2",
+          "wave_basis": "metadado wave",
+          "updated_at": "2026-11-01T08:00:00Z",
+          "state": "Declarado no relatório",
+          "sources": [],
+          "task_id": "task-alfa-root",
+          "related_task_id": "local-1"
+        },
+        {
+          "id": "les-1",
+          "kind": "lesson",
+          "title": "Lição sobre o acervo",
+          "text": "Uma lição não é uma subtarefa.",
+          "topics": ["Acervo"],
+          "wave": "Onda 2",
+          "wave_basis": "metadado wave",
+          "updated_at": "2026-11-01T08:00:00Z",
+          "state": "Declarado no relatório",
+          "task_id": "task-alfa-root",
+          "related_task_id": "local-1"
+        },
+        {
+          "id": "err-1",
+          "kind": "error",
+          "title": "erro_acervo_ausente",
+          "text": "erro_acervo_ausente",
+          "topics": ["Acervo"],
+          "wave": "Onda 2",
+          "wave_basis": "metadado wave",
+          "updated_at": "2026-11-01T08:00:00Z",
+          "state": "Declarado no relatório",
+          "task_id": "task-alfa-root",
+          "related_task_id": "local-1",
+          "occurrences": 1
+        },
+        {
+          "id": "doc-alfa",
+          "kind": "source",
+          "title": "Nota do acervo Alfa",
+          "document_path": "projects/alfa/wiki/nota.md",
+          "text": "Conteúdo integral da nota do projeto Alfa, com a palavra decisão.",
+          "topics": ["Acervo"],
+          "wave": "Sem onda informada",
+          "wave_basis": "ausente",
+          "updated_at": "2026-10-01",
+          "state": "Revisada",
+          "sources": ["projects/alfa/wiki/nota.md"],
+          "structured": false,
+          "unavailable_sources": 0
+        }
+      ],
+      "documents": {
+        "projects/alfa/wiki/nota.md": "# Nota do acervo Alfa\n\nConteúdo integral da nota do projeto Alfa, com a palavra decisão.\n"
+      },
+      "evidence": {
+        "projects/alfa/wiki/nota.md": "# Nota do acervo Alfa\n\nConteúdo integral da nota do projeto Alfa, com a palavra decisão.\n"
+      }
+    },
+    {
+      "schema_version": 1,
+      "project_id": "beta",
+      "project_title": "Atlas",
+      "export_root": "projetos/atlas-beta",
+      "demonstration": true,
+      "waves": ["Sem onda informada"],
+      "observed_at": "2026-11-01T08:30:00Z",
+      "entries": [
+        {
+          "id": "local-1",
+          "identity": "task-beta-root",
+          "kind": "fix",
+          "title": "Corrigir o índice Beta",
+          "topics": ["Índice"],
+          "wave": "Sem onda informada",
+          "wave_basis": "ausente",
+          "updated_at": "2026-11-01T08:30:00Z",
+          "state": "Em leitura",
+          "text": "Fix exclusivo do segundo Atlas.",
+          "sources": [],
+          "subtask_ids": [],
+          "parent_entry_id": null,
+          "ancestor_ids": [],
+          "relationship_status": "linked",
+          "unavailable_sources": 0
+        }
+      ],
+      "documents": {},
+      "evidence": {}
+    },
+    {
+      "schema_version": 1,
+      "project_id": "vazio",
+      "project_title": "Prateleira vazia",
+      "export_root": "projetos/prateleira-vazia",
+      "demonstration": true,
+      "waves": [],
+      "observed_at": "2026-11-01T07:00:00Z",
+      "entries": [],
+      "documents": {},
+      "evidence": {}
+    }
+  ],
+  "shared": {
+    "entries": [
+      {
+        "id": "shared-1",
+        "kind": "lesson",
+        "title": "Lição compartilhada",
+        "text": "O conhecimento compartilhado permanece rotulado e fora dos projetos.",
+        "topics": ["Compartilhado"],
+        "wave": "Sem onda informada",
+        "wave_basis": "ausente",
+        "updated_at": "2026-11-01T06:00:00Z",
+        "state": "Sanitizado",
+        "document_path": "shared/wiki/licao.md",
+        "sources": ["shared/wiki/licao.md"],
+        "structured": true
+      }
+    ],
+    "documents": {
+      "shared/wiki/licao.md": "{\"summary\":\"O conhecimento compartilhado permanece rotulado.\"}"
+    }
+  },
+  "links": [
+    {
+      "source_project_id": "alfa",
+      "source_entry_id": "local-1",
+      "target_project_id": "beta",
+      "target_entry_id": "local-1",
+      "relation": "referencia",
+      "basis": "campo explícito related_project"
+    },
+    {
+      "source_project_id": "alfa",
+      "source_entry_id": "doc-alfa",
+      "target_project_id": "shared",
+      "target_entry_id": "shared-1",
+      "relation": "usa",
+      "basis": "referência explícita ao conhecimento compartilhado"
+    },
+    {
+      "source_project_id": "alfa",
+      "source_entry_id": "local-1",
+      "target_project_id": "fora-do-recorte",
+      "target_entry_id": "FOREIGN_PROJECT_SENTINEL",
+      "relation": "referencia",
+      "basis": "FOREIGN_PROJECT_SENTINEL"
+    }
+  ]
+}

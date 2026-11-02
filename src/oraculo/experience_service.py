@@ -7,7 +7,7 @@ from pathlib import Path
 
 from oraculo.memory.context import Context
 from oraculo.memory.transport import MemoryArtifacts
-from oraculo.presentation import task_memory_confirmed
+from oraculo.presentation import plain, task_memory_confirmed
 from oraculo.protocol import MAX_ENVELOPE_BYTES, canonical_json
 from oraculo.task_panel import project_binding
 from oraculo.task_store import TaskStore
@@ -74,6 +74,22 @@ def snapshot(service, project_id):
                     "phase": latest.get("phase"),
                     "proof": {"progress": (latest.get("proof") or {}).get("progress")},
                 }
+                # Explicit presentation metadata only; never include request text,
+                # launch arguments, context or arbitrary metadata dictionaries.
+                req = task.get("request") or {}
+                for key in ("wave", "onda", "kind", "type"):
+                    if isinstance(req.get(key), (str, int)) and not isinstance(
+                        req[key], bool
+                    ):
+                        tasks[-1][key] = plain(req[key])
+                for key in ("tags", "topics"):
+                    if isinstance(req.get(key), list):
+                        tasks[-1][key] = [
+                            plain(v) for v in req[key] if isinstance(v, str)
+                        ]
+                parent = task.get("parent_task_id", req.get("parent_task_id"))
+                if isinstance(parent, str):
+                    tasks[-1]["parent_task_id"] = parent
     finally:
         if owned:
             store.close()

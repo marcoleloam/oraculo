@@ -33,8 +33,44 @@ class Context:
         return result
 
     def bundle(
+        self,
+        project_id: str,
+        query: str = "",
+        limit: int = 20,
+        *,
+        mode: str = "legacy",
+        detail_tokens: int = 6000,
+        brief_tokens: int = 800,
+        strict_abstain: bool = True,
+        ranker: str | None = None,
+    ) -> dict[str, Any]:
+        """Select scoped context.
+
+        ``mode="legacy"`` is the real historical ranker used as the F0 baseline.
+        Benchmarks must call this method (or ``legacy_bundle``) and must not
+        replace it with an approximation. ``mode="budgeted"`` is the F1 path.
+        """
+        if mode == "legacy":
+            return self.legacy_bundle(project_id, query, limit)
+        if mode == "budgeted":
+            from .retrieval import retrieve
+
+            return retrieve(
+                self,
+                project_id,
+                query,
+                limit=limit,
+                detail_tokens=detail_tokens,
+                brief_tokens=brief_tokens,
+                strict_abstain=strict_abstain,
+                ranker=ranker,
+            )
+        raise MemoryError("invalid_context_mode")
+
+    def legacy_bundle(
         self, project_id: str, query: str = "", limit: int = 20
     ) -> dict[str, Any]:
+        """Unchanged pre-F1 selector: distinct substring counts, path tie-break."""
         if not 1 <= limit <= 100:
             raise MemoryError("invalid_context_limit")
         all_files = self.files(project_id)
