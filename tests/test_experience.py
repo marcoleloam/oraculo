@@ -27,7 +27,7 @@ def test_shared_model_links_identity_and_idempotent_rebuild(tmp_path):
     files = export_files(model)
     assert "Jardim de ideias" in files["Inicio.md"]
     assert "Reconciliar importação" in files["index.html"]
-    assert any(name.startswith("Assuntos/Importação--") for name in files)
+    assert "Assuntos/Importação.md" in files
     assert not any(re.fullmatch(r"Assuntos/[0-9a-f]{64}\.md", name) for name in files)
     paths = set(files)
     for name, content in files.items():
@@ -39,7 +39,9 @@ def test_shared_model_links_identity_and_idempotent_rebuild(tmp_path):
             for target in links(active):
                 assert resolve_link(target, paths, name) in paths
     for href in re.findall(r'href="([^"]+)"', files["index.html"]):
-        if not href.startswith("t3-thread:"):
+        if href.startswith("#"):
+            assert f'id="{href[1:]}"' in files["index.html"]
+        elif not href.startswith("t3-thread:"):
             assert unquote(href) in paths
     first = write_export(tmp_path / "export", files)
     assert (
@@ -118,8 +120,13 @@ def test_untrusted_text_does_not_become_html_or_active_links():
     files = export_files(project_model(source, "demo"))
     assert "<script>window.evil" not in files["index.html"]
     assert "<img src=x>" not in files["index.html"]
-    navigation = "\n".join(c for p, c in files.items() if p.startswith("Navegar/"))
-    assert "<script>" not in navigation and "[[outside|go]]" not in navigation
+    navigation = "\n".join(
+        files[e["reading_path"]] for e in project_model(source, "demo")["entries"]
+    )
+    active = "\n".join(
+        line for line in navigation.splitlines() if not line.startswith("    ")
+    )
+    assert "<script>" not in active and "[[outside|go]]" not in active
     assert all(".." not in Path(p).parts for p in files)
     assert (
         "\n    ![](https://example.invalid/track)" in files["Fontes/" + concept["path"]]
@@ -151,7 +158,11 @@ def test_missing_and_ambiguous_links_are_explicit():
         dict(path=f"projects/demo/wiki/{kind}/same.md", content="# Same")
         for kind in ["sources", "entities"]
     ]
-    entry = project_model(source, "demo")["entries"][0]
+    entry = next(
+        e
+        for e in project_model(source, "demo")["entries"]
+        if e.get("document_path") == source["documents"][0]["path"]
+    )
     assert entry["unavailable_sources"] == 2
     assert entry["sources"] == [source["documents"][0]["path"]]
 
@@ -277,7 +288,13 @@ async def test_service_memory_report_to_both_views_with_evidence(
     task = store.create(
         {"thread_id": "origin", "run_id": "run"},
         "synthetic",
-        {"title": report["title"]},
+        {
+            "title": report["title"],
+            "wave": "Onda 3",
+            "parent_task_id": "synthetic-parent",
+            "tags": ["Leitura"],
+            "private": "PRIVATE_CONTEXT",
+        },
     )
     store.update(
         task["id"],
@@ -298,6 +315,9 @@ async def test_service_memory_report_to_both_views_with_evidence(
     model = project_model(response["data"], "alpha")
     task_entry = next(e for e in model["entries"] if e["kind"] == "task")
     assert task_entry["title"] == report["title"]
+    assert task_entry["wave"] == "Onda 3"
+    assert response["data"]["tasks"][0]["parent_task_id"] == "synthetic-parent"
+    assert task_entry["relationship_status"] == "orphan"
     assert task_entry["metrics"]["application_declared"] == report["memory_application"]
     assert task_entry["metrics"]["checks_passed"] == 1
     assert task_entry["metrics"]["benefit_demonstrated"] == "unknown"
@@ -314,7 +334,7 @@ async def test_service_memory_report_to_both_views_with_evidence(
         == report["memory_application"]
     )
     assert any(
-        "Importação sintética" in name for name in files if name.startswith("Navegar/")
+        "Importação sintética" in name for name in files if name.startswith("Projetos/")
     )
     write_export(tmp_path / "export", files)
 
@@ -451,3 +471,376 @@ def test_cli_panel_uses_fixed_project_and_loopback_entrypoint(
         == 0
     )
     assert calls == [(config.socket_path, "alpha", 8767)]
+
+
+HIERARCHY = Path(__file__).parent / "fixtures/experience_hierarchy.json"
+
+
+def hierarchy_fixture():
+    return json.loads(HIERARCHY.read_text())
+
+
+def test_explicit_hierarchy_duplicate_names_and_complete_library():
+    from oraculo.memory.schema import digest
+
+    source = hierarchy_fixture()
+    model = project_model(source, "demo-hierarchy")
+    tasks = {e["identity"]: e for e in model["entries"] if e.get("identity")}
+    assert tasks["task-synthetic-0"]["wave"] == "Onda 1"
+    assert tasks["task-synthetic-4"]["wave"] == "Onda 2"
+    assert tasks["task-synthetic-5"]["wave"] == "Onda 4"  # marker in middle
+    assert tasks["task-synthetic-6"]["wave"] == "Sem onda informada"
+    assert tasks["task-synthetic-6"]["kind"] == "task"  # errors are not fixes
+    assert tasks["task-synthetic-3"]["kind"] == "fix"
+    assert tasks["task-synthetic-7"]["kind"] == "fix"
+    assert (
+        tasks["task-synthetic-1"]["reading_path"]
+        != tasks["task-synthetic-2"]["reading_path"]
+    )
+    assert "--" in tasks["task-synthetic-1"]["reading_path"]
+    assert "--" in tasks["task-synthetic-4"]["reading_path"]
+    files = export_files(model)
+    docs = {e["document_path"]: e for e in model["entries"] if e.get("document_path")}
+    assert set(docs) == {d["path"] for d in source["documents"]}
+    for d in source["documents"]:
+        entry = docs[d["path"]]
+        assert files["Evidencias/" + d["path"] + ".txt"] == d["content"]
+        assert entry["reading_path"] in files
+        assert entry["reading_path"] in files["Biblioteca/Biblioteca.md"]
+        assert digest(d["content"]) in files[entry["reading_path"]]
+    isolated = next(
+        e for e in docs.values() if e["title"] == "Pesquisa avulsa sobre acentuação"
+    )
+    assert isolated["kind"] == "raw"
+    assert "Este material não está ligado" in files[isolated["reading_path"]]
+    assert "FIM DO CONTEÚDO INTEGRAL" in files["index.html"]
+    assert "Demonstração sintética" in files["Inicio.md"]
+    assert "Demonstração sintética" in files["index.html"]
+    assert (
+        json.loads(files[".obsidian/workspace.json"])["main"]["children"][0]["state"][
+            "state"
+        ]["file"]
+        == "Inicio.md"
+    )
+
+
+@pytest.mark.parametrize(
+    "title,metadata,expected",
+    [
+        ("Projeto Exemplo > Onda 5 > Tarefa", {}, "Onda 5"),
+        ("Exemplo — Onda 6 — Validar", {}, "Onda 6"),
+        ("Onda 2a não é marcador", {}, "Sem onda informada"),
+        ("ondamente 3", {}, "Sem onda informada"),
+        ("Onda 8", {"wave": "Entrega Azul"}, "Entrega Azul"),
+        ("Legado sem campo", {"topics": ["onda:4"]}, "Onda 4"),
+    ],
+)
+def test_wave_metadata_and_unambiguous_title_markers(title, metadata, expected):
+    source = fixture()
+    source["tasks"][0].update(title=title, **metadata)
+    entry = next(
+        e
+        for e in project_model(source, "demo")["entries"]
+        if e.get("identity") == "task-demo-1"
+    )
+    assert entry["wave"] == expected
+
+
+def test_legacy_memory_only_is_navigable_and_content_is_not_truncated():
+    source = fixture()
+    source["tasks"] = []
+    source["cycles"] = []
+    source["documents"][0]["content"] += "\n" + "ação\n" * 1500 + "FINAL INTEGRAL"
+    model = project_model(source, "demo")
+    assert model["waves"] == ["Sem onda informada"]
+    assert len(model["entries"]) == len(source["documents"])
+    files = export_files(model)
+    assert "FINAL INTEGRAL" in files["index.html"]
+    assert all(
+        e["reading_path"] in files["Biblioteca/Biblioteca.md"] for e in model["entries"]
+    )
+
+
+def test_full_task_summary_decision_and_lesson_are_preserved():
+    from oraculo.memory.schema import digest
+
+    source = fixture()
+    raw = source["documents"][1]
+    report = json.loads(raw["content"])
+    for key in ["summary", "decisions", "lessons"]:
+        report["evidence"][key] = ["Conteúdo integral.\n" * 600 + "FINAL " + key]
+    raw["content"] = json.dumps(report)
+    raw["sha256"] = digest(raw["content"])
+    raw["path"] = "projects/demo/raw/" + raw["sha256"] + ".md"
+    model = project_model(source, "demo")
+    entry = next(e for e in model["entries"] if e.get("identity") == "task-demo-1")
+    files = export_files(model)
+    for key in ["summary", "decisions", "lessons"]:
+        assert "FINAL " + key in files[entry["reading_path"]]
+        assert "FINAL " + key in files["index.html"]
+
+
+def test_reading_filenames_are_macos_safe_and_collision_deterministic():
+    import unicodedata
+
+    source = fixture()
+    originals = []
+    for i, title in enumerate(
+        ["A/B:C", "A B C", "Écho", "E\u0301CHO", ".", "../x", "💡" * 180]
+    ):
+        task = copy.deepcopy(source["tasks"][0])
+        task.update(id="collision-" + str(i), title=title, wave="../Onda: X")
+        originals.append(task)
+    source["tasks"] = originals
+    model = project_model(source, "demo")
+    paths = [e["reading_path"] for e in model["entries"]]
+    keys = [unicodedata.normalize("NFD", p).casefold() for p in paths]
+    assert len(keys) == len(set(keys))
+    for path in paths:
+        assert not any(c in path for c in '\\:*?"<>|#[]^')
+        assert ".." not in Path(path).parts
+        assert all(len(p.encode()) < 255 for p in Path(path).parts)
+    reverse = copy.deepcopy(source)
+    reverse["tasks"].reverse()
+    alternate = project_model(reverse, "demo")
+    assert {e["id"]: e["reading_path"] for e in model["entries"]} == {
+        e["id"]: e["reading_path"] for e in alternate["entries"]
+    }
+
+
+def test_reading_wikilinks_resolve_and_original_downloads_resolve():
+    import posixpath
+
+    model = project_model(hierarchy_fixture(), "demo-hierarchy")
+    files = export_files(model)
+    for name, content in files.items():
+        if not name.endswith(".md"):
+            continue
+        active = "\n".join(
+            line for line in content.splitlines() if not line.startswith("    ")
+        )
+        for target in links(active):
+            assert resolve_link(target, set(files), name) in files
+        for href in re.findall(r"\]\(([^)]+)\)", active):
+            if not href.startswith("t3-thread:"):
+                assert (
+                    posixpath.normpath(
+                        posixpath.join(posixpath.dirname(name), unquote(href))
+                    )
+                    in files
+                )
+
+
+def test_html_injection_in_all_labels_and_full_content_is_inert():
+    source = hierarchy_fixture()
+    attack = '</script><img src=x onerror="window.pwned=1">@@TITLE@@'
+    source["projects"][0]["title"] = attack
+    source["tasks"][0].update(title=attack, wave=attack, topics=[attack])
+    source["documents"][-1]["content"] = (
+        "# " + attack + "\n<script>window.pwned=2</script>\n[click](javascript:evil())"
+    )
+    files = export_files(project_model(source, "demo-hierarchy"))
+    page = files["index.html"]
+    assert "<img src=x" not in page
+    assert "<script>window.pwned" not in page
+    assert "@@TITLE@@" in page  # source text isn't re-interpolated
+    assert 'href="javascript:' not in page
+    assert 'src="http' not in page
+    assert "fetch(" not in page
+
+
+def test_hierarchy_export_cli_determinism_and_local_edit_protection(tmp_path, capsys):
+    args = [
+        "experience",
+        "export",
+        "--file",
+        str(HIERARCHY),
+        "--project",
+        "demo-hierarchy",
+        "--output",
+        str(tmp_path / "export"),
+    ]
+    assert main(args) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert main(args) == 0
+    assert json.loads(capsys.readouterr().out) == first
+    workspace = tmp_path / "export/.obsidian/workspace.json"
+    workspace.write_text("{}")
+    with pytest.raises(ValueError, match="locally_modified"):
+        write_export(
+            tmp_path / "export",
+            export_files(project_model(hierarchy_fixture(), "demo-hierarchy")),
+        )
+    assert workspace.read_text() == "{}"
+
+
+@pytest.mark.parametrize(
+    "title,kind",
+    [
+        ("Projeto Exemplo Onda 4 fix — F1", "fix"),
+        ("Projeto Exemplo — fix Onda 4", "fix"),
+        ("Projeto Exemplo / Fix: preservar notas", "fix"),
+        ("Correção: preservar notas", "fix"),
+        ("Investigar erro no importador", "task"),
+        ("Relato de erro, sem fix implementado", "task"),
+        ("Fixação do índice", "task"),
+        ("Erro com prefixo hotfix não classificado", "task"),
+    ],
+)
+def test_explicit_fix_marker_inside_title_and_document_keeps_library(title, kind):
+    source = fixture()
+    source["tasks"][0]["title"] = title
+    source["documents"][0]["content"] = (
+        "# " + title + "\n\nConteúdo de origem preservado."
+    )
+    model = project_model(source, "demo")
+    task = next(e for e in model["entries"] if e.get("identity") == "task-demo-1")
+    assert task["kind"] == kind
+    doc = next(
+        e
+        for e in model["entries"]
+        if e.get("document_path") == source["documents"][0]["path"]
+    )
+    files = export_files(model)
+    assert doc["reading_path"] in files["Biblioteca/Biblioteca.md"]
+    assert doc["document_path"] in model["evidence"]
+
+
+def test_orphan_plain_raw_schema_and_json_fix_remain_in_complete_library():
+    from oraculo.memory.schema import digest
+
+    source = fixture()
+    raw_text = "# Caderno avulso\n\nTexto integral sem vínculo com tarefa."
+    structured = json.dumps(
+        {
+            "title": "Projeto Sintético — fix Onda 4",
+            "summary": "Resumo humano preservado.",
+            "unknown_field": {"detail": "CAMPO INTEGRAL DESCONHECIDO"},
+        }
+    )
+    for content in [raw_text, structured]:
+        source["documents"].append(
+            {"path": "projects/demo/raw/" + digest(content) + ".md", "content": content}
+        )
+    source["documents"].append(
+        {
+            "path": "projects/demo/wiki/schema/structure.md",
+            "content": "# Esquema legado\n\nContrato integral preservado.",
+        }
+    )
+    model = project_model(source, "demo")
+    files = export_files(model)
+    entries = {
+        e["document_path"]: e for e in model["entries"] if e.get("document_path")
+    }
+    for doc in source["documents"][-3:]:
+        entry = entries[doc["path"]]
+        assert entry["reading_path"] in files["Biblioteca/Biblioteca.md"]
+        assert doc["content"] == files["Evidencias/" + doc["path"] + ".txt"]
+    fix = entries[source["documents"][-2]["path"]]
+    assert fix["kind"] == "fix"
+    assert fix["reading_path"].startswith("Biblioteca/Fontes/")
+    assert fix["text"].startswith("Resumo\n\nResumo humano")
+    assert "CAMPO INTEGRAL DESCONHECIDO" in files[fix["reading_path"]]
+    assert "CAMPO INTEGRAL DESCONHECIDO" in files["index.html"]
+
+
+def task_entries(source):
+    return {
+        e["identity"]: e
+        for e in project_model(source, "demo-hierarchy")["entries"]
+        if e.get("identity")
+    }
+
+
+def test_explicit_subtasks_and_related_records_are_distinct():
+    source = hierarchy_fixture()
+    model = project_model(source, "demo-hierarchy")
+    tasks = {e["identity"]: e for e in model["entries"] if e.get("identity")}
+    parent = tasks["task-synthetic-0"]
+    assert parent["subtask_ids"] == [
+        tasks["task-synthetic-1"]["id"],
+        tasks["task-synthetic-2"]["id"],
+    ]
+    assert tasks["task-synthetic-1"]["parent_entry_id"] == parent["id"]
+    assert tasks["task-synthetic-1"]["ancestor_ids"] == [parent["id"]]
+    assert not tasks["task-synthetic-3"]["subtask_ids"]
+    records = [e for e in model["entries"] if e.get("task_id") == parent["identity"]]
+    assert records and all(e["id"] not in parent["subtask_ids"] for e in records)
+    assert all(e["related_task_id"] == parent["id"] for e in records)
+    files = export_files(model)
+    assert tasks["task-synthetic-1"]["reading_path"] in files[parent["reading_path"]]
+    assert parent["reading_path"] in files[tasks["task-synthetic-1"]["reading_path"]]
+    assert parent["reading_path"] in files[model["task_index_path"]]
+    assert (
+        "Sem subtarefas registradas."
+        in files[tasks["task-synthetic-3"]["reading_path"]]
+    )
+    assert "/Ondas/" not in parent["reading_path"]
+    assert "Sem onda informada" not in files[model["task_index_path"]]
+
+
+@pytest.mark.parametrize(
+    "relationship", ["orphan", "self_cycle", "cycle", "cross_project"]
+)
+def test_invalid_parent_relations_preserve_tasks_without_inventing_edges(relationship):
+    source = hierarchy_fixture()
+    a, b = source["tasks"][:2]
+    a.pop("parent_task_id", None)
+    b.pop("parent_task_id", None)
+    if relationship == "orphan":
+        a["parent_task_id"] = "missing-parent"
+    elif relationship == "self_cycle":
+        a["parent_task_id"] = a["id"]
+    elif relationship == "cycle":
+        a["parent_task_id"] = b["id"]
+        b["parent_task_id"] = a["id"]
+    else:
+        source["tasks"].append(
+            {
+                "id": "foreign-parent",
+                "title": "PRIVATE_PARENT_SENTINEL",
+                "project": {"project_id": "other"},
+                "child": {"childThreadId": "foreign-thread"},
+            }
+        )
+        a["parent_task_id"] = "foreign-parent"
+        b["origin"] = {"thread_id": "foreign-thread"}
+    model = project_model(source, "demo-hierarchy")
+    tasks = {e["identity"]: e for e in model["entries"] if e.get("identity")}
+    assert tasks[a["id"]]["parent_entry_id"] is None
+    assert tasks[a["id"]]["relationship_status"] == (
+        "cycle" if "cycle" in relationship else "orphan"
+    )
+    assert tasks[b["id"]]["parent_entry_id"] is None
+    files = export_files(model)
+    assert "PRIVATE_PARENT_SENTINEL" not in "".join(files.values())
+    assert tasks[a["id"]]["reading_path"] in files[model["task_index_path"]]
+
+
+def test_unique_native_relation_only_and_explicit_id_takes_precedence():
+    source = hierarchy_fixture()
+    a, b, c = source["tasks"][:3]
+    b.pop("parent_task_id")
+    c.pop("parent_task_id")
+    a["child"] = {"childThreadId": "synthetic-parent-thread"}
+    b["origin"] = {"thread_id": "synthetic-parent-thread"}
+    tasks = task_entries(source)
+    assert tasks[b["id"]]["parent_entry_id"] == tasks[a["id"]]["id"]
+    assert tasks[b["id"]]["relationship_basis"] == "relação nativa de threads"
+    c["child"] = {"childThreadId": "synthetic-parent-thread"}
+    assert task_entries(source)[b["id"]]["parent_entry_id"] is None
+    b["parent_task_id"] = a["id"]
+    assert task_entries(source)[b["id"]]["parent_entry_id"] == tasks[a["id"]]["id"]
+
+
+def test_same_title_wave_and_timestamp_never_create_subtasks():
+    source = hierarchy_fixture()
+    for task in source["tasks"]:
+        task.pop("parent_task_id", None)
+        task["wave"] = "Onda 1"
+        task["title"] = "Mesmo título"
+    assert all(
+        e["parent_entry_id"] is None and not e["subtask_ids"]
+        for e in task_entries(source).values()
+    )

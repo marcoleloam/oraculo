@@ -1,0 +1,29 @@
+{
+  "schema": "second-brain-synthetic-gate-lifecycle-v1",
+  "fixture_host_metadata": true,
+  "not_live_host": true,
+  "clock": "virtual_injected_clock",
+  "seed": 20261101,
+  "virtual_days": 30,
+  "start": "2026-11-02T03:00:00+00:00",
+  "timezone": "UTC",
+  "nightly_hour": 2,
+  "weekly_weekday": 0,
+  "max_pending_jobs": 2,
+  "max_sources": 20,
+  "max_bytes": 2097152,
+  "query_limit": 20,
+  "detail_tokens": 6000,
+  "brief_tokens": 800,
+  "homonym_display_name": "Atlas",
+  "projects": ["atlas-harbor", "atlas-ridge"],
+  "shared_project": "shared",
+  "pilot_state_with_injected_clock": "accepted_simulation",
+  "recall_floor": 0.9,
+  "language_regression_max_drop": 0.02,
+  "notes": [
+    "Fixture labels only. This file is not live host metadata and not a customer corpus.",
+    "Homonym display name matches the frozen f0 manifest. Project ids stay distinct.",
+    "The injected clock never satisfies a real 14-day human pilot."
+  ]
+}

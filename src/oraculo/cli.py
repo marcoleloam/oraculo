@@ -145,6 +145,9 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="oraculo")
     root.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     commands = root.add_subparsers(dest="command", required=True)
+    from oraculo.knowledge_cli import add_parser as add_brain_parser
+
+    add_brain_parser(commands)
     task = commands.add_parser("task")
     task.add_argument(
         "action",
@@ -206,6 +209,12 @@ def parser() -> argparse.ArgumentParser:
     panel_scope.add_argument("--project")
     panel_scope.add_argument("--all-projects", action="store_true")
     panel.add_argument("--port", type=int, default=8765)
+    portfolio = views.add_parser("portfolio")
+    portfolio.add_argument("--file", type=Path, required=True)
+    portfolio.add_argument("--output", type=Path, required=True)
+    sync = views.add_parser("sync")
+    sync.add_argument("--output", type=Path, required=True)
+    sync.add_argument("--project", action="append")
     readable = views.add_parser("status")
     readable.add_argument("--file", type=Path, required=True)
     readable.add_argument("--json", action="store_true")
@@ -450,9 +459,265 @@ async def experience_snapshot(config: Config, project: str) -> dict:
     raise ValueError("experience_snapshot_incomplete")
 
 
+_PORTFOLIO_KEYS = {"schema_version", "snapshots", "project_titles"}
+_CATALOG_DENIAL = (
+    "experience_snapshot_service_failed:project_not_registered_or_outside_scope"
+)
+
+
+def validate_sync_projects(projects: list[str] | None) -> list[str]:
+    selected = list(projects or [])
+    if any(type(item) is not str or item == "" for item in selected):
+        raise ValueError("experience_sync_invalid_project")
+    if len(selected) != len(set(selected)):
+        raise ValueError("experience_sync_duplicate_project")
+    return selected
+
+
+def snapshot_project_id(snapshot: dict) -> str:
+    """Identity of one service snapshot. Rejects a multi-project blob."""
+    if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+        raise ValueError("experience_portfolio_invalid_artifact")
+    projects = snapshot.get("projects")
+    if (
+        not isinstance(projects, list)
+        or len(projects) != 1
+        or not isinstance(projects[0], dict)
+    ):
+        raise ValueError("experience_portfolio_invalid_artifact")
+    project_id = projects[0].get("id")
+    declared = snapshot.get("project_id")
+    if (
+        not isinstance(project_id, str)
+        or project_id == ""
+        or (declared is not None and declared != project_id)
+    ):
+        raise ValueError("experience_portfolio_invalid_artifact")
+    return project_id
+
+
+def reject_unsafe_export_paths(files: dict) -> None:
+    from pathlib import PurePosixPath
+
+    for path in files:
+        pure = PurePosixPath(path) if isinstance(path, str) else None
+        if (
+            pure is None
+            or path == ""
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or "\\" in path
+            or str(pure) != path
+        ):
+            raise ValueError("experience_portfolio_unsafe_path")
+
+
+def load_portfolio_bundle(path: Path) -> tuple[list[dict], dict[str, str] | None]:
+    try:
+        bundle = json.loads(path.read_text())
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("experience_portfolio_invalid_artifact") from exc
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("schema_version") != 1
+        or not set(bundle).issubset(_PORTFOLIO_KEYS)
+        or "snapshots" not in bundle
+    ):
+        raise ValueError("experience_portfolio_invalid_artifact")
+    snapshots = bundle["snapshots"]
+    if not isinstance(snapshots, list):
+        raise ValueError("experience_portfolio_invalid_artifact")
+    if not snapshots:
+        raise ValueError("experience_portfolio_no_projects")
+    identities = [snapshot_project_id(snapshot) for snapshot in snapshots]
+    if len(identities) != len(set(identities)):
+        raise ValueError("experience_portfolio_duplicate_project")
+    titles = bundle["project_titles"] if "project_titles" in bundle else None
+    if titles is not None:
+        if not isinstance(titles, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) or value == ""
+            for key, value in titles.items()
+        ):
+            raise ValueError("experience_portfolio_invalid_artifact")
+        if not set(titles).issubset(identities):
+            raise ValueError("experience_portfolio_unknown_title")
+    return snapshots, titles
+
+
+def catalog_rows(status: dict) -> tuple[list[dict], dict]:
+    """Registered catalog from status.get. Paths stay out of the reading receipt."""
+    if not isinstance(status, dict) or status.get("ok") is not True:
+        message = ""
+        error = status.get("error") if isinstance(status, dict) else None
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            message = error["message"]
+        raise ValueError("experience_sync_service_failed:" + message)
+    data = status.get("data")
+    projects = data.get("projects") if isinstance(data, dict) else None
+    if not isinstance(projects, list):
+        raise ValueError("experience_sync_invalid_catalog")
+    rows = []
+    seen: set[str] = set()
+    for row in projects:
+        if not isinstance(row, dict):
+            raise ValueError("experience_sync_invalid_catalog")
+        project_id = row.get("id")
+        state = row.get("status")
+        if (
+            not isinstance(project_id, str)
+            or project_id == ""
+            or not isinstance(state, str)
+            or project_id in seen
+        ):
+            raise ValueError("experience_sync_invalid_catalog")
+        seen.add(project_id)
+        rows.append(row)
+    return rows, data
+
+
+def catalog_titles(rows: list[dict]) -> dict[str, str] | None:
+    """Human titles only when the catalog itself carries a non-empty string."""
+    titles = {}
+    for row in rows:
+        title = row.get("title")
+        if isinstance(title, str) and title != "":
+            titles[row["id"]] = title
+    return titles or None
+
+
+def portfolio_freshness(snapshots: list[dict], source: str) -> list[dict]:
+    items = []
+    for snapshot in snapshots:
+        observed = snapshot.get("observed_at")
+        items.append(
+            {
+                "project_id": snapshot_project_id(snapshot),
+                "observed_at": observed if isinstance(observed, str) else None,
+                "source": source,
+            }
+        )
+    return items
+
+
+def write_portfolio(
+    destination: Path,
+    snapshots: list[dict],
+    titles: dict[str, str] | None,
+    *,
+    mode: str,
+) -> dict:
+    try:
+        from oraculo.experience_portfolio import (
+            portfolio_export_files,
+            portfolio_model,
+        )
+    except ImportError as exc:
+        raise ValueError("experience_portfolio_unavailable") from exc
+    from oraculo.experience_portfolio_refresh import refresh_export
+
+    model = portfolio_model(snapshots, titles)
+    if (
+        not isinstance(model, dict)
+        or model.get("schema_version") != 1
+        or model.get("kind") != "portfolio"
+    ):
+        raise ValueError("experience_portfolio_invalid_model")
+    files = portfolio_export_files(model)
+    if not isinstance(files, dict) or any(
+        not isinstance(content, str) for content in files.values()
+    ):
+        raise ValueError("experience_portfolio_invalid_files")
+    reject_unsafe_export_paths(files)
+    result = refresh_export(destination, files)
+    observed = model.get("observed_at")
+    result["mode"] = mode
+    result["observed_at"] = observed if isinstance(observed, str) else None
+    source = "file" if mode == "snapshot" else "service"
+    result["freshness"] = portfolio_freshness(snapshots, source)
+    result["projects"] = [item["project_id"] for item in result["freshness"]]
+    return result
+
+
+async def experience_sync(
+    config: Config, destination: Path, projects: list[str]
+) -> dict:
+    """Refresh every selected authorized project, or write nothing."""
+    status = await request(config, make_envelope("status.get", "*", {}))
+    rows, data = catalog_rows(status)
+    by_id = {row["id"]: row for row in rows}
+    explicit = bool(projects)
+    if explicit:
+        missing = [item for item in projects if item not in by_id]
+        if missing:
+            raise ValueError("experience_sync_unknown_project:" + ",".join(missing))
+        unregistered = [
+            item for item in projects if by_id[item]["status"] != "registered"
+        ]
+        if unregistered:
+            raise ValueError(
+                "experience_sync_project_not_registered:" + ",".join(unregistered)
+            )
+        selected = [by_id[item] for item in sorted(projects)]
+    else:
+        selected = sorted(
+            (row for row in rows if row["status"] == "registered"),
+            key=lambda row: row["id"],
+        )
+    snapshots: list[dict] = []
+    included: list[dict] = []
+    excluded: list[str] = []
+    failures: list[str] = []
+    for row in selected:
+        project_id = row["id"]
+        try:
+            snapshot = await experience_snapshot(config, project_id)
+        except ValueError as exc:
+            message = str(exc)
+            if message == _CATALOG_DENIAL:
+                if explicit:
+                    failures.append(project_id + ":not_authorized")
+                else:
+                    excluded.append(project_id)
+                continue
+            failures.append(project_id + ":" + message)
+            continue
+        try:
+            identity = snapshot_project_id(snapshot)
+        except ValueError:
+            failures.append(project_id + ":experience_sync_scope")
+            continue
+        if identity != project_id:
+            failures.append(project_id + ":experience_sync_scope")
+            continue
+        snapshots.append(snapshot)
+        included.append(row)
+    if failures:
+        raise ValueError("experience_sync_incomplete:" + ",".join(failures))
+    if not snapshots:
+        suffix = ":" + ",".join(excluded) if excluded else ""
+        raise ValueError("experience_sync_no_authorized_projects" + suffix)
+    result = write_portfolio(
+        destination, snapshots, catalog_titles(included), mode="refresh"
+    )
+    result["excluded_unauthorized"] = excluded
+    runtime = data.get("runtime") if isinstance(data.get("runtime"), dict) else {}
+    protocol = runtime.get("protocol_version")
+    health = data.get("health")
+    result["service"] = {
+        "health": health if isinstance(health, str) else None,
+        "protocol_version": protocol if type(protocol) is int else None,
+    }
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "brain":
+            from oraculo.knowledge_cli import command as brain_command
+
+            print_json(asyncio.run(brain_command(Config.load(args.config), args)))
+            return 0
         if args.command == "obsidian":
             from oraculo.obsidian import project_labels_css
 
@@ -467,6 +732,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "experience":
+            if args.action == "portfolio":
+                snapshots, titles = load_portfolio_bundle(args.file)
+                print_json(
+                    write_portfolio(args.output, snapshots, titles, mode="snapshot")
+                )
+                return 0
+            if args.action == "sync":
+                selected = validate_sync_projects(args.project)
+                print_json(
+                    asyncio.run(
+                        experience_sync(Config.load(args.config), args.output, selected)
+                    )
+                )
+                return 0
             from oraculo.experience import export_files, project_model, write_export
             from oraculo.presentation import summary_markdown, task_view
 

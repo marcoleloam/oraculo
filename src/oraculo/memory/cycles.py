@@ -237,8 +237,14 @@ class MemoryCycles:
             with self.publisher.locked():
                 self.publisher._recover()
                 self.publisher._check_integrity()
+                # Budgeted retrieval is the memory-cycle consumer. Small corpora
+                # that already fit keep complete legacy bytes (strict_abstain
+                # off) so existing receipts stay full-content and in scope.
                 bundle = Context(self.publisher.vault).bundle(
-                    item["project_id"], item["query"]
+                    item["project_id"],
+                    item["query"],
+                    mode="budgeted",
+                    strict_abstain=False,
                 )
                 bundle["base_commit"] = self.publisher.git.head()
                 if bundle["base_commit"] is None:

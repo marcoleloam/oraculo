@@ -13,11 +13,13 @@ from typing import Any, Iterator
 
 from oraculo.config import resources_root
 
+from .claims import validate_knowledge
 from .git import VaultGit
 from .schema import (
     ConflictError,
     MemoryError,
     MemoryProposal,
+    _shield_claims,
     corpus,
     digest,
     identifier,
@@ -159,7 +161,11 @@ class Publisher:
         atomic_write(path, json.dumps(journal, ensure_ascii=False).encode())
 
     def _transaction(
-        self, operation_id: str, updates: dict[str, bytes], payload_hash: str = ""
+        self,
+        operation_id: str,
+        updates: dict[str, bytes],
+        payload_hash: str = "",
+        knowledge_findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         identifier(operation_id)
         journal_path = self.journals / f"{operation_id}.json"
@@ -188,6 +194,8 @@ class Publisher:
                 p: base64.b64encode(data).decode() for p, data in updates.items()
             },
         }
+        if knowledge_findings is not None:
+            journal["knowledge_findings"] = knowledge_findings
         self._save_journal(journal_path, journal)
         return self._finish(journal_path, journal)
 
@@ -218,6 +226,8 @@ class Publisher:
             "commit": commit,
             "paths": list(updates),
         }
+        if "knowledge_findings" in journal:
+            receipt["knowledge_findings"] = journal["knowledge_findings"]
         journal.update(state="confirmed", receipt=receipt)
         self._save_journal(journal_path, journal)
         return receipt
@@ -371,13 +381,30 @@ class Publisher:
                     if existing_meta.get("page_id") == change.page_id:
                         raise MemoryError("duplicate_page_identity")
             updates[change.path] = normalized.encode()
+        available = dict(pages)
+        for path, data in updates.items():
+            available[path] = data.decode("utf-8")
+        knowledge_findings: list[dict[str, Any]] = []
+        for change in proposal.changes:
+            knowledge_findings.extend(
+                validate_knowledge(
+                    available[change.path], proposal.project_id, available
+                )
+            )
+        blocked = [
+            item for item in knowledge_findings if item.get("severity") == "error"
+        ]
+        if blocked:
+            raise MemoryError(str(blocked[0]["code"]))
         known = set(pages) | set(updates)
         for path, content in updates.items():
             if "/raw/" in path:
                 continue
-            for target in links(content.decode()) + markdown_targets(content.decode()):
+            text = content.decode()
+            surface, _claims = _shield_claims(text)
+            for target in links(surface) + markdown_targets(surface):
                 resolve_link(target, known, path)
-            meta, _ = parse_page(content.decode())
+            meta, _ = parse_page(text)
             note = meta.get("source_note")
             if isinstance(note, str) and not note.startswith("[["):
                 resolve_link(note, known, path)
@@ -405,7 +432,12 @@ class Publisher:
             previous
             + f"\n## [{today}] ingest | {proposal.batch_id}\n\nbatch_id: {proposal.batch_id}\noperation_id: {proposal.operation_id}\n"
         ).encode()
-        return self._transaction(proposal.operation_id, updates, payload_hash)
+        return self._transaction(
+            proposal.operation_id,
+            updates,
+            payload_hash,
+            knowledge_findings=knowledge_findings,
+        )
 
     def _tags(self, prefix: str) -> set[str] | None:
         path = safe_path(self.vault, f"{prefix}/wiki/schema/config.md")

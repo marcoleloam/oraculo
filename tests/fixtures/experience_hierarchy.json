@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "demonstration": true,
+  "observed_at": "2026-10-30T12:00:00Z",
+  "projects": [
+    {
+      "id": "demo-hierarchy",
+      "title": "Projeto Aurora · demonstração sintética"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task-synthetic-0",
+      "title": "Planejar importação",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": true,
+      "memory": {
+        "id": "cycle-synthetic-0"
+      },
+      "wave": "Onda 1"
+    },
+    {
+      "id": "task-synthetic-1",
+      "title": "Validar notas",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": true,
+      "memory": {
+        "id": "cycle-synthetic-1"
+      },
+      "wave": "Onda 1",
+      "parent_task_id": "task-synthetic-0"
+    },
+    {
+      "id": "task-synthetic-2",
+      "title": "Validar notas",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": true,
+      "memory": {
+        "id": "cycle-synthetic-2"
+      },
+      "wave": "Onda 1",
+      "parent_task_id": "task-synthetic-0"
+    },
+    {
+      "id": "task-synthetic-3",
+      "title": "Fix: preservar notas",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": true,
+      "memory": {
+        "id": "cycle-synthetic-3"
+      },
+      "wave": "Onda 1"
+    },
+    {
+      "id": "task-synthetic-4",
+      "title": "Validar notas",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": true,
+      "memory": {
+        "id": "cycle-synthetic-4"
+      },
+      "topics": [
+        "onda/2"
+      ]
+    },
+    {
+      "id": "task-synthetic-5",
+      "title": "Aurora — Onda 4 — Organizar biblioteca",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "executing",
+      "work_status": "pending",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": false,
+      "memory": {
+        "id": "cycle-synthetic-5"
+      }
+    },
+    {
+      "id": "task-synthetic-6",
+      "title": "Investigar erro de importação",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "executing",
+      "work_status": "pending",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": false,
+      "memory": {
+        "id": "cycle-synthetic-6"
+      }
+    },
+    {
+      "id": "task-synthetic-7",
+      "title": "Corrigir índice",
+      "project": {
+        "project_id": "demo-hierarchy"
+      },
+      "phase": "pr_pending",
+      "work_status": "succeeded",
+      "observed_at": "2026-10-30T12:00:00Z",
+      "completion_evidence": true,
+      "memory": {
+        "id": "cycle-synthetic-7"
+      },
+      "kind": "fix",
+      "onda": 2
+    }
+  ],
+  "cycles": [
+    {
+      "id": "cycle-synthetic-0",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-1",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-2",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-3",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-4",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-5",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-6",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    },
+    {
+      "id": "cycle-synthetic-7",
+      "project_id": "demo-hierarchy",
+      "read_state": "empty",
+      "write_state": "saved"
+    }
+  ],
+  "documents": [
+    {
+      "path": "projects/demo-hierarchy/raw/2e25a1e543e6665a8d05fa88b9f34fef355d1fccdc22e0bc51cd3162c80c0774.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-0\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Planejar importação. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Planejar importação\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "2e25a1e543e6665a8d05fa88b9f34fef355d1fccdc22e0bc51cd3162c80c0774"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-0.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- Planejar importação\n---\n# Planejar importação\n\n## Resumo\n\nDemonstração fictícia: Planejar importação. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/2e25a1e543e6665a8d05fa88b9f34fef355d1fccdc22e0bc51cd3162c80c0774.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/f1907d69fa8a254b5869f3e709a5ef1bff0da7b282090daaeb0a1543b57c7c7b.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-1\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Validar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Validar notas\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "f1907d69fa8a254b5869f3e709a5ef1bff0da7b282090daaeb0a1543b57c7c7b"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-1.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- Validar notas\n---\n# Validar notas\n\n## Resumo\n\nDemonstração fictícia: Validar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/f1907d69fa8a254b5869f3e709a5ef1bff0da7b282090daaeb0a1543b57c7c7b.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/cb18760682373768cff4bc9eb68242923879f797efd621f66065067464993883.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-2\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Validar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Validar notas\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "cb18760682373768cff4bc9eb68242923879f797efd621f66065067464993883"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-2.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- Validar notas\n---\n# Validar notas\n\n## Resumo\n\nDemonstração fictícia: Validar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/cb18760682373768cff4bc9eb68242923879f797efd621f66065067464993883.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/cb95eaffc07ce26cd1c774d9e0eb2944fc44fdb11bb20c5e49d36b256b67f432.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-3\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Fix: preservar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Fix: preservar notas\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "cb95eaffc07ce26cd1c774d9e0eb2944fc44fdb11bb20c5e49d36b256b67f432"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-3.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- 'Fix: preservar notas'\n---\n# Fix: preservar notas\n\n## Resumo\n\nDemonstração fictícia: Fix: preservar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/cb95eaffc07ce26cd1c774d9e0eb2944fc44fdb11bb20c5e49d36b256b67f432.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/df9aa6c830d568391fd88f182dcf39e132fc30eca6e47360a51b8a2a6367101c.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-4\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Validar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Validar notas\", \"topics\": [\"Leitura\", \"Importação\", \"onda/2\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "df9aa6c830d568391fd88f182dcf39e132fc30eca6e47360a51b8a2a6367101c"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-4.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\n- onda/2\naliases:\n- Validar notas\n---\n# Validar notas\n\n## Resumo\n\nDemonstração fictícia: Validar notas. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/df9aa6c830d568391fd88f182dcf39e132fc30eca6e47360a51b8a2a6367101c.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/9a411823c3ced90c75613639950ebd8b737e74bfe66844aba620b2ec81a2a442.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-5\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Aurora — Onda 4 — Organizar biblioteca. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Aurora — Onda 4 — Organizar biblioteca\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "9a411823c3ced90c75613639950ebd8b737e74bfe66844aba620b2ec81a2a442"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-5.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- Aurora — Onda 4 — Organizar biblioteca\n---\n# Aurora — Onda 4 — Organizar biblioteca\n\n## Resumo\n\nDemonstração fictícia: Aurora — Onda 4 — Organizar biblioteca. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/9a411823c3ced90c75613639950ebd8b737e74bfe66844aba620b2ec81a2a442.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/69ec2c4a1fd3a7d6bc0819e3115d431c4d60cfdd8995f7189ec3b2e22105a75e.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-6\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"errors\": [\"importação interrompida — investigar causa; não indica Fix.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Investigar erro de importação. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Investigar erro de importação\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "69ec2c4a1fd3a7d6bc0819e3115d431c4d60cfdd8995f7189ec3b2e22105a75e"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-6.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- Investigar erro de importação\n---\n# Investigar erro de importação\n\n## Resumo\n\nDemonstração fictícia: Investigar erro de importação. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/69ec2c4a1fd3a7d6bc0819e3115d431c4d60cfdd8995f7189ec3b2e22105a75e.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/c33f7c1fec85a43e7dad71ebe9c3f184b0a582280c9cdf138f2a90861294480e.md",
+      "content": "{\"cycle_id\": \"cycle-synthetic-7\", \"evidence\": {\"changes\": [\"Navegação organizada por onda quando a fonte a informa.\"], \"decisions\": [\"Manter a fonte original e reconstruir somente a projeção de leitura.\"], \"lessons\": [\"Títulos humanos facilitam a consulta; identidade técnica continua preservada.\"], \"limitations\": [\"Exemplo sintético, sem operação ou resultado de projeto real.\"], \"summary\": \"Demonstração fictícia: Corrigir índice. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\", \"title\": \"Corrigir índice\", \"topics\": [\"Leitura\", \"Importação\"]}, \"project_id\": \"demo-hierarchy\", \"schema_version\": 1}",
+      "sha256": "c33f7c1fec85a43e7dad71ebe9c3f184b0a582280c9cdf138f2a90861294480e"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/sources/memory-7.md",
+      "content": "---\ntype: source\ntags:\n- Leitura\n- Importação\naliases:\n- Corrigir índice\n---\n# Corrigir índice\n\n## Resumo\n\nDemonstração fictícia: Corrigir índice. Este registro explica a intenção, o resultado declarado e as fontes selecionadas.\n\n## Decisões\n\nManter a fonte original e reconstruir somente a projeção de leitura.\n\n## Aprendizados\n\nTítulos humanos facilitam a consulta; identidade técnica continua preservada.\n\nFonte: [[projects/demo-hierarchy/raw/c33f7c1fec85a43e7dad71ebe9c3f184b0a582280c9cdf138f2a90861294480e.md]]\n"
+    },
+    {
+      "path": "projects/demo-hierarchy/raw/69f26e0d6d62400bdb3ef775bc603a442a2ea32133ccd3bc51110c922242294e.md",
+      "content": "{\"body\": \"Este material não está ligado a uma tarefa e precisa continuar acessível.\", \"summary\": \"Fonte isolada: ação, revisão, decisão e conteúdo integral.\", \"title\": \"Pesquisa avulsa sobre acentuação\"}",
+      "sha256": "69f26e0d6d62400bdb3ef775bc603a442a2ea32133ccd3bc51110c922242294e"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/concepts/legacy.md",
+      "content": "# Guia de leitura legado\n\nSem onda registrada.\n\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nParágrafo de conteúdo preservado.\nFIM DO CONTEÚDO INTEGRAL"
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/index.md",
+      "content": "# Índice do projeto sintético\n\nÍndice integral preservado."
+    },
+    {
+      "path": "projects/demo-hierarchy/wiki/log.md",
+      "content": "# Histórico sintético\n\nRegistro sem tarefa associada."
+    },
+    {
+      "path": "shared/wiki/concepts/read.md",
+      "content": "# Convenção compartilhada de leitura\n\nExemplo compartilhado selecionado pelo snapshot."
+    }
+  ]
+}
