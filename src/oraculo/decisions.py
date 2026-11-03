@@ -14,7 +14,6 @@ import json
 import math
 import os
 import re
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +23,11 @@ import httpx2
 from pydantic import Field
 
 from oraculo.config import DecisionsConfig, StrictModel
+from oraculo.decision_credentials import (
+    CredentialUnavailable,
+    resolve_credential,
+    valid_token,
+)
 from oraculo.protocol import canonical_json, content_hash
 from oraculo.state import State, StateError
 
@@ -64,81 +68,119 @@ class DecisionTransport(Protocol):
     ) -> tuple[int, dict]: ...
 
 
-def _keychain_password():
-    # Explicit secure backend; never select ambient/env/file backends. Imported
-    # lazily so disabled/default/zero-budget paths cannot access the Keychain.
-    from keyring.backends.macOS import Keyring
-
-    return Keyring().get_password("oraculo.openai", "decisions-api")
-
-
-async def resolve_credential(reference):
-    if reference != "ref:oraculo-openai-decisions" or sys.platform != "darwin":
-        raise StateError("decision_credential_unavailable")
-    try:
-        return await asyncio.to_thread(_keychain_password)
-    except Exception:
-        raise StateError("decision_credential_unavailable") from None
+class DecisionTransportError(StateError):
+    def __init__(self, stage, reason="transport"):
+        self.stage, self.reason = stage, reason
+        super().__init__("decision_transport_failed")
 
 
 class HTTPDecisionTransport:
-    """Fixed official endpoint; no redirects, retries, ambient auth or raw errors.
-
-    The resolver is installed by the operator/service, never supplied in a request.
-    A MockTransport can exercise this exact HTTP path without opening the network.
-    """
+    """Single HTTP attempt with bounded local preparation and safe stage evidence."""
 
     def __init__(self, credential_resolver=None, *, http_transport=None):
         self._resolve = credential_resolver or resolve_credential
         self._transport = http_transport
+        self.credential_status = dict(
+            state="unavailable", reason="not_prepared", stage="before_http"
+        )
 
-    async def post(self, path, body, *, timeout, credential_reference):
-        if path != "/v1/decisions" or body.get("model") != "gpt-6-luna":
-            raise StateError("decision_endpoint_invalid")
-        if self._resolve is None or credential_reference is None:
-            raise StateError("decision_credential_unavailable")
-        token = None
+    async def _credential(self, reference):
         try:
-            token = (
-                self._resolve(credential_reference)
-                if inspect.iscoroutinefunction(self._resolve)
-                else await asyncio.to_thread(self._resolve, credential_reference)
-            )
+            # The production resolver is asynchronous and owns a killable
+            # subprocess. Synchronous injected resolvers are laboratory hooks;
+            # do not launch them in an uncancellable executor thread.
+            token = self._resolve(reference)
             if inspect.isawaitable(token):
                 token = await token
-            if (
-                not isinstance(token, str)
-                or not token
-                or any(c in token for c in "\r\n")
-            ):
-                raise StateError("decision_credential_unavailable")
-            transport = self._transport or httpx2.AsyncHTTPTransport(
-                retries=0, trust_env=False
+            if not valid_token(token):
+                raise CredentialUnavailable("invalid_value")
+            self.credential_status = dict(
+                state="available", reason="resolved", stage="before_http"
             )
-            async with httpx2.AsyncClient(
-                transport=transport,
-                trust_env=False,
-                follow_redirects=False,
-                timeout=timeout,
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    "https://api.openai.com/v1/decisions",
-                    json=body,
-                    headers={"Authorization": "Bearer " + token},
-                ) as response:
-                    if response.status_code != 200:
-                        return response.status_code, {}
-                    raw = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        raw.extend(chunk)
-                        if len(raw) > 65536:
-                            raise StateError("decision_response_limit")
-                    return response.status_code, json.loads(raw)
+            return token
+        except asyncio.CancelledError:
+            self.credential_status = dict(
+                state="unavailable", reason="cancelled", stage="before_http"
+            )
+            raise
+        except Exception as exc:
+            reason = (
+                exc.reason
+                if type(exc) is CredentialUnavailable
+                else "backend_unavailable"
+            )
+            self.credential_status = dict(
+                state="unavailable", reason=reason, stage="before_http"
+            )
+            raise DecisionTransportError(
+                "before_http", "credential_" + reason
+            ) from None
+
+    async def prepare(self, reference):
+        try:
+            async with asyncio.timeout(2):
+                await self._credential(reference)
+        except TimeoutError:
+            self.credential_status = dict(
+                state="unavailable", reason="timeout", stage="before_http"
+            )
+        except DecisionTransportError:
+            pass
+        return dict(self.credential_status, api_calls=0, tokens=0)
+
+    async def post(
+        self, path, body, *, timeout, credential_reference, stage_callback=None
+    ):
+        stage = "before_http"
+        token = None
+
+        def observed(value):
+            nonlocal stage
+            stage = value
+            if stage_callback:
+                stage_callback(stage)
+
+        try:
+            if path != "/v1/decisions" or body.get("model") != "gpt-6-luna":
+                raise DecisionTransportError(stage)
+            async with asyncio.timeout(timeout):
+                token = await self._credential(credential_reference)
+                transport = self._transport or httpx2.AsyncHTTPTransport(
+                    retries=0, trust_env=False
+                )
+                async with httpx2.AsyncClient(
+                    transport=transport,
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=timeout,
+                ) as client:
+                    # Commit possible_send BEFORE entering the HTTP stack. Even
+                    # connection errors cannot prove that no request was sent.
+                    observed("possible_send")
+                    async with client.stream(
+                        "POST",
+                        "https://api.openai.com/v1/decisions",
+                        json=body,
+                        headers={"Authorization": "Bearer " + token},
+                    ) as response:
+                        observed("response")
+                        if response.status_code != 200:
+                            return response.status_code, {}
+                        raw = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            raw.extend(chunk)
+                            if len(raw) > 65536:
+                                raise DecisionTransportError(stage, "schema")
+                        try:
+                            return response.status_code, json.loads(raw)
+                        except (ValueError, UnicodeError):
+                            raise DecisionTransportError(stage, "schema") from None
         except asyncio.CancelledError:
             raise
+        except DecisionTransportError:
+            raise
         except Exception:
-            raise StateError("decision_transport_failed") from None
+            raise DecisionTransportError(stage) from None
         finally:
             token = None
 
@@ -331,6 +373,48 @@ class Decisions:
             or self.transport is None
         )
 
+    async def prepare(self):
+        # Explicit local prerequisite, independent of ledger unknown/circuit.
+        # No reservation, paid transport, task or schema mutation.
+        if self.disabled():
+            reason = "disabled"
+        elif (
+            self.config.daily_budget_microusd == 0
+            or self.config.task_budget_microusd == 0
+            or self.config.max_calls == 0
+            or (self.config.mode == "shadow" and self.config.run_budget_microusd == 0)
+        ):
+            reason = "budget"
+        elif self.config.tariff is None:
+            reason = "financial_bound_unavailable"
+        elif not isinstance(self.transport, HTTPDecisionTransport):
+            reason = "preparation_unavailable"
+        else:
+            return await self.transport.prepare(self.config.credential_reference)
+        return dict(
+            state="unavailable",
+            reason=reason,
+            stage="before_http",
+            api_calls=0,
+            tokens=0,
+        )
+
+    def status(self, project):
+        from oraculo.decision_recovery import financial_status
+
+        credential = (
+            dict(self.transport.credential_status)
+            if isinstance(self.transport, HTTPDecisionTransport)
+            else dict(state="unavailable", reason="not_prepared", stage="before_http")
+        )
+        return dict(
+            financial=financial_status(self, project),
+            credential=credential,
+            enabled=not self.disabled(),
+            api_calls=0,
+            tokens=0,
+        )
+
     def result(self, key, reason, **extra):
         return dict(
             key=key,
@@ -415,16 +499,24 @@ class Decisions:
             previous = self.state.get_meta(meta)
             if previous:
                 return previous, None, False
-            entries = self.entries()
-            book = self.state.get_meta(
-                PREFIX + "book",
-                {
-                    "unknown_cost": False,
-                    "failures": [],
-                    "consecutive": 0,
-                    "open_until": 0,
-                },
-            )
+            from oraculo.decision_recovery import validate_book, validate_entry
+
+            try:
+                entries = self.entries()
+                for stored in entries:
+                    validate_entry(self, stored)
+                book = self.state.get_meta(
+                    PREFIX + "book",
+                    {
+                        "unknown_cost": False,
+                        "failures": [],
+                        "consecutive": 0,
+                        "open_until": 0,
+                    },
+                )
+                validate_book(book, entries)
+            except (ValueError, KeyError, TypeError):
+                return None, "decision_accounting_corrupt", False
             for e in entries:
                 if e["state"] in {"intent", "sent"} and e["deadline"] <= now:
                     book["unknown_cost"] = True
@@ -433,6 +525,13 @@ class Decisions:
                         dict(e, state="unknown", reason="crash_or_deadline"),
                     )
             self.state.require_operational_schema()
+            self.state.set_meta(PREFIX + "book", book)
+            from oraculo.decision_recovery import unresolved
+
+            try:
+                book["unknown_cost"] = bool(unresolved(self, self.entries(), book))
+            except (ValueError, KeyError, TypeError):
+                return None, "decision_accounting_corrupt", False
             self.state.set_meta(PREFIX + "book", book)
             if book["unknown_cost"]:
                 return None, "unknown_cost", False
@@ -650,7 +749,7 @@ class Decisions:
                     return self.result(key, error)
             return replay
         # Crash after intent also never permits a second send for this key.
-        sent = dict(entry, state="sent")
+        sent = dict(entry, state="sent", stage="before_http")
         if not self.state.compare_meta(meta, entry, sent):
             return self.result(key, "cas_lost")
         if self.disabled() or current_snapshot() != frozen:
@@ -665,13 +764,28 @@ class Decisions:
             return self._finish(
                 meta, sent, "deadline", None, None, started, current_error
             )
+
+        def observe_stage(stage):
+            nonlocal sent
+            updated = dict(sent, stage=stage)
+            if not self.state.compare_meta(meta, sent, updated):
+                raise StateError("decision_stage_cas_lost")
+            sent = updated
+
         try:
+            extra = {}
+            if isinstance(self.transport, HTTPDecisionTransport):
+                extra["stage_callback"] = observe_stage
+            else:
+                # An opaque injected transport supplies no before-send proof.
+                observe_stage("possible_send")
             async with asyncio.timeout(remaining):
                 status, raw = await self.transport.post(
                     "/v1/decisions",
                     copy.deepcopy(request),
                     timeout=remaining,
                     credential_reference=self.config.credential_reference,
+                    **extra,
                 )
             if type(status) is not int or status != 200:
                 reason = (
@@ -683,6 +797,13 @@ class Decisions:
                 return self._finish(
                     meta, sent, reason, None, None, started, current_error
                 )
+            question = request["questions"][0]
+            answer, usage = validate_response(
+                raw,
+                token_bound,
+                name=question["name"],
+                choices=tuple(c["value"] for c in question["choices"]),
+            )
             if (
                 self.monotonic() - started >= self.config.deadline_seconds
                 or self.clock() >= sent["deadline"]
@@ -699,13 +820,6 @@ class Decisions:
                 return self._finish(
                     meta, sent, "snapshot_changed", None, None, started, current_error
                 )
-            question = request["questions"][0]
-            answer, usage = validate_response(
-                raw,
-                token_bound,
-                name=question["name"],
-                choices=tuple(c["value"] for c in question["choices"]),
-            )
             return self._finish(meta, sent, None, answer, usage, started, current_error)
         except asyncio.CancelledError:
             self._finish(meta, sent, "cancelled", None, None, started, current_error)
@@ -713,7 +827,9 @@ class Decisions:
         except Exception as exc:
             # Neither exception text nor raw bodies/headers enter logs/receipts.
             reason = (
-                str(exc)
+                exc.reason
+                if type(exc) is DecisionTransportError
+                else str(exc)
                 if type(exc) is StateError
                 and str(exc) in {"schema", "usage", "refusal"}
                 else "transport"
@@ -727,6 +843,7 @@ class Decisions:
             latency_ms=max(0, self.monotonic() - started) * 1000,
             expires_at=entry["expires_at"],
             deadline=entry["deadline"],
+            stage=entry.get("stage", "unknown"),
             policy_hash=entry["snapshot"]["policy_hash"],
             model="gpt-6-luna",
             request_artifact=entry["request_artifact"],
@@ -814,6 +931,7 @@ class Decisions:
                         response_artifact=response_artifact,
                     )
                 result.update(
+                    stage=sent.get("stage", "unknown"),
                     latency_ms=max(0, self.monotonic() - started) * 1000,
                     expires_at=sent["expires_at"],
                     deadline=sent["deadline"],

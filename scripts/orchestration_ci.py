@@ -37,6 +37,8 @@ SELECTION = (
     "operational_decisions",
     "local_rollout",
     "decisions",
+    "decision_credentials",
+    "decision_recovery",
     "decisions_eval",
     "outcomes",
     "rollout",

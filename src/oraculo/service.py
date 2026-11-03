@@ -1211,6 +1211,9 @@ class Service:
             "decisions.shadow",
             "decisions.canary",
             "decisions.kill",
+            "decisions.prepare",
+            "decisions.status",
+            "decisions.acknowledge",
             "outcome.verify",
             "rollout.verify",
         }:
