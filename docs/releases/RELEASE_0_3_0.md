@@ -45,6 +45,12 @@ O template de CI mantém os nomes públicos `Tests (ubuntu-latest)`,
 `Tests (macos-latest)` e `Orchestration offline gate`, com timeout 30 min e
 JUnit/durations. Os templates privados em `templates/ci` só são exportados ao
 checkout público sanitizado; não publicar a história privada.
+O gate offline verifica os contratos de nomes dos templates antes de executar
+`uv` ou testes. Se `ci.yml` ou `orchestration.yml` existir em `.github/workflows`,
+exige igualdade byte a byte com o respectivo template `oraculo-suite` ou
+`oraculo-ci`, removendo somente o cabeçalho inativo. Não injetar campos na
+exportação: duplicações de `name` e qualquer outra divergência são recusadas.
+O layout privado sem `.github` continua permitido.
 
 Os testes novos usam transportes OpenAI/GitHub/Azure e controle launchd de
 laboratório, com Git, SQLite, sockets e artefatos descartáveis reais. Canário
