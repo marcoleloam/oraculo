@@ -331,7 +331,7 @@ async def test_merge_must_reject_unresolved_execution(
     assert result["blocked_reason"] == (
         "thread_active_failed_or_pending_question"
         if case == "later_failed_run"
-        else "thread_children_pending_or_unknown"
+        else "terminal_descendant_review_required"
     )
 
 

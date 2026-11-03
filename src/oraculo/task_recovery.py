@@ -13,6 +13,16 @@ class TaskRecovery:
         self.engine = engine
         self.store = engine.store
 
+    async def diagnose_review(self, task):
+        from oraculo.review_adjudication import ReviewAdjudication
+
+        return await ReviewAdjudication(self.engine).diagnose(task)
+
+    async def adjudicate_review(self, task, payload, actor):
+        from oraculo.review_adjudication import ReviewAdjudication
+
+        await ReviewAdjudication(self.engine).accept(task, payload, actor)
+
     @staticmethod
     def origin(task, actor, payload):
         if actor["thread_id"] != task["origin"]["thread_id"] or actor[

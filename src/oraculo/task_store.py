@@ -578,6 +578,7 @@ class TaskStore:
                 "report_bootstrap",
                 "continuation_bootstrap",
                 "origin_completion",
+                "review_adjudication",
                 "supersession",
                 "launch_arguments",
                 "events",
@@ -591,6 +592,14 @@ class TaskStore:
                     for k in ("basis", "actor", "at", "report_sha256")
                 }
                 if task.get("origin_completion")
+                else None
+            ),
+            "review_adjudication": (
+                {
+                    k: task["review_adjudication"][k]
+                    for k in ("basis", "actor", "at", "report_sha256")
+                }
+                if task.get("review_adjudication")
                 else None
             ),
             "supersession": (

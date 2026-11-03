@@ -10,7 +10,7 @@ from pathlib import Path
 
 from oraculo.deliverables import require_implementation
 from oraculo.protocol import content_hash
-from oraculo.settlement import Settlements, verify_pull_requests
+from oraculo.settlement import verify_pull_requests
 from oraculo.state import StateError
 
 
@@ -293,8 +293,9 @@ class TaskClosure:
             await self.host.call(
                 "t3_thread_organize", {"threadId": thread_id, "action": "settle"}
             )
-            snapshot = await client.settlement_snapshot(thread_id)
-            Settlements.remote_gate(binding, snapshot)
+            # The managed execution gate also revalidates any human review.
+            # Generic settlement remains strict about unsuccessful descendants.
+            _, _, snapshot = await self.engine._execution_gate(task)
             if snapshot["thread"]["settled"] is not True:
                 raise StateError("settlement_unconfirmed")
         # Also validate after a new request or when reconciling a lost response.

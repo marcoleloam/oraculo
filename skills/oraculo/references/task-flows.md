@@ -84,6 +84,20 @@ Put unexecuted checks in `limitations`, never invent a passed/failed result for
 `rejection.persisted=false` leaves the task unchanged: correct the same report
 and retry the same ID. Positive reports require the actual full clean HEAD SHA.
 
+For an unsuccessful terminal review descendant, use `diagnose-review`
+on the existing task first. `adjudicate-review` requires an actual technical human
+review, verified test artifacts and two human host messages bound to its digest,
+exact scope, immutable report and final HEAD. Keep message IDs outside the review
+artifact to avoid a circular hash. An original negative host-only interruption
+also needs an explicit human disposition of each original check, run, scope, log
+and confirmed failed-memory digest; a technical FAIL or functional failure stays
+blocked. Generic implementation authorization and self-declared human/approved
+JSON do not qualify. The host exposes message role/source, not individual human
+identity; independence is human-attested, not automatically verified. Preserve
+the original failed child/report/memory; never route declined content to another
+model/provider. See `docs/TERMINAL_REVIEW_ADJUDICATION.md` in the project. These
+commands require `terminal_review_adjudication=true` from the live service.
+
 For legacy malformed immutable submissions, use the explicit `recover-report`
 flow in the project's managed-task contract, only from the real original origin.
 It requires a running service advertising `invalid_report_recovery=true`, the

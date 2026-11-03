@@ -1252,6 +1252,7 @@ class Service:
                     "global_host_enforcement": False,
                     "invalid_report_recovery": True,
                     "origin_terminal_recovery": True,
+                    "terminal_review_adjudication": True,
                 }
             else:
                 if self.managed_service is None:

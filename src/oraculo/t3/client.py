@@ -420,6 +420,8 @@ class T3Client:
         visited = {thread_id}
         has_pending = False
         children_successful = True
+        children_terminal = True
+        descendants = []
         while pending:
             child_id = pending.pop()
             if child_id in visited:
@@ -436,6 +438,18 @@ class T3Client:
                 child, terminal_only=terminal_only
             )
             children_successful = children_successful and settlement_child_clear(child)
+            terminal = settlement_child_clear(child, terminal_only=True)
+            children_terminal = children_terminal and terminal
+            descendants.append(
+                {
+                    "thread": child.thread.model_dump(mode="json"),
+                    "recentRuns": [
+                        run.model_dump(mode="json") for run in child.recentRuns
+                    ],
+                    "terminal": terminal,
+                    "successful": settlement_child_clear(child),
+                }
+            )
             if complete_runs and settlement_child_clear(child, terminal_only=True):
                 from oraculo.run_continuity import terminal_chain
 
@@ -460,6 +474,8 @@ class T3Client:
             "childrenScope": "project",
             "observedChildCount": len(visited) - 1,
             "childrenSuccessful": children_successful,
+            "childrenTerminal": children_terminal,
+            "descendants": sorted(descendants, key=lambda d: d["thread"]["threadId"]),
         }
 
     async def wait(

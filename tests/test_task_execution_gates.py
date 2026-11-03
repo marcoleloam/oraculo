@@ -20,7 +20,7 @@ async def test_failed_descendant_must_not_certify_success(system, independent, f
         "failed review must not certify task success"
     )
     assert result["memory"]["write_state"] != "saved"
-    assert result["blocked_reason"] == "thread_children_pending_or_unknown"
+    assert result["blocked_reason"] == "terminal_descendant_review_required"
 
 
 @pytest.mark.parametrize("independent", [False, True])
