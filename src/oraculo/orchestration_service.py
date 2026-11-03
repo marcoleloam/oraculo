@@ -190,11 +190,51 @@ async def command(service, envelope):
         "decisions.shadow": {"job_id"},
         "decisions.canary": {"task_id"},
         "decisions.kill": {"enabled"},
+        "decisions.prepare": set(),
+        "decisions.status": set(),
+        "decisions.acknowledge": {
+            "key",
+            "expected_entry_digest",
+            "idempotency_key",
+            "actor_reference",
+            "reason",
+            "evidence_reference",
+            "evidence_sha256",
+        },
         "outcome.verify": {"attempt_id", "generation", "criterion_id", "cwd"},
         "rollout.verify": {"task_id", "operation_id"},
     }[kind]
     if set(p) - allowed:
         raise StateError("orchestration_payload_fields_invalid")
+    if kind in {"decisions.prepare", "decisions.status", "decisions.acknowledge"}:
+        if (
+            envelope.origin.thread_id
+            or envelope.origin.run_id
+            or envelope.origin.message_id
+        ):
+            raise StateError("decisions_recovery_requires_local_operator")
+        if kind == "decisions.status":
+            return service.decisions.status(envelope.project_id)
+        if service.state.get_meta("runtime_maintenance"):
+            raise StateError("maintenance_admission_closed")
+        if kind == "decisions.prepare":
+            result = await service.decisions.prepare()
+            if result["state"] == "unavailable" and result["reason"] in {
+                "timeout",
+                "access_denied_or_missing",
+                "backend_unavailable",
+            }:
+                result["human_action"] = (
+                    "No macOS, desbloqueie o chaveiro de login no Acesso às Chaves; "
+                    "localize oraculo.openai / decisions-api e confira o acesso "
+                    "do /usr/bin/security. Autorize somente o acesso necessário "
+                    "quando o macOS solicitar e repita decisions prepare. "
+                    "Não use permitir todos os aplicativos."
+                )
+            return result
+        from oraculo.decision_recovery import acknowledge
+
+        return acknowledge(service.decisions, envelope.project_id, p)
     if kind == "decisions.kill":
         if envelope.origin.thread_id or envelope.origin.run_id:
             raise StateError("decisions_kill_requires_local_operator")

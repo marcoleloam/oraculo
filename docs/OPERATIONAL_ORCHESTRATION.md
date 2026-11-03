@@ -1,4 +1,4 @@
-# Operação verificável — 0.3.0
+# Operação verificável — 0.3.1
 
 ## Seleção e autorização
 
@@ -93,6 +93,9 @@ service `oraculo.openai`, account `decisions-api`. Não usar valor em argv, env,
 arquivo, chat, log ou mensagem de erro. Testes não abrem esse Keychain. Os
 requests contêm somente índices locais e features fechadas; prompts, memória,
 paths, IDs, nomes de modelos/provedores e logs privados não são enviados.
+
+O caminho limitado de Keychain, a preparação sem API e a reconciliação auditada
+de unknown estão no [procedimento de recuperação](DECISIONS_RECOVERY.md).
 
 ## CI e outcomes
 

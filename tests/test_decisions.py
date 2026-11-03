@@ -436,12 +436,14 @@ async def test_default_lazy_keychain_alias_uses_fake_reader_only_after_authorize
     calls = []
     loop_thread = threading.get_ident()
 
-    def fake_reader():
+    async def fake_reader(timeout):
         calls.append(threading.get_ident())
         return "synthetic-token"
 
-    monkeypatch.setattr(module, "_keychain_password", fake_reader)
-    monkeypatch.setattr(module.sys, "platform", "darwin")
+    import oraculo.decision_credentials as credentials
+
+    monkeypatch.setattr(credentials, "_security_password", fake_reader)
+    monkeypatch.setattr(credentials.sys, "platform", "darwin")
 
     def handle(request):
         assert len(calls) == 1
@@ -463,7 +465,7 @@ async def test_default_lazy_keychain_alias_uses_fake_reader_only_after_authorize
     assert (await advise(Decisions(state, c, transport=transport)))[
         "state"
     ] == "answered"
-    assert len(calls) == 1 and calls[0] != loop_thread
+    assert len(calls) == 1 and calls[0] == loop_thread
     with pytest.raises(StateError):
         await module.resolve_credential("ref:wrong-alias")
     assert len(calls) == 1

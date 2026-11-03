@@ -174,7 +174,7 @@ def test_new_rollout_operation_promotes_before_intent_and_old_reader_cannot_conf
 def test_future_schema_is_refused_by_modern_writer_and_readers(tmp_path):
     path = tmp_path / "state.sqlite3"
     s = State(path)
-    s.connection.execute("INSERT INTO schema_migrations VALUES(8)")
+    s.connection.execute("INSERT INTO schema_migrations VALUES(9)")
     s.close()
     with pytest.raises(StateError):
         State(path)

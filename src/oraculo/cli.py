@@ -265,6 +265,15 @@ def parser() -> argparse.ArgumentParser:
         required=True,
         help="SHA-256 exato retornado por plan para o mesmo ID, caminho e catálogo",
     )
+    decisions = commands.add_parser(
+        "decisions",
+        help="Prontidão local e recuperação financeira auditada; sem API paga",
+    )
+    decisions.add_argument("action", choices=["status", "prepare", "acknowledge"])
+    decisions.add_argument("--project", required=True)
+    decisions.add_argument(
+        "--file", type=Path, help="JSON do acknowledgement; nunca uma credencial"
+    )
     commands.add_parser("serve")
     diagnostics = commands.add_parser("doctor")
     diagnostics.add_argument(
@@ -1079,6 +1088,15 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "request":
                     raw = args.file.read_text() if args.file else sys.stdin.read()
                     envelope = json.loads(raw)
+                elif args.command == "decisions":
+                    if args.action != "acknowledge" and args.file:
+                        raise ValueError("decisions_payload_not_allowed")
+                    if args.action == "acknowledge" and args.file is None:
+                        raise ValueError("decision_acknowledgement_file_required")
+                    payload = json.loads(args.file.read_text()) if args.file else {}
+                    envelope = make_envelope(
+                        "decisions." + args.action, args.project, payload
+                    )
                 elif args.command == "status":
                     envelope = make_envelope("status.get", args.project, {})
                 elif args.command == "capacity":

@@ -14,7 +14,7 @@ from oraculo.state import DedupeConflict, State, StateError
 
 
 class TaskStore:
-    def __init__(self, path: Path, *, read_only=False, schema_max=7):
+    def __init__(self, path: Path, *, read_only=False, schema_max=8):
         if read_only:
             # Offline inspection must not run State's schema migrations or
             # contend with the daemon's writer authority. URI mode also forbids

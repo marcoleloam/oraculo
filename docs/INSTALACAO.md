@@ -37,7 +37,7 @@ with Path('bundle/requirements.txt').open('a') as out:
 PY
 .venv/bin/python -m oraculo.runtime manifest bundle \
   --release-id RELEASE --source-commit "$(git rev-parse HEAD)" \
-  --schema-min 4 --schema-max 7
+  --schema-min 4 --schema-max 8
 ```
 
 `manifest.json` v1 contém release, commit de origem, versão Python, intervalo de
@@ -46,12 +46,13 @@ um canal confiável junto do bundle e do bootstrap revisado. Hashes detectam
 corrupção; não autenticam um distribuidor malicioso que substitua também o
 manifesto. Registre o SHA do manifesto revisado fora do bundle.
 
-Em 0.3.0, use o SHA público integrado como `RELEASE` e `source-commit`.
-O teto 7 precisa existir no código e no manifesto. A promoção é lazy; depois de
-usar contratos novos, runtime limitado a 4 ou ledger limitado a 5 não pode ler
-os dados promovidos. Rollback exige release compatível com todos os bancos
+Em 0.3.1, use o SHA público integrado como `RELEASE` e `source-commit`.
+O teto 8 precisa existir no código e no manifesto. A promoção é lazy: o ack
+financeiro de Decisions exige 8 e impede reabertura por runtime limitado a 7.
+Contratos anteriores mantêm suas barreiras 6/7; bases main 4 e ledger 5 não
+são promovidas apenas por abertura. Código antigo não pode ler dados promovidos. Rollback exige release compatível com todos os bancos
 atuais; nunca restaure um backup velho para recuar o histórico. Consulte
-[Release 0.3.0](releases/RELEASE_0_3_0.md) para defaults e limites.
+[Release 0.3.1](releases/RELEASE_0_3_1.md) para defaults e limites.
 
 ## Instalar sem checkout permanente
 
@@ -439,3 +440,7 @@ cooperativa sem iniciar novos runs durante a parada. O transporte e o operador
 local são a fronteira de confiança, sem atestação criptográfica. Preserve prova,
 backup e journal para reconciliar qualquer recusa ou resposta perdida. Os
 encerramentos continuam com seus próprios gates no daemon ativado.
+
+Decisions 0.3.1: instale com suporte a schema 8 antes de reconhecer um unknown.
+Apenas o acknowledgement promove o State principal; veja
+[preparação e recuperação financeira](DECISIONS_RECOVERY.md).

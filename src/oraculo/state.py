@@ -12,7 +12,7 @@ from typing import Any
 
 from oraculo.protocol import canonical_json, content_hash
 
-STATE_SCHEMA_CEILING = 7
+STATE_SCHEMA_CEILING = 8
 
 
 class StateError(ValueError):
@@ -123,6 +123,12 @@ class State:
             raise StateError("operational_schema_unsupported")
         with self.transaction():
             self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(7)")
+
+    def require_decision_recovery_schema(self):
+        if self.schema_max < 8:
+            raise StateError("decision_recovery_schema_unsupported")
+        with self.transaction():
+            self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(8)")
 
     @staticmethod
     def peek_schema(path: Path, *, default=4):
