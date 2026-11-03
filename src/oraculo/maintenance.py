@@ -18,10 +18,7 @@ def status(state):
         schema_version=1,
         state_schema=max(
             state.schema_version(),
-            6
-            if State.peek_schema(state.path.parent / "managed-tasks.sqlite3", default=5)
-            >= 6
-            else 4,
+            State.required_schema(state.path.parent),
         ),
         main_schema=state.schema_version(),
         managed_schema=State.peek_schema(

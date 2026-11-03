@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Literal
 
@@ -11,6 +12,20 @@ from pydantic import Field
 from oraculo.config import StrictModel
 from oraculo.protocol import content_hash
 from oraculo.state import StateError
+
+
+def verifier_binding(target, config_path):
+    if target is None:
+        return None
+    try:
+        return content_hash(
+            [
+                target.model_dump(mode="json"),
+                hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            ]
+        )
+    except OSError:
+        return None
 
 
 class RolloutIdentity(StrictModel):
@@ -60,8 +75,24 @@ class RolloutVerifier:
                             healthy=True,
                             elapsed=elapsed,
                             observed_at=self.clock(),
+                            process={
+                                k: observed[k]
+                                for k in (
+                                    "process_pid",
+                                    "config_sha256",
+                                    "liveness",
+                                    "readiness",
+                                    "diagnostic_health",
+                                )
+                                if k in observed
+                            },
                         )
                     )
+                    if index and any(
+                        samples[0]["process"].get(k) != samples[1]["process"].get(k)
+                        for k in ("process_pid", "config_sha256")
+                    ):
+                        raise StateError("rollout_process_changed")
             return dict(
                 state="confirmed",
                 verifier="service-rollout-v1",

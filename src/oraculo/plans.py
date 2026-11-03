@@ -320,10 +320,15 @@ class Plans:
             ):
                 raise StateError("delivery_operation_not_confirmed")
 
-    @staticmethod
-    def _rollout_current(operation):
+    def _rollout_current(self, operation):
         observed = json.loads(operation["observed_state"] or "{}")
         receipt = observed.get("rollout_receipt")
+        if receipt and hasattr(self, "rollout_binding"):
+            current = self.rollout_binding(
+                (receipt.get("identity") or {}).get("environment")
+            )
+            if current is None or current != receipt.get("verifier_config_hash"):
+                return False
         # Legacy operations keep their historical contract; new rollout evidence
         # has its own expiry and cannot rely on an old confirmed state.
         return receipt is None or (

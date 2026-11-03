@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "oraculo"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local T3 orchestration and durable Obsidian memory"
 requires-python = ">=3.12,<3.13"
 dependencies = ["mcp==2.3.0", "keyring==25.7.0", "pydantic==2.14.1", "PyYAML==6.0.3", "httpx2>=2.10,<3", "jsonschema>=4.20,<5"]
@@ -48,6 +48,8 @@ include = [
   "/docs/INSTALACAO.md",
   "/docs/PROJECT_REGISTRATION.md",
   "/docs/releases/RELEASE_0_2_0.md",
+  "/docs/releases/RELEASE_0_3_0.md",
+  "/docs/OPERATIONAL_ORCHESTRATION.md",
   "/docs/SKILLS.md",
   "/docs/RUN_CONTINUITY_AND_ACKS.md",
   "/docs/CONTINUATION_BOOTSTRAP.md",

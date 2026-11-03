@@ -13,6 +13,7 @@ import inspect
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import UTC, datetime
@@ -142,10 +143,30 @@ class HTTPDecisionTransport:
             token = None
 
 
+def sanitized_features(diagnostic: str) -> dict:
+    """Discard the entire private text. Only closed-vocabulary indicators leave.
+
+    Matching a word can influence advice, never admission or authorization.
+    No excerpts, identifiers, paths, model names or caller instructions survive.
+    """
+    text = diagnostic[:12000].lower()
+    indicators = {
+        "code": r"\b(assertion|syntax|typeerror|test failure)\b",
+        "environment": r"\b(executable|dependency|module not found|runner)\b",
+        "external": r"\b(network|dns|unavailable|connection refused)\b",
+        "context_limit": r"\b(context length|context overflow|context limit)\b",
+        "concurrency": r"\b(concurrency|simultaneous|parallel limit)\b",
+        "account_quota": r"\b(quota|credits|rate limit|spending)\b",
+    }
+    return {
+        name: bool(re.search(pattern, text)) for name, pattern in indicators.items()
+    }
+
+
 def triage_request(diagnostic: str) -> dict:
     return {
         "model": "gpt-6-luna",
-        "input": diagnostic,
+        "input": canonical_json(sanitized_features(diagnostic)),
         "questions": [
             {
                 "type": "choice",
@@ -170,7 +191,9 @@ def probability(value):
     return type(value) in {int, float} and math.isfinite(value) and 0 <= value <= 1
 
 
-def validate_response(raw: dict, token_bound: int) -> tuple[dict, dict]:
+def validate_response(
+    raw: dict, token_bound: int, *, name="ci_cause", choices=CAUSES
+) -> tuple[dict, dict]:
     if (
         not isinstance(raw, dict)
         or (
@@ -195,15 +218,15 @@ def validate_response(raw: dict, token_bound: int) -> tuple[dict, dict]:
     if (
         set(a) != {"type", "name", "choice", "confidence", "probabilities"}
         or a["type"] != "choice"
-        or a["name"] != "ci_cause"
-        or a["choice"] not in CAUSES
+        or a["name"] != name
+        or a["choice"] not in choices
         or not probability(a["confidence"])
     ):
         raise StateError("schema")
     ps = a["probabilities"]
     if (
         not isinstance(ps, list)
-        or len(ps) != len(CAUSES)
+        or len(ps) != len(choices)
         or any(
             not isinstance(p, dict)
             or set(p) != {"value", "probability"}
@@ -213,7 +236,7 @@ def validate_response(raw: dict, token_bound: int) -> tuple[dict, dict]:
         )
     ):
         raise StateError("schema")
-    if {p["value"] for p in ps} != set(CAUSES) or abs(
+    if {p["value"] for p in ps} != set(choices) or abs(
         sum(p["probability"] for p in ps) - 1
     ) > 0.00001:
         raise StateError("schema")
@@ -245,7 +268,6 @@ def validate_response(raw: dict, token_bound: int) -> tuple[dict, dict]:
         sum(details.values()) > u["input_tokens"]
         or outputs["reasoning_tokens"] > u["output_tokens"]
         or u["total_tokens"] != u["input_tokens"] + u["output_tokens"]
-        or u["output_tokens"] != 0
         or u["input_tokens"] > token_bound
     ):
         raise StateError("usage")
@@ -304,7 +326,7 @@ class Decisions:
     def disabled(self):
         return (
             not self.config.enabled
-            or self.config.mode != "shadow"
+            or self.config.mode == "off"
             or self.state.get_meta(PREFIX + "kill", False)
             or self.transport is None
         )
@@ -362,6 +384,18 @@ class Decisions:
         # offline replay may use its validated answer until the snapshot TTL.
         return dict(entry["result"], replay=True)
 
+    def usable(self, result):
+        """Effect-time cache gate; kill toggles invalidate even after re-enable."""
+        return (
+            result.get("state") == "answered"
+            and not self.disabled()
+            and self.clock() < result.get("expires_at", 0)
+            and result.get("kill_epoch")
+            == self.state.get_meta(PREFIX + "kill_epoch", 0)
+            and self.artifact_valid(result.get("request_artifact", {}))
+            and self.artifact_valid(result.get("response_artifact", {}))
+        )
+
     def _reserve(
         self,
         meta,
@@ -398,24 +432,52 @@ class Decisions:
                         PREFIX + "entry:" + e["key"],
                         dict(e, state="unknown", reason="crash_or_deadline"),
                     )
-            self.state.require_orchestration_schema()
+            self.state.require_operational_schema()
             self.state.set_meta(PREFIX + "book", book)
             if book["unknown_cost"]:
                 return None, "unknown_cost", False
             if book["open_until"] > now:
                 return None, "circuit_open", False
-            daily = [e for e in entries if e["day"] == day]
-            running = [e for e in entries if e["run"] == run]
+            days = sorted(
+                {
+                    day,
+                    datetime.fromtimestamp(now + self.config.deadline_seconds, UTC)
+                    .date()
+                    .isoformat(),
+                }
+            )
+            daily_books = [
+                [e for e in entries if d in e.get("days", [e["day"]])] for d in days
+            ]
+            if entries and now < max(e["created_at"] for e in entries):
+                return None, "clock_regressed", False
+            # Legacy entries are included conservatively, without re-certifying or
+            # rewriting them. New keys never use a CI run as a billing owner.
+            running = [
+                e
+                for e in entries
+                if e.get("logical_task") == run
+                or (
+                    "logical_task" not in e
+                    and content_hash([e["snapshot"]["project"], e["snapshot"]["task"]])
+                    == run
+                )
+            ]
             if (
-                len(daily) >= self.config.max_calls
+                any(len(daily) >= self.config.max_calls for daily in daily_books)
                 or len(running) >= self.config.max_calls
             ):
                 return None, "call_limit", False
-            if (
+            if any(
                 sum(e["charge"] for e in daily) + reserve
-                > self.config.daily_budget_microusd
-                or sum(e["charge"] for e in running) + reserve
-                > self.config.run_budget_microusd
+                > min(1000000, self.config.daily_budget_microusd)
+                for daily in daily_books
+            ) or sum(e["charge"] for e in running) + reserve > min(
+                100000,
+                self.config.task_budget_microusd,
+                self.config.run_budget_microusd
+                if self.config.mode == "shadow"
+                else 100000,
             ):
                 return None, "budget", False
             if (
@@ -433,7 +495,9 @@ class Decisions:
                 deadline=now + self.config.deadline_seconds,
                 expires_at=now + 300,
                 day=day,
+                days=days,
                 run=run,
+                logical_task=run,
                 charge=reserve,
                 reserved=reserve,
                 token_bound=token_bound,
@@ -448,8 +512,66 @@ class Decisions:
     async def advise(
         self, snapshot: Snapshot, diagnostic: str, current_snapshot
     ) -> dict:
+        return await self._advise(
+            snapshot, triage_request(diagnostic), current_snapshot
+        )
+
+    async def choose(self, snapshot, count, features, current_snapshot, *, traits=None):
+        # Internal API: arbitrary caller content/description is never forwarded.
+        if type(count) is not int or not 2 <= count <= 32:
+            return self.result("", "unambiguous_or_invalid_options")
+        allowed = {"kind", "ci_conclusion", "ci_cause"}
+        safe = {
+            k: v
+            for k, v in features.items()
+            if k in allowed
+            and v
+            in {
+                "implementation",
+                "tests",
+                "architecture",
+                "research",
+                "discovery",
+                "memory",
+                "pending",
+                "passed",
+                "failed",
+                "cancelled",
+                *CAUSES,
+            }
+        }
+        from oraculo.config import RoutingTraits
+
+        option_traits = (
+            [RoutingTraits.model_validate(t).model_dump() for t in traits]
+            if traits is not None
+            else [RoutingTraits().model_dump() for _ in range(count)]
+        )
+        if len(option_traits) != count:
+            return self.result("", "invalid_options")
+        request = {
+            "model": "gpt-6-luna",
+            "input": canonical_json(safe),
+            "questions": [
+                {
+                    "type": "choice",
+                    "name": "route",
+                    "instructions": "Choose among already eligible execution routes. Prefer earlier options unless evidence favors another. Unknown means abstain. Never authorize effects.",
+                    "choices": [
+                        {
+                            "value": f"option_{i}",
+                            "description": f"Authorized preference {i + 1}; capability {option_traits[i]['capability']}; latency {option_traits[i]['latency']}",
+                        }
+                        for i in range(count)
+                    ]
+                    + [{"value": "unknown", "description": "Insufficient evidence"}],
+                }
+            ],
+        }
+        return await self._advise(snapshot, request, current_snapshot)
+
+    async def _advise(self, snapshot, request, current_snapshot):
         frozen = copy.deepcopy(snapshot.model_dump(mode="json"))
-        request = triage_request(diagnostic)
         request_hash = content_hash(request)
         config_hash = content_hash(self.config.model_dump(mode="json"))
         key = content_hash([TAXONOMY, frozen, request_hash, config_hash])
@@ -464,13 +586,19 @@ class Decisions:
         tariff = self.config.tariff
         if tariff is None:
             return self.result(key, "financial_bound_unavailable")
+        if self.config.mode in {"active", "assisted"} and (
+            tariff.input_nanousd < 125
+            or tariff.multiplier_milli < 2200
+            or "output_nanousd" not in tariff.model_fields_set
+        ):
+            return self.result(key, "financial_bound_unavailable")
         # An explicitly authorized byte/framing upper contract and rate including
         # maximum cache/region/context premiums is required. Not a provider cap.
         token_bound = size + tariff.framing_tokens
         reserve = self.cost(token_bound)
         now, started = self.clock(), self.monotonic()
         day = datetime.fromtimestamp(now, UTC).date().isoformat()
-        run = frozen["ci_run"]
+        run = content_hash([frozen["project"], frozen["task"]])
         deadline = now + self.config.deadline_seconds
         duration = self.config.deadline_seconds
 
@@ -571,7 +699,13 @@ class Decisions:
                 return self._finish(
                     meta, sent, "snapshot_changed", None, None, started, current_error
                 )
-            answer, usage = validate_response(raw, token_bound)
+            question = request["questions"][0]
+            answer, usage = validate_response(
+                raw,
+                token_bound,
+                name=question["name"],
+                choices=tuple(c["value"] for c in question["choices"]),
+            )
             return self._finish(meta, sent, None, answer, usage, started, current_error)
         except asyncio.CancelledError:
             self._finish(meta, sent, "cancelled", None, None, started, current_error)
@@ -665,6 +799,8 @@ class Decisions:
                         "model_abstained"
                         if answer["choice"] == "unknown"
                         else "shadow_only"
+                        if self.config.mode == "shadow"
+                        else "advice_only"
                     ),
                 )
                 charge = sent["reserved"]
@@ -683,6 +819,7 @@ class Decisions:
                     deadline=sent["deadline"],
                     policy_hash=sent["snapshot"]["policy_hash"],
                     model=self.config.model,
+                    kill_epoch=sent["kill_epoch"],
                     request_artifact=sent["request_artifact"],
                 )
                 final = dict(

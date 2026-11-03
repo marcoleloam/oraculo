@@ -108,9 +108,18 @@ class TaskClosure:
         task = self.store.get(task_id)
         require_implementation(task)
         self._requirements(task)
+        actual_policy = None
+        if hasattr(self.lifecycle, "validate_host_policy"):
+            actual_policy = self.lifecycle.validate_host_policy(
+                task["publication"],
+                task["merge_policy"],
+                task["publication_spec"]["cwd"],
+            )
         receipt = self.lifecycle.inspect(
             task["publication"], task["merge_policy"], task["publication_spec"]["cwd"]
         )
+        if actual_policy is not None:
+            receipt["observed_host_policy"] = actual_policy
         self.store.record_pr_observation(
             task_id, receipt, task.get("snapshot_revision", 0)
         )
@@ -188,6 +197,12 @@ class TaskClosure:
             await self.engine._execution_gate(task)
 
         def before_merge():
+            if hasattr(self.lifecycle, "validate_host_policy"):
+                self.lifecycle.validate_host_policy(
+                    task["publication"],
+                    task["merge_policy"],
+                    task["publication_spec"]["cwd"],
+                )
             self.store.update(
                 task_id,
                 "merge_pending",

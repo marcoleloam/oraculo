@@ -38,7 +38,12 @@ class AzureHost:
         }
         self.policies = [
             {
-                "configuration": {"id": 1, "isBlocking": True, "isEnabled": True},
+                "configuration": {
+                    "id": 1,
+                    "isBlocking": True,
+                    "isEnabled": True,
+                    "settings": {"statusName": "unit", "statusGenre": "ci"},
+                },
                 "status": "approved",
             }
         ]

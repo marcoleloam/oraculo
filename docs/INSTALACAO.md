@@ -37,7 +37,7 @@ with Path('bundle/requirements.txt').open('a') as out:
 PY
 .venv/bin/python -m oraculo.runtime manifest bundle \
   --release-id RELEASE --source-commit "$(git rev-parse HEAD)" \
-  --schema-min 4 --schema-max 6
+  --schema-min 4 --schema-max 7
 ```
 
 `manifest.json` v1 contém release, commit de origem, versão Python, intervalo de
@@ -46,12 +46,12 @@ um canal confiável junto do bundle e do bootstrap revisado. Hashes detectam
 corrupção; não autenticam um distribuidor malicioso que substitua também o
 manifesto. Registre o SHA do manifesto revisado fora do bundle.
 
-Em 0.2.0, use o SHA público integrado como `RELEASE` e `source-commit`.
-O teto 6 precisa existir no código e no manifesto. A promoção é lazy; depois de
+Em 0.3.0, use o SHA público integrado como `RELEASE` e `source-commit`.
+O teto 7 precisa existir no código e no manifesto. A promoção é lazy; depois de
 usar contratos novos, runtime limitado a 4 ou ledger limitado a 5 não pode ler
 os dados promovidos. Rollback exige release compatível com todos os bancos
 atuais; nunca restaure um backup velho para recuar o histórico. Consulte
-[Release 0.2.0](releases/RELEASE_0_2_0.md) para defaults e limites.
+[Release 0.3.0](releases/RELEASE_0_3_0.md) para defaults e limites.
 
 ## Instalar sem checkout permanente
 

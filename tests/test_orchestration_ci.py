@@ -184,6 +184,19 @@ def test_inactive_ci_template_pins_actions_and_preserves_always_evidence():
     assert upload["if"] == "always()" and upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["retention-days"] == "7"
     assert "steps.proof.outputs.path" in upload["with"]["path"]
+    assert spec["jobs"]["offline"]["name"] == "Orchestration offline gate"
+    assert spec["jobs"]["offline"]["timeout-minutes"] == "30"
+    full = yaml.load(
+        (ROOT / "templates/ci/full-ci.yml.template").read_text(), Loader=yaml.BaseLoader
+    )
+    job = full["jobs"]["tests"]
+    assert job["name"] == "Tests (${{ matrix.os }})"
+    assert job["strategy"]["matrix"]["os"] == ["ubuntu-latest", "macos-latest"]
+    assert job["timeout-minutes"] == "30"
+    assert any(
+        "--durations=25" in step.get("run", "") and "--junitxml=" in step.get("run", "")
+        for step in job["steps"]
+    )
 
 
 def test_uv_output_marker_is_metadata_and_unexpected_extra_files_still_fail(tmp_path):

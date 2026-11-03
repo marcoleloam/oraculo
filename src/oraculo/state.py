@@ -12,7 +12,7 @@ from typing import Any
 
 from oraculo.protocol import canonical_json, content_hash
 
-STATE_SCHEMA_CEILING = 6
+STATE_SCHEMA_CEILING = 7
 
 
 class StateError(ValueError):
@@ -112,10 +112,17 @@ class State:
 
     def require_orchestration_schema(self):
         """Lazy compatibility barrier, atomic with the first new semantic write."""
-        if self.schema_max < STATE_SCHEMA_CEILING:
+        if self.schema_max < 6:
             raise StateError("orchestration_schema_unsupported")
         with self.transaction():
             self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(6)")
+
+    def require_operational_schema(self):
+        """v7 accounting/routing cannot be interpreted by a shadow-only reader."""
+        if self.schema_max < 7:
+            raise StateError("operational_schema_unsupported")
+        with self.transaction():
+            self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(7)")
 
     @staticmethod
     def peek_schema(path: Path, *, default=4):
@@ -139,7 +146,7 @@ class State:
         main = State.peek_schema(state_dir / "state.sqlite3")
         ledger = State.peek_schema(state_dir / "managed-tasks.sqlite3", default=5)
         # Ledger v5 is an established independent baseline, not main v5.
-        return max(main, 6 if ledger >= 6 else 4)
+        return max(main, ledger if ledger >= 6 else 4)
 
     def close(self) -> None:
         self.connection.close()
@@ -274,6 +281,13 @@ class State:
                         "dependency must be an existing job of this objective"
                     )
             spec = payload.get("task_spec", {})
+            if "target" in payload:
+                self.require_operational_schema()
+            if any(
+                (c.get("outcome") or {}).get("kind") == "ci"
+                for c in spec.get("criteria", [])
+            ):
+                self.require_operational_schema()
             if "ci_binding" in payload or any(
                 c.get("outcome") is not None for c in spec.get("criteria", [])
             ):

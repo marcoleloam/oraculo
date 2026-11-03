@@ -51,6 +51,11 @@ class ManagedService:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.store = TaskStore(path, schema_max=max(5, service.state.schema_max))
             self.store.authority_owned = True
+            from oraculo.rollout import verifier_binding
+
+            self.store.rollout_binding = lambda env: verifier_binding(
+                service.config.rollout_targets.get(env), service.config_path
+            )
             untracked = []
             for row in self.store.db.execute("SELECT id FROM managed_tasks"):
                 task = self.store.get(row[0])
@@ -318,6 +323,7 @@ class ManagedService:
                 admission=self.service.state,
             )
             adapter.config_path = self.service.config_path
+            adapter.decisions = self.service.decisions
             result = await adapter.command(
                 envelope.payload["action"], envelope.payload["payload"]
             )

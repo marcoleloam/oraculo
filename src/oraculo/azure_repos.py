@@ -572,7 +572,7 @@ class AzureRepos:
             raise PublicationError("pr_required_checks_unspecified")
         m = inspect_repository(
             cwd,
-            remote=pr.get("remote", "origin"),
+            remote=pr.get("remote"),
             base=policy["base"],
             runner=self.runner,
         )

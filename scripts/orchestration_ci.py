@@ -31,6 +31,10 @@ SELECTION = (
     "runtime_recovery_identity",
     "runtime_migration",
     "ci_events",
+    "ci_host",
+    "ci_azure",
+    "operational_decisions",
+    "local_rollout",
     "decisions",
     "decisions_eval",
     "outcomes",
@@ -161,6 +165,7 @@ def main():
                 "-q",
                 *[f"tests/test_{name}.py" for name in SELECTION],
                 "--junitxml=" + str(junit),
+                "--durations=25",
             ],
             "pytest",
         )
