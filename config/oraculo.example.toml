@@ -46,3 +46,14 @@ max_batch_pages = 20
 max_proposal_bytes = 2097152
 review_retention_days = 30
 canonical_gc = false
+
+# Separate API contract; these defaults make zero paid requests.
+[decisions]
+enabled = false
+mode = "off"
+model = "gpt-6-luna"
+daily_budget_microusd = 0
+run_budget_microusd = 0
+# credential_reference = "ref:oraculo-openai-decisions"
+# No tariff authorization/upper-bound contract is supplied by default.
+# No rollout target or CI authentication observer is installed by default.

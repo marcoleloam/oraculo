@@ -342,6 +342,9 @@ async def _recover(config, config_path, payload, host, runtime, ledger, main):
         transaction=lambda: transaction(ledger),
     )
     task = store.get(task_id)
+    from oraculo.deliverables import require_implementation
+
+    require_implementation(task)
     raw = ledger.execute(
         "SELECT payload FROM managed_tasks WHERE id=?", (task_id,)
     ).fetchone()[0]

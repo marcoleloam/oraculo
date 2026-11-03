@@ -516,9 +516,9 @@ def test_managed_schema_fences_old_writers_without_migrating_main_state(tmp_path
         == 5
     )
     store.close()
-    # The pre-feature writer's existing version gate is still exactly max=4.
+    # Model the pre-feature writer explicitly: the current writer supports v6.
     with pytest.raises(StateError, match="state_schema_newer_than_runtime"):
-        State(path)
+        State(path, schema_max=4)
     store = TaskStore(path)
     assert store.get(ident)["phase"] == "received"
     store.close()

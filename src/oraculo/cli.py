@@ -25,7 +25,13 @@ DEFAULT_CONFIG = Path.home() / ".config/oraculo/config.toml"
 async def request(config: Config, envelope: dict) -> dict:
     raw = canonical_json(envelope).encode()
     parse_envelope(raw)
-    async with asyncio.timeout(5):
+    timeout = (
+        125
+        if envelope["kind"]
+        in {"rollout.verify", "operation.report", "outcome.verify", "operation.prepare"}
+        else 5
+    )
+    async with asyncio.timeout(timeout):
         reader, writer = await asyncio.open_unix_connection(
             str(config.socket_path), limit=MAX_RESPONSE_BYTES + 1
         )
@@ -218,6 +224,47 @@ def parser() -> argparse.ArgumentParser:
     readable = views.add_parser("status")
     readable.add_argument("--file", type=Path, required=True)
     readable.add_argument("--json", action="store_true")
+    project = commands.add_parser(
+        "project",
+        help="Autorizar um projeto T3 sem editar config.toml nem reiniciar",
+    )
+    project_actions = project.add_subparsers(dest="project_action", required=True)
+    register = project_actions.add_parser(
+        "register",
+        help="Cadastrar um projeto observado no catálogo T3. Somente adição.",
+        description=(
+            "Somente adição. Não remove projetos. Observa o catálogo T3 atual e "
+            "publica uma autorização estreita em "
+            "state_dir/project-authorization.json. Não altera config.toml, o hash "
+            "preso do processo, reservas, provedores ou rotinas, e não reinicia o "
+            "serviço. Sem o arquivo, allowed_projects permanece como está. plan só "
+            "emite a confirmação; apply exige essa confirmação exata e observa o "
+            "catálogo de novo."
+        ),
+    )
+    phases = register.add_subparsers(dest="phase", required=True)
+    plan = phases.add_parser(
+        "plan",
+        help="Emite a confirmação. Não publica e não reinicia.",
+        description="Emite a confirmação. Não publica e não reinicia.",
+    )
+    apply = phases.add_parser(
+        "apply",
+        help="Publica uma autorização confirmada. Não edita config.toml.",
+        description="Publica uma autorização confirmada. Não edita config.toml.",
+    )
+    for phase in (plan, apply):
+        phase.add_argument("--id", required=True, help="ID do projeto no catálogo T3")
+        phase.add_argument(
+            "--path",
+            required=True,
+            help="Diretório absoluto do projeto, estritamente dentro de projects_root",
+        )
+    apply.add_argument(
+        "--confirmation",
+        required=True,
+        help="SHA-256 exato retornado por plan para o mesmo ID, caminho e catálogo",
+    )
     commands.add_parser("serve")
     diagnostics = commands.add_parser("doctor")
     diagnostics.add_argument(
@@ -857,6 +904,11 @@ def main(argv: list[str] | None = None) -> int:
             }
         else:
             config = Config.load(args.config)
+            if args.command == "project":
+                from oraculo.project_registration import cli_command
+
+                print_json(asyncio.run(cli_command(config, args)))
+                return 0
             if args.command == "task":
                 from oraculo.managed_service import command as managed_command
                 from oraculo.state import StateError

@@ -160,6 +160,40 @@ def verify(root: Path, *, installed=False):
         raise RuntimeError("invalid_manifest") from exc
 
 
+def rollout_identity(root: Path, environment: str, health_probe):
+    """Read installed release identity and health for a configured destination.
+
+    The service pins this observer, rather than trusting deployment payloads.
+    No activation or state mutation occurs; existing maintenance gates still own
+    prepare/activation/rollback. Artifact identity is the verified file inventory.
+    """
+    from oraculo.protocol import content_hash
+
+    selected = current_release(root)
+    if selected is None:
+        raise RuntimeError("release_missing")
+    manifest = verify(root / "releases" / selected, installed=True)
+    health = health_probe()
+    # A health probe must report the identity of the running process as well as
+    # health; a healthy old process cannot confirm a new on-disk release.
+    healthy = (
+        isinstance(health, dict)
+        and health.get("healthy") is True
+        and health.get("release_id") == selected
+        and health.get("source_commit") == manifest["source_commit"]
+        and health.get("environment") == environment
+    )
+    return dict(
+        version=1,
+        source_commit=manifest["source_commit"],
+        merge_sha=health.get("merge_sha") if isinstance(health, dict) else None,
+        release_id=selected,
+        artifact_sha256=content_hash(manifest["files"]),
+        environment=environment,
+        healthy=healthy,
+    )
+
+
 def create_manifest(bundle, release_id, source_commit, schema_min, schema_max):
     """Seal a reviewed, flat wheelhouse plus hash-locked requirements."""
     manifest = dict(
@@ -239,9 +273,15 @@ def run(command, *, timeout=180):
     return result.stdout
 
 
-def prepare(root, bin_dir, bundle, *, dry_run=False, initial=False):
+def prepare(root, bin_dir, bundle, *, dry_run=False, initial=False, config_path=None):
     manifest = verify(bundle)
-    if not manifest["schema_min"] <= CURRENT_STATE_SCHEMA <= manifest["schema_max"]:
+    required = CURRENT_STATE_SCHEMA
+    if config_path is not None and config_path.is_file():
+        from oraculo.config import Config
+        from oraculo.state import State
+
+        required = State.required_schema(Config.load(config_path).state_dir)
+    if not manifest["schema_min"] <= required <= manifest["schema_max"]:
         raise RuntimeError("schema_incompatible")
     if sys.version_info[:2] != (3, 12):
         raise RuntimeError(
@@ -300,7 +340,9 @@ def prepare(root, bin_dir, bundle, *, dry_run=False, initial=False):
                     str(stage / "venv/bin/python"),
                     "-B",
                     "-c",
-                    "import oraculo.cli; from oraculo.config import resources_root; "
+                    "import oraculo.cli,inspect; from oraculo.state import State; "
+                    f"assert inspect.signature(State).parameters['schema_max'].default >= {manifest['schema_max']}; "
+                    "from oraculo.config import resources_root; "
                     'assert all((resources_root()/p).is_file() for p in ["config/oraculo.example.toml", "prompts/managed-origin.md", "skills/oraculo/SKILL.md", "templates/integration/AGENTS.md"])',
                 ]
             )
@@ -970,6 +1012,7 @@ def dispatch(args):
                     args.bundle.expanduser().resolve(),
                     dry_run=args.dry_run,
                     initial=args.runtime_action == "install",
+                    config_path=args.config.expanduser().absolute(),
                 )
             from oraculo.service_control import ServiceController
 

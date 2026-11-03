@@ -14,7 +14,7 @@ from oraculo.state import DedupeConflict, State, StateError
 
 
 class TaskStore:
-    def __init__(self, path: Path, *, read_only=False):
+    def __init__(self, path: Path, *, read_only=False, schema_max=6):
         if read_only:
             # Offline inspection must not run State's schema migrations or
             # contend with the daemon's writer authority. URI mode also forbids
@@ -30,7 +30,7 @@ class TaskStore:
                 version = self.db.execute(
                     "SELECT max(version) FROM schema_migrations"
                 ).fetchone()[0]
-                if version and version > 5:
+                if version and version > schema_max:
                     raise StateError("state_schema_newer_than_runtime")
                 self.db.execute("SELECT id,payload FROM managed_tasks LIMIT 0")
                 self.db.execute("SELECT id,payload,receipt FROM task_returns LIMIT 0")
@@ -41,7 +41,7 @@ class TaskStore:
             return
         # Schema 5 belongs only to the managed ledger. Old writers must refuse
         # it: NULL receipts on covered events are deliberately not host ACKs.
-        self.state = State(path, schema_max=5)
+        self.state = State(path, schema_max=schema_max)
         self.db = self.state.connection
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS managed_tasks(
@@ -102,6 +102,8 @@ class TaskStore:
                 if row[0] != digest:
                     raise DedupeConflict("task_key_reused")
                 return self.get(task_id)
+            if request.get("deliverable_kind") in {"validation", "research"}:
+                self.state.require_orchestration_schema()
             task = dict(
                 id=task_id,
                 origin=origin,
@@ -128,6 +130,11 @@ class TaskStore:
         with self.state.transaction():
             task = self.get(task_id)
             before = canonical_json(task)
+            if (
+                changes.get("deliverable_kind") in {"validation", "research"}
+                or "rollout_verification" in changes
+            ):
+                self.state.require_orchestration_schema()
             task.update(changes)
             task["phase"] = phase
             if phase != "blocked":
@@ -476,10 +483,64 @@ class TaskStore:
             result.append(record)
         return result
 
+    def record_pr_observation(
+        self, task_id: str, receipt: dict, expected_revision: int
+    ):
+        """Persist a fresh trusted lifecycle read before applying any PR gate.
+
+        Called only after the adapter's authenticated repository inspection;
+        public command payloads never enter this method as observations.
+        """
+        with self.state.transaction():
+            task = self.get(task_id)
+            if task.get("snapshot_revision", 0) != expected_revision:
+                raise StateError("pr_observation_snapshot_changed")
+            publication = task.get("publication") or {}
+            if receipt.get("head_sha") != publication.get("head_sha") or receipt.get(
+                "url"
+            ) != publication.get("url"):
+                raise StateError("pr_observation_binding_mismatch")
+            key = "pr-observation:v1:" + content_hash(
+                [task_id, publication, task.get("merge_policy"), receipt]
+            )
+            previous = self.state.get_meta(key)
+            if previous:
+                return previous
+            record = {
+                "source": "authenticated_repository_lifecycle",
+                "task_id": task_id,
+                "head_sha": receipt["head_sha"],
+                "event_hash": content_hash(receipt),
+                "observed_at": time.time(),
+                "receipt": receipt,
+            }
+            self.state.require_orchestration_schema()
+            self.state.set_meta(key, record)
+            # The task's existing durable return outbox is reused; no new queue.
+            self.update(
+                task_id,
+                task["phase"],
+                {"pr_observation": record["event_hash"]},
+                pr_observation=record,
+            )
+            return record
+
     def describe(self, task_id: str) -> dict:
         from oraculo.presentation import task_view
 
         task = self.get(task_id)
+        rollout = task.get("rollout_verification")
+        if (
+            rollout
+            and rollout.get("state") == "confirmed"
+            and rollout.get("expires_at", 0) <= time.time()
+        ):
+            task = dict(
+                task,
+                rollout_verification=dict(
+                    rollout, state="unknown", reason="verification_expired"
+                ),
+            )
         return {
             k: v
             for k, v in task.items()

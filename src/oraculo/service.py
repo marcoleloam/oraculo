@@ -78,7 +78,15 @@ class Singleton:
 
 
 class Service:
-    def __init__(self, config: Config, config_path: Path):
+    def __init__(
+        self,
+        config: Config,
+        config_path: Path,
+        *,
+        decision_transport=None,
+        credential_resolver=None,
+        ci_observer=None,
+    ):
         validate_startup_config(config, config_path)
         self.config = config
         self.config_path = config_path
@@ -97,12 +105,34 @@ class Service:
                 if current is None
                 else min(current, alias.max_executors)
             )
+        import sys
+
+        from oraculo.state import STATE_SCHEMA_CEILING
+
+        ceiling = STATE_SCHEMA_CEILING
+        manifest = Path(sys.prefix).parent / "manifest.json"
+        if manifest.is_file():
+            ceiling = min(ceiling, json.loads(manifest.read_text())["schema_max"])
         self.state = State(
             config.db_path,
             max_executors=config.max_executors,
             provider_limits=provider_limits,
+            schema_max=ceiling,
         )
         self.plans = Plans(self.state)
+        from oraculo.ci_events import CIEvents
+        from oraculo.decisions import Decisions, HTTPDecisionTransport
+        from oraculo.outcomes import Outcomes
+
+        self.decisions = Decisions(
+            self.state,
+            config.decisions,
+            transport=decision_transport or HTTPDecisionTransport(credential_resolver),
+        )
+        self.ci_events = CIEvents(self.state)
+        self.ci_observer = ci_observer
+        self.outcomes = Outcomes(self)
+        self.plans.outcomes = self.outcomes
         self.settlements = SettlementStore(self.state)
         self.publisher = Publisher(config.vault_root, config.state_dir, lock_timeout=2)
         self.publisher.git.timeout = 30
@@ -125,13 +155,23 @@ class Service:
             self.managed_service = ManagedService(self)
 
     def project(self, project_id: str) -> dict:
-        project = self.state.get_project(project_id)
+        project = self._visible_project(self.state, project_id)
+        if project is None:
+            from oraculo.project_registration import admit_project
+
+            project = admit_project(self.state, self.config, project_id)
+        if project is None:
+            raise StateError("project_not_registered_or_outside_scope")
+        return project
+
+    def _visible_project(self, state: State, project_id: str) -> dict | None:
+        project = state.get_project(project_id)
         if (
             not project
             or project["status"] != "registered"
             or not self.config.project_in_scope(project["path"])
         ):
-            raise StateError("project_not_registered_or_outside_scope")
+            return None
         return project
 
     @property
@@ -266,6 +306,11 @@ class Service:
         return attempt
 
     def status(self, project_id: str) -> dict:
+        from oraculo.project_registration import admit_authorized_projects
+
+        # A missing row can appear before the next tick. An unregistered row
+        # stays unregistered until a catalog tick observes the project again.
+        admit_authorized_projects(self.state, self.config)
         plans = [
             self.plans.describe(o["id"])
             for o in self.state.list_objectives()
@@ -764,7 +809,9 @@ class Service:
             raise StateError("operation_requires_async_handler")
         raise StateError("unsupported_command")
 
-    async def run_command(self, argv: list[str], cwd: Path) -> str:
+    async def run_command(
+        self, argv: list[str], cwd: Path, *, capture=False
+    ) -> str | dict:
         if (
             not isinstance(argv, list)
             or not argv
@@ -786,6 +833,13 @@ class Service:
                     if len(output) > 2 * 1024 * 1024:
                         raise StateError("verification_output_too_large")
                 await process.wait()
+            if capture:
+                return dict(
+                    argv=argv,
+                    exit=process.returncode,
+                    stdout_sha256=hashlib.sha256(output).hexdigest(),
+                    verifier="service-subprocess-v1",
+                )
             if process.returncode:
                 raise StateError("verification_command_failed")
             return output.decode("utf-8")
@@ -832,8 +886,20 @@ class Service:
                 raise StateError("operation_checkout_mismatch")
             checks = p.get("checks_argv", [])
             verifier = p.get("verifier_argv")
-            if p["kind"] in {"merge", "deploy"} and (not checks or not verifier):
+            if (p["kind"] in {"merge", "deploy"} and not checks) or (
+                p["kind"] == "merge" and not verifier
+            ):
                 raise StateError("delivery_requires_checks_and_destination_verifier")
+            if p["kind"] == "deploy":
+                from oraculo.rollout import RolloutIdentity
+
+                identity = RolloutIdentity.model_validate(
+                    p["expected_state"].get("rollout")
+                )
+                target = self.config.rollout_targets.get(identity.environment)
+                if target is None:
+                    raise StateError("rollout_target_unconfigured")
+                verifier = target.verifier_argv
             for argv in checks:
                 await self.run_command(argv, cwd)
             self.owner(envelope, executor=True)
@@ -882,6 +948,10 @@ class Service:
         from oraculo.operations import Operations
 
         operations = Operations(self.state)
+        if operation["kind"] == "deploy":
+            from oraculo.orchestration_service import verify_rollout_operation
+
+            return await verify_rollout_operation(self, operation)
         if operation["state"] == "confirmed":
             return operation
         verifier = self.state.get_meta(f"operation_verifier:{operation['id']}")
@@ -894,7 +964,9 @@ class Service:
             )
             if not isinstance(observed, dict):
                 raise StateError("invalid_destination_receipt")
-            return operations.report(operation["id"], observed, verified=True)
+            return await operations.reconcile(
+                operation["id"], lambda expected: observed
+            )
         except (ValueError, OSError, TimeoutError):
             operations.mark_uncertain(operation["id"])
             return operations.get(operation["id"])
@@ -1028,12 +1100,12 @@ class Service:
             state = State(self.config.db_path, max_executors=self.config.max_executors)
 
             def project(project_id):
-                item = state.get_project(project_id)
-                if (
-                    not item
-                    or item["status"] != "registered"
-                    or not self.config.project_in_scope(item["path"])
-                ):
+                from oraculo.project_registration import admit_project
+
+                item = self._visible_project(state, project_id)
+                if item is None:
+                    item = admit_project(state, self.config, project_id)
+                if item is None:
                     raise StateError("project_not_registered_or_outside_scope")
                 return item
 
@@ -1060,6 +1132,22 @@ class Service:
             self.memory_operations -= 1
 
     async def handle(self, envelope: Envelope) -> dict:
+        if envelope.kind in {
+            "ci.observe",
+            "decisions.shadow",
+            "decisions.kill",
+            "outcome.verify",
+            "rollout.verify",
+        }:
+            from oraculo.orchestration_service import command
+
+            data = await command(self, envelope)
+            return {
+                "request_id": envelope.request_id,
+                "ok": True,
+                "state": data.get("state", "ok"),
+                "data": data,
+            }
         if envelope.kind.startswith("knowledge."):
             from oraculo.knowledge_service import handle
 
@@ -1684,6 +1772,24 @@ class Service:
                         "evidence": report.get("evidence"),
                     }
                 )
+        spec = json.loads(job["payload"]).get("task_spec", {})
+        if spec.get("stage") == "review" and any(
+            c.get("outcome") for c in spec.get("criteria", [])
+        ):
+            for proof in proofs:
+                proof.pop("evidence", None)
+                source = self.state.get_job(proof["job_id"])
+                source_spec = json.loads(source["payload"]).get("task_spec", {})
+                attempt = self.state._one(
+                    "SELECT * FROM attempts WHERE job_id=? ORDER BY number DESC LIMIT 1",
+                    (source["id"],),
+                )
+                proof["outcomes"] = [
+                    self.state.get_meta(self.outcomes.key(attempt["id"], c["id"]))
+                    for c in source_spec.get("criteria", [])
+                    if c.get("outcome") and self.outcomes.satisfied(attempt, c["id"])
+                ]
+
         return {
             "objective": plan["spec"]["text"],
             "dependency_evidence": proofs,

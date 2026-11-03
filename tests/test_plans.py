@@ -314,7 +314,7 @@ def test_success_requires_exact_passing_criterion_receipts(db, evidence):
 @pytest.mark.parametrize(
     "stage,kind", [("publication", "push"), ("deployment", "deploy")]
 )
-def test_publication_and_deployment_require_verified_matching_operation(
+async def test_publication_and_deployment_require_verified_matching_operation(
     db, stage, kind
 ):
     state, plans = db
@@ -342,7 +342,7 @@ def test_publication_and_deployment_require_verified_matching_operation(
     operations.report("delivery", dict(expected, healthy=True))
     with pytest.raises(StateError, match="delivery_operation_not_confirmed"):
         plans.validate_report(attempt, receipts)
-    operations.report("delivery", dict(expected, healthy=True), verified=True)
+    await operations.reconcile("delivery", lambda frozen: dict(expected, healthy=True))
     plans.validate_report(attempt, receipts)
     finish(state, plans, attempt)
     assert plans.describe(result["objective_id"])["stages"][stage] == "succeeded"
@@ -554,3 +554,76 @@ def test_maximum_initial_plan_plus_followups_is_bounded_and_persistent(db):
         state.connection.execute("SELECT spec FROM objective_plans").fetchone()[0]
     )
     assert len(stored["tasks"]) == 36
+
+
+def test_frozen_legacy_plan_replays_after_upgrade_without_hash_or_payload_rewrite(
+    tmp_path,
+):
+    from pathlib import Path
+
+    from oraculo.protocol import canonical_json, content_hash
+
+    frozen = json.loads(
+        (Path(__file__).parent / "fixtures/plans/legacy_v1.json").read_text()
+    )
+    state = State(tmp_path / "legacy-state")
+    state.register_project("p", "/tmp/synthetic")
+    plans = Plans(state)
+    obj = state.submit_objective("p", frozen["raw"]["text"], dedupe_key="same-key")
+    j = state.enqueue_job(obj["id"], "implementation", frozen["job_payload"])
+    state.connection.execute(
+        "INSERT INTO objective_plans VALUES(?,?,?,?,0)",
+        (
+            obj["id"],
+            canonical_json(frozen["normalized"]),
+            frozen["submission_hash"],
+            canonical_json({"build": j["id"]}),
+        ),
+    )
+    before = state._one(
+        "SELECT * FROM objective_plans WHERE objective_id=?", (obj["id"],)
+    )
+    result = plans.submit("p", frozen["raw"], "same-key", {"implementation": ["codex"]})
+    assert result["objective_id"] == obj["id"] and len(state.list_jobs()) == 1
+    assert (
+        state._one("SELECT * FROM objective_plans WHERE objective_id=?", (obj["id"],))
+        == before
+    )
+    # New submission and nested enqueue retain the exact v1 shape, too.
+    new = plans.submit("p", frozen["raw"], "other-key", {"implementation": ["codex"]})
+    assert (
+        plans.get(new["objective_id"])["submission_hash"]
+        == frozen["submission_hash"]
+        == content_hash(frozen["normalized"])
+    )
+    assert (
+        json.loads(state.get_job(new["tasks"][0]["job_id"])["payload"])
+        == frozen["job_payload"]
+    )
+
+
+def test_real_v2_outcome_is_in_plan_hash_and_cannot_reuse_legacy_key(tmp_path):
+    from copy import deepcopy
+    from pathlib import Path
+
+    frozen = json.loads(
+        (Path(__file__).parent / "fixtures/plans/legacy_v1.json").read_text()
+    )
+    state = State(tmp_path / "state")
+    state.register_project("p", "/tmp/synthetic")
+    plans = Plans(state)
+    plans.submit("p", frozen["raw"], "key", {"implementation": ["codex"]})
+    raw = deepcopy(frozen["raw"])
+    raw["tasks"][0]["criteria"][0]["outcome"] = {
+        "version": 2,
+        "commit": "a" * 40,
+        "argv": ["synthetic-command"],
+        "artifact": "proof.json",
+        "sha256": "b" * 64,
+    }
+    with pytest.raises(StateError, match="plan_dedupe_conflict"):
+        plans.submit("p", raw, "key", {"implementation": ["codex"]})
+    result = plans.submit("p", raw, "new-key", {"implementation": ["codex"]})
+    saved = plans.get(result["objective_id"])
+    assert saved["submission_hash"] != frozen["submission_hash"]
+    assert saved["spec"]["tasks"][0]["criteria"][0]["outcome"]["version"] == 2

@@ -49,7 +49,7 @@ class ManagedService:
         )
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.store = TaskStore(path)
+            self.store = TaskStore(path, schema_max=max(5, service.state.schema_max))
             self.store.authority_owned = True
             untracked = []
             for row in self.store.db.execute("SELECT id FROM managed_tasks"):

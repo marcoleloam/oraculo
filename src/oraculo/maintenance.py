@@ -16,7 +16,17 @@ def status(state):
     active = state.get_meta("runtime_maintenance")
     return dict(
         schema_version=1,
-        state_schema=4,
+        state_schema=max(
+            state.schema_version(),
+            6
+            if State.peek_schema(state.path.parent / "managed-tasks.sqlite3", default=5)
+            >= 6
+            else 4,
+        ),
+        main_schema=state.schema_version(),
+        managed_schema=State.peek_schema(
+            state.path.parent / "managed-tasks.sqlite3", default=5
+        ),
         config_schema=1,
         admission_closed=bool(active),
         quiescent=quiescent(state),

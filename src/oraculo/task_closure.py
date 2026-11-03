@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from oraculo.deliverables import require_implementation
 from oraculo.protocol import content_hash
 from oraculo.settlement import Settlements, verify_pull_requests
 from oraculo.state import StateError
@@ -21,8 +22,7 @@ class TaskClosure:
 
     async def policy(self, task_id: str, policy: dict, actor: dict):
         task = self.store.get(task_id)
-        if task.get("deliverable_kind") == "plan":
-            raise StateError("plan_not_publishable")
+        require_implementation(task)
         if actor["thread_id"] != task["origin"]["thread_id"]:
             raise StateError("merge_policy_requires_origin")
         if not isinstance(policy, dict) or (
@@ -44,8 +44,7 @@ class TaskClosure:
         )
 
     def _requirements(self, task):
-        if task.get("deliverable_kind") == "plan":
-            raise StateError("plan_not_publishable")
+        require_implementation(task)
         if not task.get("publication") or not task.get("publication_spec"):
             raise StateError("publication_required_before_merge")
         specification = task["publication_spec"]
@@ -71,8 +70,7 @@ class TaskClosure:
 
     async def watch(self, task_id):
         task = self.store.get(task_id)
-        if task.get("deliverable_kind") == "plan":
-            raise StateError("plan_not_publishable")
+        require_implementation(task)
         if task["publication"].get("host") == "azure":
             self.store.update(
                 task_id,
@@ -108,11 +106,13 @@ class TaskClosure:
 
     async def check(self, task_id, *, merge=False):
         task = self.store.get(task_id)
-        if task.get("deliverable_kind") == "plan":
-            raise StateError("plan_not_publishable")
+        require_implementation(task)
         self._requirements(task)
         receipt = self.lifecycle.inspect(
             task["publication"], task["merge_policy"], task["publication_spec"]["cwd"]
+        )
+        self.store.record_pr_observation(
+            task_id, receipt, task.get("snapshot_revision", 0)
         )
         if receipt["state"] == "merged":
             if not receipt.get("merge_sha"):
@@ -223,8 +223,7 @@ class TaskClosure:
     async def finalize(self, task_id):
         task = self.store.get(task_id)
         self._requirements(task)
-        if task.get("deliverable_kind") == "plan":
-            raise StateError("plan_not_publishable")
+        require_implementation(task)
         merged = task.get("merge_receipt")
         if not merged or not task["merged"]:
             raise StateError("verified_merge_required")

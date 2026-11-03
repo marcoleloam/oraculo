@@ -7,9 +7,11 @@ import time
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
+from oraculo.ci_events import CIBinding
 from oraculo.config import StrictModel
+from oraculo.outcomes import OutcomeContract, Outcomes
 from oraculo.protocol import canonical_json, content_hash, validate_memory_submission
 from oraculo.state import State, StateError
 
@@ -17,6 +19,14 @@ from oraculo.state import State, StateError
 class Criterion(StrictModel):
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")
     description: str = Field(min_length=1, max_length=2000)
+    outcome: OutcomeContract | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_shape(self, handler):
+        value = handler(self)
+        if self.outcome is None:
+            value.pop("outcome", None)
+        return value
 
 
 class TaskSpec(StrictModel):
@@ -71,6 +81,8 @@ class TaskSpec(StrictModel):
         if (self.kind == "memory") != (self.stage == "memory"):
             raise ValueError("memory kind and stage must agree")
         validate_memory_submission(dict(self.payload, kind=self.kind))
+        if "ci_binding" in self.payload:
+            CIBinding.model_validate(self.payload["ci_binding"])
         if {
             "task_spec",
             "kind",
@@ -111,6 +123,7 @@ class PlanSpec(StrictModel):
 class Plans:
     def __init__(self, state: State):
         self.state = state
+        self.outcomes = Outcomes(state)
         state.connection.execute(
             "CREATE TABLE IF NOT EXISTS objective_plans(objective_id TEXT PRIMARY KEY REFERENCES objectives(id),spec TEXT NOT NULL,submission_hash TEXT NOT NULL,job_ids TEXT NOT NULL,followups INTEGER NOT NULL DEFAULT 0)"
         )
@@ -286,17 +299,37 @@ class Plans:
                 or not matched[0]["reference"].strip()
             ):
                 raise StateError("criterion_not_satisfied:" + criterion["id"])
+            if criterion.get("outcome"):
+                if self.outcomes is None or not self.outcomes.satisfied(
+                    attempt, criterion["id"], matched[0]["reference"]
+                ):
+                    raise StateError("outcome_not_verified:" + criterion["id"])
         if spec["stage"] in {"publication", "deployment"}:
             kinds = (
                 {"deploy"} if spec["stage"] == "deployment" else {"push", "merge", "pr"}
             )
             operations = self.state.connection.execute(
-                "SELECT kind,state FROM operations WHERE attempt_id=?", (attempt["id"],)
+                "SELECT kind,state,observed_state FROM operations WHERE attempt_id=?",
+                (attempt["id"],),
             ).fetchall()
             if not any(
-                o["kind"] in kinds and o["state"] == "confirmed" for o in operations
+                o["kind"] in kinds
+                and o["state"] == "confirmed"
+                and (o["kind"] != "deploy" or self._rollout_current(o))
+                for o in operations
             ):
                 raise StateError("delivery_operation_not_confirmed")
+
+    @staticmethod
+    def _rollout_current(operation):
+        observed = json.loads(operation["observed_state"] or "{}")
+        receipt = observed.get("rollout_receipt")
+        # Legacy operations keep their historical contract; new rollout evidence
+        # has its own expiry and cannot rely on an old confirmed state.
+        return receipt is None or (
+            receipt.get("state") == "confirmed"
+            and receipt.get("expires_at", 0) > time.time()
+        )
 
     def retry(self, objective_id: str, task_id: str, max_attempts: int) -> dict:
         if type(max_attempts) is not int or max_attempts < 1:

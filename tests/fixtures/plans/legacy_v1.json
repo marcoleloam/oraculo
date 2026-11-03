@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "raw": {
+    "text": "Synthetic stable upgrade replay",
+    "tasks": [
+      {
+        "id": "build",
+        "owner": "synthetic",
+        "brief": "synthetic work",
+        "criteria": [
+          {
+            "id": "proof",
+            "description": "synthetic proof"
+          }
+        ]
+      }
+    ]
+  },
+  "normalized": {
+    "max_followups": 4,
+    "tasks": [
+      {
+        "brief": "synthetic work",
+        "criteria": [
+          {
+            "description": "synthetic proof",
+            "id": "proof"
+          }
+        ],
+        "depends_on": [],
+        "id": "build",
+        "kind": "implementation",
+        "owner": "synthetic",
+        "payload": {},
+        "sources": [],
+        "stage": "implementation",
+        "write_paths": [
+          "*"
+        ]
+      }
+    ],
+    "text": "Synthetic stable upgrade replay"
+  },
+  "submission_hash": "79c472657939c40e75c08abb444ca9b99aedfd297d2db7a708957ef3b97c94d7",
+  "job_payload": {
+    "task_spec": {
+      "brief": "synthetic work",
+      "criteria": [
+        {
+          "description": "synthetic proof",
+          "id": "proof"
+        }
+      ],
+      "depends_on": [],
+      "id": "build",
+      "kind": "implementation",
+      "owner": "synthetic",
+      "sources": [],
+      "stage": "implementation",
+      "write_paths": [
+        "*"
+      ]
+    },
+    "text": "synthetic work"
+  }
+}
