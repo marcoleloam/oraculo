@@ -1,5 +1,13 @@
 # Tarefas geridas por projeto
 
+## Revisão terminal sem parecer
+
+`task diagnose-review` distingue descendentes ativos/desconhecidos de revisão
+terminal sem sucesso. `task adjudicate-review` exige revisão técnica humana,
+provas e mensagens humanas reais vinculadas ao escopo, relatório e HEAD. Mantém
+relatórios, memória e runs originais; um FAIL técnico ou teste funcional negativo
+continua bloqueando. Veja o [contrato completo](TERMINAL_REVIEW_ADJUDICATION.md).
+
 ## Recuperação explícita pela origem
 
 `task complete-origin` aceita validação independente de uma implementação cujo

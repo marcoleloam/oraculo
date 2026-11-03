@@ -97,10 +97,10 @@ def git(
             env=env,
             check=True,
             capture_output=True,
-            text=True,
+            text=strip,
             timeout=15,
         ).stdout
-        return output.strip() if strip else output
+        return output.strip() if strip else os.fsdecode(output)
     except (OSError, subprocess.SubprocessError):
         raise StateError(error) from None
 
@@ -329,6 +329,16 @@ class ManagedTasks:
                     )
                 elif action == "recover-report":
                     await self._recover_report(task, payload, actor)
+                elif action in {"diagnose-review", "adjudicate-review"}:
+                    from oraculo.task_recovery import TaskRecovery
+
+                    recovery = TaskRecovery(self)
+                    if action == "diagnose-review":
+                        return dict(
+                            self.store.describe(task_id),
+                            review_diagnosis=await recovery.diagnose_review(task),
+                        )
+                    await recovery.adjudicate_review(task, payload, actor)
                 elif action in {"complete-origin", "supersede"}:
                     from oraculo.task_recovery import TaskRecovery
 
@@ -1582,7 +1592,7 @@ class ManagedTasks:
         client.call = self.host.call
         snapshot = await client.settlement_snapshot(
             task["child"]["childThreadId"],
-            terminal_only=not successful,
+            terminal_only=True,
             complete_runs=True,
         )
         if pending_reason:
@@ -1601,6 +1611,9 @@ class ManagedTasks:
             ):
                 raise StateError(pending_reason)
         if successful:
+            from oraculo.review_adjudication import ReviewAdjudication
+
+            await ReviewAdjudication(self).gate(task, snapshot)
             self._successful_snapshot(task, snapshot)
         chain = self._terminal_snapshot(
             task, snapshot, workspace_required=workspace_required
@@ -1661,8 +1674,15 @@ class ManagedTasks:
         """Keep host truth intact when the latest request never executed."""
         thread = snapshot["thread"]
         audit = task.get("origin_completion")
-        if snapshot.get("childrenSuccessful") is not True:
-            raise StateError("thread_children_pending_or_unknown")
+        if snapshot.get("childrenSuccessful") is not True and not task.get(
+            "review_adjudication"
+        ):
+            reason = (
+                "terminal_descendant_review_required"
+                if snapshot.get("childrenTerminal") is True
+                else "thread_children_pending_or_unknown"
+            )
+            raise StateError(reason)
         latest = [
             r for r in snapshot["recentRuns"] if r["runId"] == thread["latestRunId"]
         ]
@@ -1689,7 +1709,6 @@ class ManagedTasks:
             or type(thread.get("settled")) is not bool
             or not thread.get("updatedAt")
             or type(thread.get("itemCount")) is not int
-            or snapshot.get("childrenSuccessful") is not True
         ):
             raise StateError("thread_active_failed_or_pending_question")
         if audit:
@@ -1707,6 +1726,9 @@ class ManagedTasks:
                 task, successful=True, observations=observations
             )
         else:
+            from oraculo.review_adjudication import ReviewAdjudication
+
+            await ReviewAdjudication(self).gate(task, snapshot)
             self._successful_snapshot(task, snapshot)
         chain = terminal_chain(snapshot)
         original = next(r for r in chain if r["runId"] == task["child"]["childRunId"])

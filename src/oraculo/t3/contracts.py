@@ -92,7 +92,10 @@ class SettlementListPage(RemoteModel):
 def settlement_child_clear(
     snapshot: SettlementRead, *, terminal_only: bool = False
 ) -> bool:
-    """A failed/interrupted child is unresolved, even though its run is terminal."""
+    """Keep liveness (terminal_only) distinct from successful completion.
+
+    Neither terminal liveness nor an external review changes the host status.
+    """
     thread = snapshot.thread
     if thread.activeRunId is not None or thread.pendingRequestCount != 0:
         return False
