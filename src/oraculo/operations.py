@@ -57,6 +57,8 @@ class Operations:
                     )
                 if kind == "deploy" and not expected_state.get("artifact"):
                     raise StateError("deploy requires an expected artifact")
+            if "rollout" in expected_state:
+                self.state.require_orchestration_schema()
             self.state.connection.execute(
                 "INSERT INTO operations(id,attempt_id,kind,idempotency_key,expected_state,state,payload_hash,created_at) VALUES(?,?,?,?,?,'prepared',?,?)",
                 (
@@ -114,14 +116,16 @@ class Operations:
         self,
         operation_id: str,
         observed_state: dict[str, Any],
-        *,
-        verified: bool = False,
     ) -> dict[str, Any]:
+        """Record an assertion only; callers cannot confirm with a boolean."""
+        return self._record(operation_id, observed_state, verified=False)
+
+    def _record(self, operation_id, observed_state, *, verified):
         with self.state.transaction():
             operation = self.get(operation_id)
             if not operation:
                 raise StateError("unknown operation")
-            if operation["state"] == "confirmed":
+            if operation["state"] == "confirmed" and operation["kind"] != "deploy":
                 return operation
             expected = json.loads(operation["expected_state"])
             matches = all(
@@ -140,6 +144,8 @@ class Operations:
             )
             if observed_state.get("failed") is True:
                 status = "failed"
+            if "rollout_receipt" in observed_state:
+                self.state.require_orchestration_schema()
             self.state.connection.execute(
                 "UPDATE operations SET observed_state=?,state=? WHERE id=?",
                 (canonical_json(observed_state), status, operation_id),
@@ -155,4 +161,4 @@ class Operations:
         observed = verify_destination(json.loads(operation["expected_state"]))
         if inspect.isawaitable(observed):
             observed = await observed
-        return self.report(operation_id, observed, verified=True)
+        return self._record(operation_id, observed, verified=True)

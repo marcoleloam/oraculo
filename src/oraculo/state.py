@@ -6,11 +6,13 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from oraculo.protocol import canonical_json, content_hash
+
+STATE_SCHEMA_CEILING = 6
 
 
 class StateError(ValueError):
@@ -54,10 +56,11 @@ class State:
         max_executors: int = 1,
         provider_limits: dict[str, int] | None = None,
         *,
-        schema_max: int = 4,
+        schema_max: int = STATE_SCHEMA_CEILING,
     ) -> None:
         if type(max_executors) is not int or max_executors < 1:
             raise StateError("max_executors must be a positive integer")
+        self.schema_max = schema_max
         self.max_executors = max_executors
         self.provider_limits = provider_limits or {}
         self.path = Path(path)
@@ -102,6 +105,42 @@ class State:
             self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(4)")
         self.path.chmod(0o600)
 
+    def schema_version(self):
+        return self.connection.execute(
+            "SELECT max(version) FROM schema_migrations"
+        ).fetchone()[0]
+
+    def require_orchestration_schema(self):
+        """Lazy compatibility barrier, atomic with the first new semantic write."""
+        if self.schema_max < STATE_SCHEMA_CEILING:
+            raise StateError("orchestration_schema_unsupported")
+        with self.transaction():
+            self.connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(6)")
+
+    @staticmethod
+    def peek_schema(path: Path, *, default=4):
+        if not path.exists():
+            return default
+        try:
+            with closing(
+                sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)
+            ) as db:
+                version = db.execute(
+                    "SELECT max(version) FROM schema_migrations"
+                ).fetchone()[0]
+            if not isinstance(version, int) or version > STATE_SCHEMA_CEILING:
+                raise StateError("state_schema_newer_than_runtime")
+            return version
+        except sqlite3.Error:
+            raise StateError("state_schema_unavailable") from None
+
+    @staticmethod
+    def required_schema(state_dir: Path):
+        main = State.peek_schema(state_dir / "state.sqlite3")
+        ledger = State.peek_schema(state_dir / "managed-tasks.sqlite3", default=5)
+        # Ledger v5 is an established independent baseline, not main v5.
+        return max(main, 6 if ledger >= 6 else 4)
+
     def close(self) -> None:
         self.connection.close()
 
@@ -134,6 +173,14 @@ class State:
             "INSERT INTO metadata VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, canonical_json(value)),
         )
+
+    def compare_meta(self, key: str, expected: Any, value: Any) -> bool:
+        """Compare and replace one durable value under the existing writer lock."""
+        with self.transaction():
+            if self.get_meta(key) != expected:
+                return False
+            self.set_meta(key, value)
+            return True
 
     def register_project(
         self, project_id: str, path: str | Path, status: str = "registered"
@@ -226,6 +273,11 @@ class State:
                     raise StateError(
                         "dependency must be an existing job of this objective"
                     )
+            spec = payload.get("task_spec", {})
+            if "ci_binding" in payload or any(
+                c.get("outcome") is not None for c in spec.get("criteria", [])
+            ):
+                self.require_orchestration_schema()
             identifier = uuid.uuid4().hex
             self.connection.execute(
                 "INSERT INTO jobs(id,objective_id,kind,payload,payload_hash,created_at) VALUES(?,?,?,?,?,?)",
@@ -566,6 +618,15 @@ class State:
                 "Reconcile successful dependency criteria",
                 job_ids=missing,
             )
+        binding = json.loads(job["payload"]).get("ci_binding")
+        if binding:
+            from oraculo.ci_events import CIEvents
+
+            if not CIEvents(self).passed(objective["project_id"], binding):
+                block(
+                    "ci_evidence_pending",
+                    "Observe authenticated CI for the exact HEAD/run/attempt",
+                )
         if job["next_attempt_at"] > time.time():
             block(
                 "retry_backoff", "Wait for retry time", retry_at=job["next_attempt_at"]

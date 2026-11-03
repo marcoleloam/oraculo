@@ -155,7 +155,7 @@ def migrate(
         manifest_hash = rt.digest(source / "manifest.json")
         if (
             not manifest["schema_min"]
-            <= rt.CURRENT_STATE_SCHEMA
+            <= State.required_schema(config.state_dir)
             <= manifest["schema_max"]
         ):
             raise rt.RuntimeError("schema_incompatible")

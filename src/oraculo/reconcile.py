@@ -137,7 +137,7 @@ class Reconciler:
             operations.mark_uncertain(operation_id)
             return None
         observed = dict(expected, thread_id=matches[0]["threadId"])
-        operations.report(operation_id, observed, verified=True)
+        await operations.reconcile(operation_id, lambda expected: observed)
         return matches[0]
 
     async def reconcile(self) -> list[dict[str, Any]]:

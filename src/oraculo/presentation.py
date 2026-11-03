@@ -37,6 +37,10 @@ PHASES = {
         "Registrando memória",
         "Salvando o resultado e os aprendizados.",
     ),
+    "validation_ready": (
+        "Validação entregue",
+        "Trabalho e memória confirmados; resultado pronto para revisão.",
+    ),
     "awaiting_approval": (
         "Aguardando aprovação",
         "O planejamento aguarda decisão da origem.",
@@ -180,11 +184,18 @@ def task_view(task: dict) -> dict:
         if work in {"failed", "stopped"}
         else "A origem deve revisar o planejamento."
         if phase == "awaiting_approval"
+        else "A origem pode revisar as evidências da validação/pesquisa."
+        if phase == "validation_ready"
         else "Nenhuma ação necessária."
     )
     child = task.get("child") or {}
     origin = task.get("origin") or {}
-    if task.get("deliverable_kind") == "plan" and work == "succeeded":
+    if (
+        task.get("deliverable_kind") in {"validation", "research"}
+        and work == "succeeded"
+    ):
+        result = "Validação/pesquisa entregue para revisão; publicação não faz parte deste entregável."
+    elif task.get("deliverable_kind") == "plan" and work == "succeeded":
         result = (
             "Planejamento aprovado; implementação ainda é uma etapa separada."
             if task.get("approval_state") == "approved"

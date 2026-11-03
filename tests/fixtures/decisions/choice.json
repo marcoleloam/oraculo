@@ -1,0 +1,26 @@
+{
+  "model": "gpt-6-luna",
+  "usage": {
+    "input_tokens": 351,
+    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    "output_tokens": 0,
+    "output_tokens_details": {"reasoning_tokens": 0},
+    "total_tokens": 351
+  },
+  "status": null,
+  "answers": [{
+    "type": "choice", "name": "ci_cause", "choice": "environment",
+    "probabilities": [
+      {"value": "code", "probability": 0.01},
+      {"value": "environment", "probability": 0.98},
+      {"value": "external", "probability": 0.0},
+      {"value": "context_limit", "probability": 0.0},
+      {"value": "concurrency", "probability": 0.0},
+      {"value": "account_quota", "probability": 0.0},
+      {"value": "unknown", "probability": 0.01}
+    ],
+    "confidence": 0.98
+  }],
+  "output": null,
+  "service_tier": null
+}

@@ -8,6 +8,7 @@ from test_reconcile import Remote
 from test_reconcile import snapshot as unit_snapshot
 
 from oraculo.cli import make_envelope, request
+from oraculo.config import RolloutTarget
 from oraculo.reconcile import Reconciler
 
 
@@ -357,26 +358,45 @@ async def test_delivery_checks_and_real_destination_verifier(
     _, attempt = await acquire(service)
     root = service.config.projects_root / "alpha"
     subprocess.run(["git", "init", "-q", str(root)], check=True)
+    identity = {
+        "version": 1,
+        "source_commit": "a" * 40,
+        "merge_sha": "b" * 40,
+        "release_id": "fixture",
+        "artifact_sha256": "c" * 64,
+        "environment": "local-test",
+    }
+    service.config.rollout_targets["local-test"] = RolloutTarget(
+        cwd=root,
+        verifier_argv=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; print(Path('destination.json').read_text())",
+        ],
+    )
     destination = root / "destination.json"
-    destination.write_text(json.dumps({"commit": "old"}))
+    destination.write_text(json.dumps(dict(identity, release_id="old", healthy=True)))
     payload = {
         "operation_id": "deploy-test",
         "attempt_id": attempt["id"],
         "generation": attempt["generation"],
         "kind": "deploy",
         "expected_state": {
-            "commit": "new",
+            "commit": identity["merge_sha"],
             "target": "local-test",
-            "artifact": "fixture",
+            "artifact": identity["artifact_sha256"],
+            "rollout": identity,
         },
         "cwd": str(root),
         "checks_argv": [
             [sys.executable, "-c", f"import sys; sys.exit({0 if checks_pass else 1})"]
         ],
+        # An executor-supplied self-confirmation must never replace the pinned
+        # service destination verifier below.
         "verifier_argv": [
             sys.executable,
             "-c",
-            "from pathlib import Path; print(Path('destination.json').read_text())",
+            "print(" + repr(json.dumps(dict(identity, healthy=True))) + ")",
         ],
     }
     result = await command(
@@ -398,29 +418,11 @@ async def test_delivery_checks_and_real_destination_verifier(
     mismatch = await command(service, "operation.report", report)
     assert mismatch["data"]["state"] != "confirmed"
     for health in ({}, {"healthy": False}):
-        destination.write_text(
-            json.dumps(
-                {
-                    "commit": "new",
-                    "target": "local-test",
-                    "artifact": "fixture",
-                    **health,
-                }
-            )
-        )
+        destination.write_text(json.dumps(dict(identity, **health)))
         assert (await command(service, "operation.report", report))["data"][
             "state"
         ] != "confirmed"
-    destination.write_text(
-        json.dumps(
-            {
-                "commit": "new",
-                "target": "local-test",
-                "artifact": "fixture",
-                "healthy": True,
-            }
-        )
-    )
+    destination.write_text(json.dumps(dict(identity, healthy=True)))
     confirmed = await command(service, "operation.report", report)
     assert confirmed["data"]["state"] == "confirmed"
     assert not (
@@ -500,12 +502,28 @@ async def test_concurrent_operation_prepare_authorizes_effect_only_once(
         return await original(argv, cwd)
 
     monkeypatch.setattr(service, "run_command", synchronized_check)
+    identity = {
+        "version": 1,
+        "source_commit": "a" * 40,
+        "merge_sha": "b" * 40,
+        "release_id": "fixture",
+        "artifact_sha256": "c" * 64,
+        "environment": "test",
+    }
+    service.config.rollout_targets["test"] = RolloutTarget(
+        cwd=root, verifier_argv=[sys.executable, "-c", "print('{}')"]
+    )
     payload = {
         "operation_id": "contended-deploy",
         "attempt_id": attempt["id"],
         "generation": attempt["generation"],
         "kind": "deploy",
-        "expected_state": {"commit": "new", "target": "test", "artifact": "a"},
+        "expected_state": {
+            "commit": identity["merge_sha"],
+            "target": "test",
+            "artifact": identity["artifact_sha256"],
+            "rollout": identity,
+        },
         "cwd": str(root),
         "checks_argv": [check],
         "verifier_argv": [sys.executable, "-c", "print('{}')"],

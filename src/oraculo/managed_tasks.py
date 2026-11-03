@@ -13,6 +13,14 @@ import re
 import subprocess
 from pathlib import Path
 
+from oraculo.deliverables import (
+    KINDS,
+    certified_phase,
+    require_implementation,
+)
+from oraculo.deliverables import (
+    kind as deliverable_kind,
+)
 from oraculo.projects import resolve_project
 from oraculo.protocol import canonical_json, content_hash, is_control_event
 from oraculo.run_continuity import (
@@ -215,6 +223,8 @@ class ManagedTasks:
             if action == "start":
                 if payload.get("kind") != "work":
                     return {"state": "not_work", "created": False}
+                if payload.get("deliverable_kind", "implementation") not in KINDS:
+                    raise StateError("invalid_deliverable_kind")
                 text = payload.get("text")
                 if not isinstance(text, str) or not text.strip() or len(text) > 32000:
                     raise StateError("task_brief_required")
@@ -351,6 +361,7 @@ class ManagedTasks:
                     else:
                         await self._finish(task_id, payload.get("report"), actor)
                 elif action == "deployment":
+                    require_implementation(task)
                     from oraculo.deployment import deployment_evidence
 
                     if actor["thread_id"] != task["origin"]["thread_id"]:
@@ -367,8 +378,7 @@ class ManagedTasks:
                             deployments=[*records, evidence],
                         )
                 elif action in {"pr-check", "merge", "settle", "unwatch"}:
-                    if task.get("deliverable_kind") == "plan":
-                        raise StateError("plan_not_publishable")
+                    require_implementation(task)
                     from oraculo.task_closure import TaskClosure
 
                     if self.lifecycle is None:
@@ -629,6 +639,7 @@ class ManagedTasks:
                 "settled",
                 "awaiting_approval",
                 "plan_approved",
+                "validation_ready",
             }:
                 return
             report = task.get("submitted_report") or task.get("report")
@@ -639,7 +650,7 @@ class ManagedTasks:
                 )
                 if (
                     publication
-                    and self.store.get(task_id).get("deliverable_kind") != "plan"
+                    and deliverable_kind(self.store.get(task_id)) == "implementation"
                 ):
                     await self._publish(task_id, publication, task["origin"])
             elif task["work_status"] == "pending":
@@ -1160,7 +1171,7 @@ class ManagedTasks:
         if not isinstance(report, dict):
             raise StateError("structured_report_required")
         kind = task["request"].get("deliverable_kind", "implementation")
-        if kind not in {"plan", "implementation"}:
+        if kind not in KINDS:
             raise StateError("invalid_deliverable_kind")
         if report.get("deliverable_kind", kind) != kind:
             raise StateError("deliverable_kind_conflict")
@@ -1803,7 +1814,7 @@ class ManagedTasks:
         )
         self.store.update(
             task_id,
-            ("awaiting_approval" if kind == "plan" else "pr_pending")
+            certified_phase(kind)
             if self._saved(cycle) and succeeded
             else "memory_pending",
             {
@@ -1883,7 +1894,7 @@ class ManagedTasks:
                 if task.get("approval_state") == "approved"
                 else "awaiting_approval"
             )
-        return "pr_pending"
+        return certified_phase(deliverable_kind(task))
 
     def _certified(self, task: dict) -> bool:
         """Report certified and its memory confirmed: an immutable result."""
@@ -1945,8 +1956,7 @@ class ManagedTasks:
 
     async def _publish(self, task_id: str, spec: dict, actor: dict):
         task = self.store.get(task_id)
-        if task.get("deliverable_kind") == "plan":
-            raise StateError("plan_not_publishable")
+        require_implementation(task)
         if task["work_status"] != "succeeded" or not self._saved(task["memory"]):
             raise StateError("work_and_memory_required_before_pr")
         if self._report_failed(task.get("report")):

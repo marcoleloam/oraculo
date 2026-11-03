@@ -61,7 +61,7 @@ def test_failed_checks_block_delivery(tmp_path):
         generation=grant["generation"],
         checks_passed=True,
     )
-    assert operations.report("op", {"failed": True}, verified=True)["state"] == "failed"
+    assert operations.report("op", {"failed": True})["state"] == "failed"
 
 
 def test_failed_deploy_cannot_complete_successfully(tmp_path):
@@ -75,7 +75,7 @@ def test_failed_deploy_cannot_complete_successfully(tmp_path):
         generation=grant["generation"],
         checks_passed=True,
     )
-    operations.report("op", {"failed": True}, verified=True)
+    operations.report("op", {"failed": True})
     assert state.record_execution(
         grant["id"],
         grant["generation"],

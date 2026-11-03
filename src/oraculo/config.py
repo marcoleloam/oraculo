@@ -36,6 +36,41 @@ class MemoryConfig(StrictModel):
     canonical_gc: Literal[False] = False
 
 
+class DecisionsTariff(StrictModel):
+    version: str = Field(min_length=1, max_length=100)
+    authorization_reference: str = Field(pattern=r"^ref:[a-zA-Z0-9_.-]{1,100}$")
+    bound_reference: str = Field(pattern=r"^ref:[a-zA-Z0-9_.-]{1,100}$")
+    # Authorized upper rates in nano-USD/token, including caching premiums.
+    input_nanousd: int = Field(ge=1, strict=True)
+    multiplier_milli: int = Field(ge=1000, strict=True)
+    framing_tokens: int = Field(ge=1024, strict=True)
+    # Decisions currently has no output cap. Only the explicit zero-output
+    # billing contract can supply a finite bound for this adapter.
+    output_nanousd: Literal[0] = 0
+
+
+class DecisionsConfig(StrictModel):
+    # API spend is independent of subscription billing; defaults cannot send.
+    enabled: bool = Field(default=False, strict=True)
+    mode: Literal["off", "shadow"] = "off"
+    model: Literal["gpt-6-luna"] = "gpt-6-luna"
+    credential_reference: str | None = Field(
+        default=None, pattern=r"^ref:[a-zA-Z0-9_.-]{1,100}$"
+    )
+    daily_budget_microusd: int = Field(default=0, ge=0, le=1000000, strict=True)
+    run_budget_microusd: int = Field(default=0, ge=0, le=1000000, strict=True)
+    max_calls: int = Field(default=80, ge=0, le=80, strict=True)
+    max_concurrent: int = Field(default=2, ge=1, le=2, strict=True)
+    deadline_seconds: float = Field(default=3, gt=0, le=3)
+    tariff: DecisionsTariff | None = None
+
+
+class RolloutTarget(StrictModel):
+    # Pinned by service configuration, never by an executor request.
+    verifier_argv: list[str] = Field(min_length=1, max_length=100)
+    cwd: Path
+
+
 class Config(StrictModel):
     _loaded_sha256: str | None = PrivateAttr(default=None)
     schema_version: Literal[1] = 1
@@ -71,6 +106,8 @@ class Config(StrictModel):
         }
     )
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    decisions: DecisionsConfig = Field(default_factory=DecisionsConfig)
+    rollout_targets: dict[str, RolloutTarget] = Field(default_factory=dict)
 
     @field_validator("projects_root", "vault_root", "state_dir", mode="before")
     @classmethod
@@ -128,11 +165,17 @@ class Config(StrictModel):
 
     def project_in_scope(self, path: str | Path) -> bool:
         candidate = Path(path).expanduser().resolve()
-        return (
-            candidate != self.projects_root
-            and candidate.is_relative_to(self.projects_root)
-            and (self.allowed_projects is None or candidate in self.allowed_projects)
+        in_root = candidate != self.projects_root and candidate.is_relative_to(
+            self.projects_root
         )
+        if not in_root:
+            return False
+        # None keeps root discovery. A list is exact; dynamic policy only adds.
+        if self.allowed_projects is None or candidate in self.allowed_projects:
+            return True
+        from oraculo.project_registration import dynamic_scope_contains
+
+        return dynamic_scope_contains(self, candidate)
 
     @classmethod
     def load(cls, path: Path | str) -> Config:
