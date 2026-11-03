@@ -174,7 +174,7 @@ def test_new_rollout_operation_promotes_before_intent_and_old_reader_cannot_conf
 def test_future_schema_is_refused_by_modern_writer_and_readers(tmp_path):
     path = tmp_path / "state.sqlite3"
     s = State(path)
-    s.connection.execute("INSERT INTO schema_migrations VALUES(7)")
+    s.connection.execute("INSERT INTO schema_migrations VALUES(8)")
     s.close()
     with pytest.raises(StateError):
         State(path)
@@ -191,7 +191,23 @@ def test_installed_manifest_ceiling_blocks_new_features_without_migrating_state(
     release = tmp_path / "installed"
     venv = release / "venv"
     venv.mkdir(parents=True)
-    (release / "manifest.json").write_text(json.dumps({"schema_max": 4}))
+    (venv / "bin").mkdir()
+    interpreter = venv / "bin/python"
+    interpreter.write_bytes(b"laboratory interpreter")
+    (release / "manifest.json").write_text(
+        json.dumps(
+            dict(
+                release_id="laboratory",
+                schema_version=1,
+                python="3.12",
+                source_commit="a" * 40,
+                schema_min=4,
+                schema_max=4,
+                interpreter_sha256=rt.digest(interpreter),
+                files=rt.inventory(release),
+            )
+        )
+    )
     monkeypatch.setattr(sys, "prefix", str(venv))
     s = Service(config, path)
     s.state.register_project("p", str(config.projects_root / "alpha"))

@@ -23,7 +23,8 @@ class FixtureTransport:
 
     async def post(self, path, body, **kwargs):
         self.calls += 1
-        label = body["input"].split(":", 1)[0]
+        features = json.loads(body["input"])
+        label = next((key for key, value in features.items() if value), "unknown")
         return 200, {
             "model": "gpt-6-luna",
             "answers": [
@@ -83,6 +84,15 @@ async def evaluate(root):
             transport=t,
         )
         rows = []
+        diagnostics = dict(
+            code="assertion",
+            environment="runner",
+            external="network",
+            context_limit="context overflow",
+            concurrency="concurrency",
+            account_quota="quota",
+            unknown="",
+        )
         for index, label in enumerate(CAUSES):
             router = Router(config, state)
             baseline = router.select("implementation", catalog)
@@ -112,13 +122,13 @@ async def evaluate(root):
             started = time.perf_counter()
             answer = await advisor.advise(
                 snap,
-                label + ": synthetic evidence",
+                diagnostics[label],
                 lambda: snap.model_dump(mode="json"),
             )
             elapsed = (time.perf_counter() - started) * 1000
             await advisor.advise(
                 snap,
-                label + ": synthetic evidence",
+                diagnostics[label],
                 lambda: snap.model_dump(mode="json"),
             )
             after = content_hash(

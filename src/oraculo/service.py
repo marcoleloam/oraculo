@@ -95,6 +95,22 @@ class Service:
             if config_path.is_file()
             else None
         )
+        self.process_release = None
+        manifest_path = Path(sys.prefix).parent / "manifest.json"
+        if manifest_path.is_file():
+            from oraculo.runtime import verify
+
+            manifest = verify(manifest_path.parent, installed=True)
+            self.process_release = dict(
+                release_id=manifest["release_id"],
+                source_commit=manifest["source_commit"],
+                delivery_source_commit=manifest.get(
+                    "delivery_source_commit", manifest["source_commit"]
+                ),
+                artifact_sha256=__import__(
+                    "oraculo.protocol", fromlist=["content_hash"]
+                ).content_hash(manifest["files"]),
+            )
         provider_limits: dict[str, int] = {}
         for alias in config.providers.values():
             if alias.max_executors is None:
@@ -105,8 +121,6 @@ class Service:
                 if current is None
                 else min(current, alias.max_executors)
             )
-        import sys
-
         from oraculo.state import STATE_SCHEMA_CEILING
 
         ceiling = STATE_SCHEMA_CEILING
@@ -120,6 +134,11 @@ class Service:
             schema_max=ceiling,
         )
         self.plans = Plans(self.state)
+        from oraculo.rollout import verifier_binding
+
+        self.plans.rollout_binding = lambda env: verifier_binding(
+            self.config.rollout_targets.get(env), self.config_path
+        )
         from oraculo.ci_events import CIEvents
         from oraculo.decisions import Decisions, HTTPDecisionTransport
         from oraculo.outcomes import Outcomes
@@ -130,7 +149,9 @@ class Service:
             transport=decision_transport or HTTPDecisionTransport(credential_resolver),
         )
         self.ci_events = CIEvents(self.state)
-        self.ci_observer = ci_observer
+        from oraculo.ci_host import RepositoryCIObserver
+
+        self.ci_observer = ci_observer or RepositoryCIObserver(self)
         self.outcomes = Outcomes(self)
         self.plans.outcomes = self.outcomes
         self.settlements = SettlementStore(self.state)
@@ -462,7 +483,10 @@ class Service:
         return result
 
     def local_command(
-        self, envelope: Envelope, prepared_cycle: dict | None = None
+        self,
+        envelope: Envelope,
+        prepared_cycle: dict | None = None,
+        prepared_route=None,
     ) -> dict:
         p = envelope.payload
         kind = envelope.kind
@@ -633,7 +657,9 @@ class Service:
                 != envelope.project_id
             ):
                 raise StateError("job_project_mismatch")
-            target = self.router.select(job["kind"], self.catalog)
+            from oraculo.decision_routing import consume_job_route
+
+            target = consume_job_route(self, job, prepared_route)
             if not target:
                 raise StateError("no_eligible_subscription_model")
             if job["kind"] != "memory":
@@ -661,6 +687,19 @@ class Service:
             )
             if not attempt:
                 return {"state": "busy"}
+            if prepared_route is not None:
+                from dataclasses import asdict
+
+                prepared_route.update(
+                    applied=bool(
+                        prepared_route.get("selected") == asdict(target)
+                        and asdict(target) != prepared_route.get("baseline")
+                    ),
+                    fallback_executed=not bool(prepared_route.get("selected")),
+                    executed=asdict(target),
+                    attempt=attempt["id"],
+                )
+                self.state.set_meta("route:v1:" + job["id"], prepared_route)
             cycle_id = self.state.get_meta(
                 f"work_cycle:{job['id']}:{attempt['number']}"
             )
@@ -1132,9 +1171,45 @@ class Service:
             self.memory_operations -= 1
 
     async def handle(self, envelope: Envelope) -> dict:
+        if envelope.kind == "runtime.probe":
+            # Identity is frozen from the installed interpreter's manifest at
+            # startup, never from caller JSON or release environment variables.
+            unchanged = (
+                self.config_path.is_file()
+                and hashlib.sha256(self.config_path.read_bytes()).hexdigest()
+                == self.config_sha256
+            )
+            ready = (
+                self._health
+                in {
+                    "online",
+                    "dispatch_attempts_exhausted",
+                    "dispatch_identity_unknown",
+                    "awaiting_coordinator",
+                    "legacy_dispatch_oversize_requires_reconciliation",
+                }
+                and unchanged
+                and not self.state.get_meta("runtime_maintenance")
+            )
+            return {
+                "ok": True,
+                "request_id": envelope.request_id,
+                "state": "ok",
+                "data": dict(
+                    pid=os.getpid(),
+                    liveness=True,
+                    readiness=ready,
+                    diagnostic_health=self.health,
+                    config_sha256=self.config_sha256,
+                    config_path=str(self.config_path.resolve()),
+                    protocol_version=1,
+                    **(self.process_release or {}),
+                ),
+            }
         if envelope.kind in {
             "ci.observe",
             "decisions.shadow",
+            "decisions.canary",
             "decisions.kill",
             "outcome.verify",
             "rollout.verify",
@@ -1153,6 +1228,7 @@ class Service:
 
             return await handle(self, envelope)
         prepared_cycle = None
+        prepared_route = None
         if envelope.kind == "experience.snapshot":
             from oraculo.experience_service import response as experience_response
 
@@ -1226,6 +1302,20 @@ class Service:
                 "auth_required",
             }:
                 prepared_cycle = await self.prepare_work_memory(job)
+            binding = json.loads(job["payload"]).get("ci_binding")
+            if binding:
+                from oraculo.ci_events import CIBinding
+                from oraculo.ci_host import RepositoryCIObserver
+
+                if isinstance(self.ci_observer, RepositoryCIObserver):
+                    await self.ci_events.observe(
+                        envelope.project_id,
+                        CIBinding.model_validate(binding),
+                        self.ci_observer,
+                    )
+            from oraculo.decision_routing import prepare_job_route
+
+            prepared_route = await prepare_job_route(self, job)
         if envelope.kind == "memory.read":
             # Reads revalidate the live grant even for a repeated request_id;
             # cached pages must not bypass cancellation or artifact integrity.
@@ -1276,7 +1366,7 @@ class Service:
                     )
                 return previous
             if not external:
-                data = self.local_command(envelope, prepared_cycle)
+                data = self.local_command(envelope, prepared_cycle, prepared_route)
                 response = {
                     "request_id": envelope.request_id,
                     "ok": True,

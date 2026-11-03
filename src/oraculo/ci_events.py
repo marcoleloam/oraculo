@@ -85,11 +85,29 @@ class CIEvents:
         )
 
     async def observe(self, project, binding: CIBinding, observer: SignedCIObserver):
-        if not isinstance(observer, SignedCIObserver):
+        from oraculo.ci_host import RepositoryCIObserver
+
+        if not isinstance(observer, (SignedCIObserver, RepositoryCIObserver)):
             raise StateError("ci_trusted_observer_unavailable")
         if self.state.connection.in_transaction:
             raise StateError("ci_io_inside_transaction")
-        event = await observer.read(binding)
+        live = isinstance(observer, RepositoryCIObserver)
+        try:
+            event = (
+                await observer.read(binding, project)
+                if live
+                else await observer.read(binding)
+            )
+        except Exception:
+            if live:
+                with self.state.transaction():
+                    current = self.state.get_meta(self.key(project, binding))
+                    if current:
+                        self.state.set_meta(
+                            self.key(project, binding),
+                            dict(current, disposition="unverified"),
+                        )
+            raise
         raw = event.model_dump(mode="json")
         identity = "ci:v1:event:" + content_hash(
             [
@@ -110,6 +128,13 @@ class CIEvents:
             if previous:
                 if previous["event_hash"] != content_hash(raw):
                     raise DedupeConflict("ci_event_identity_reused")
+                if live:
+                    current = self.state.get_meta(cursor)
+                    if not current or current["event_hash"] != previous["event_hash"]:
+                        return dict(previous, replay=True, disposition="stale")
+                    refreshed = dict(previous, observed_at=time.time())
+                    self.state.set_meta(cursor, refreshed)
+                    return dict(refreshed, replay=True)
                 return dict(previous, replay=True)
             current = self.state.get_meta(cursor)
             matched = all(
@@ -133,12 +158,19 @@ class CIEvents:
                 source=observer.identity,
                 observed_at=time.time(),
             )
+            if live:
+                receipt["host_evidence"] = observer.evidence
             # Inbox and outbox intent commit together before scheduler admission.
-            self.state.require_orchestration_schema()
+            if live:
+                self.state.require_operational_schema()
+            else:
+                self.state.require_orchestration_schema()
             self.state.request_begin(identity, receipt)
             self.state.set_meta(identity, receipt)
             if disposition == "accepted":
                 self.state.set_meta(cursor, receipt)
+            elif live and current:
+                self.state.set_meta(cursor, dict(current, disposition="unverified"))
             self.state.enqueue_outbox(
                 identity,
                 {
@@ -167,4 +199,11 @@ class CIEvents:
         except ValueError:
             return False
         current = self.current(project, binding)
-        return current is not None and current["event"]["conclusion"] == "passed"
+        return (
+            current is not None
+            and current["event"]["conclusion"] == "passed"
+            and (
+                not current.get("host_evidence")
+                or time.time() - current["observed_at"] < 300
+            )
+        )

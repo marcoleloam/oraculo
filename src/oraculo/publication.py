@@ -87,23 +87,79 @@ def _github_repository(remote_url: str) -> str:
     return path
 
 
+def discover_repository_remote(
+    cwd, *, repository=None, host=None, remote=None, runner=command_runner
+):
+    """Bind to actual Git remotes. No preferred name, URL hint or host boolean.
+
+    An explicit remote is immutable. Otherwise exactly one actual remote must
+    match the expected repository/host (or exactly one supported remote when
+    there is no expected binding). Two aliases of the same repo are ambiguous.
+    """
+    cwd = Path(cwd).resolve()
+    names = _run(runner, ["git", "remote"], cwd, "publication_not_git").splitlines()
+    if not names:
+        raise PublicationError("publication_remote_missing")
+    if remote is not None:
+        if not isinstance(remote, str) or not re.fullmatch(
+            r"[A-Za-z0-9_][A-Za-z0-9_.-]*", remote
+        ):
+            raise PublicationError("publication_remote_invalid")
+        if remote not in names:
+            raise PublicationError("publication_remote_missing")
+        names = [remote]
+    matches, errors = [], []
+    from oraculo.azure_repos import azure_repository
+
+    for name in sorted(names):
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name):
+            raise PublicationError("publication_remote_invalid")
+        urls = _run(
+            runner,
+            ["git", "remote", "get-url", "--all", name],
+            cwd,
+            "publication_remote_missing",
+        ).splitlines()
+        if len(urls) != 1:
+            raise PublicationError("publication_remote_ambiguous")
+        try:
+            azure = azure_repository(urls[0])
+            identity = azure or dict(
+                host="github", repository=_github_repository(urls[0])
+            )
+            identity = dict(
+                identity,
+                remote=name,
+                remote_url=identity["remote_url"]
+                if azure
+                else f"https://github.com/{identity['repository']}.git",
+            )
+        except PublicationError as exc:
+            errors.append(exc)
+            continue
+        if (
+            repository is None or identity["repository"].lower() == repository.lower()
+        ) and (host is None or identity["host"] == host):
+            matches.append(identity)
+    if not matches:
+        if len(names) == 1 and errors:
+            raise errors[0]
+        raise PublicationError("publication_repository_mismatch")
+    if len(matches) != 1:
+        raise PublicationError("publication_remote_ambiguous")
+    return matches[0]
+
+
 def inspect_repository(
     cwd: str | Path,
     *,
-    remote: str = "origin",
+    remote: str | None = None,
     base: str = "main",
     runner: Runner = command_runner,
 ) -> dict:
     """Inspect the selected remote; never infer a repository from a folder name."""
     cwd = Path(cwd).resolve()
-    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", remote):
-        raise PublicationError("publication_remote_invalid")
-    if (
-        remote.startswith("-")
-        or not isinstance(base, str)
-        or not base
-        or base.startswith("-")
-    ):
+    if not isinstance(base, str) or not base or base.startswith("-"):
         raise PublicationError("publication_spec_invalid")
     _run(runner, ["git", "rev-parse", "--show-toplevel"], cwd, "publication_not_git")
     _run(
@@ -112,18 +168,7 @@ def inspect_repository(
         cwd,
         "publication_base_invalid",
     )
-    urls = _run(
-        runner,
-        ["git", "remote", "get-url", "--all", remote],
-        cwd,
-        "publication_remote_missing",
-    ).splitlines()
-    if len(urls) != 1:
-        raise PublicationError("publication_remote_ambiguous")
-    from oraculo.azure_repos import azure_repository
-
-    azure = azure_repository(urls[0])
-    repository = azure["repository"] if azure else _github_repository(urls[0])
+    identity = discover_repository_remote(cwd, remote=remote, runner=runner)
     branch = _run(
         runner,
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
@@ -139,12 +184,7 @@ def inspect_repository(
     if not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", head):
         raise PublicationError("publication_head_invalid")
     return {
-        **(azure or {"host": "github"}),
-        "repository": repository,
-        "remote": remote,
-        "remote_url": azure["remote_url"]
-        if azure
-        else f"https://github.com/{repository}.git",
+        **identity,
         "base": base,
         "head_sha": head,
         "branch": branch,
@@ -220,6 +260,13 @@ class RepositoryPublisher:
     def ensure_pr(self, spec, *, before_create=None):
         from oraculo.azure_repos import AzureRepos
 
+        if not spec.get("remote"):
+            spec = dict(
+                spec,
+                remote=discover_repository_remote(
+                    spec["cwd"], repository=spec.get("repository"), runner=self.runner
+                )["remote"],
+            )
         metadata = inspect_repository(
             spec["cwd"], remote=spec["remote"], base=spec["base"], runner=self.runner
         )

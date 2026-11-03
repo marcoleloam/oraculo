@@ -46,6 +46,13 @@ class Router:
         *,
         reserved: dict[str, int] | None = None,
     ) -> Target | None:
+        choices = self.candidates(kind, catalog, now, reserved=reserved)
+        return choices[0] if choices else None
+
+    def candidates(
+        self, kind, catalog, now=None, *, reserved=None, explicit=None
+    ) -> list[Target]:
+        """Only subscription-authorized, available models; no model authority."""
         timestamp = time.time() if now is None else now
         entries = catalog.get("providers", []) if isinstance(catalog, dict) else catalog
         if isinstance(entries, dict):
@@ -57,6 +64,7 @@ class Router:
         }
         self.last_reason = "unavailable"
         self.last_blockers = []
+        choices = []
         for name in self.config.profiles.get(
             kind, self.config.profiles["implementation"]
         ):
@@ -126,12 +134,21 @@ class Router:
             }
             for model in config.models:
                 if model in eligible:
-                    self.last_reason = "ready"
-                    return Target(config.instance_id, model, kind)
-            self.last_blockers.append(
-                {
-                    "provider": config.instance_id,
-                    "reason": "authorized_model_unavailable",
-                }
-            )
-        return None
+                    candidate = Target(config.instance_id, model, kind)
+                    if explicit is None or (
+                        explicit.get("providerInstanceId", config.instance_id)
+                        == config.instance_id
+                        and explicit.get("model", model) == model
+                    ):
+                        if candidate not in choices:
+                            choices.append(candidate)
+            if not any(t.provider == config.instance_id for t in choices):
+                self.last_blockers.append(
+                    {
+                        "provider": config.instance_id,
+                        "reason": "authorized_model_unavailable",
+                    }
+                )
+        if choices:
+            self.last_reason = "ready"
+        return choices

@@ -8,6 +8,7 @@ permissions:
   contents: read
 jobs:
   offline:
+    name: Orchestration offline gate
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:

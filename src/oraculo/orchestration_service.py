@@ -9,7 +9,7 @@ from pathlib import Path
 from oraculo.ci_events import CIBinding
 from oraculo.decisions import Snapshot
 from oraculo.protocol import content_hash
-from oraculo.rollout import RolloutIdentity, RolloutVerifier
+from oraculo.rollout import RolloutIdentity, RolloutVerifier, verifier_binding
 from oraculo.routing import Router
 from oraculo.state import StateError
 
@@ -140,18 +140,31 @@ async def verify_rollout_operation(service, operation):
         ):
             raise StateError("rollout_target_unconfigured_or_mismatched")
 
-        target_hash = content_hash(target.model_dump(mode="json"))
+        target_hash = verifier_binding(target, service.config_path)
+        service.state.require_operational_schema()
 
         async def probe():
+            if target.runtime_root is not None:
+                import asyncio
+
+                from oraculo.local_rollout import probe as local_probe
+
+                return await asyncio.to_thread(
+                    local_probe,
+                    target.runtime_root.expanduser().resolve(),
+                    service.config_path,
+                    identity.environment,
+                )
             return json.loads(
                 await service.run_command(target.verifier_argv, target.cwd)
             )
 
         receipt = await RolloutVerifier(probe).observe(identity)
+        receipt["verifier_config_hash"] = target_hash
         current_target = service.config.rollout_targets.get(identity.environment)
         if (
             current_target is None
-            or content_hash(current_target.model_dump(mode="json")) != target_hash
+            or verifier_binding(current_target, service.config_path) != target_hash
         ):
             receipt = dict(
                 receipt, state="unknown", reason="verifier_configuration_changed"
@@ -175,6 +188,7 @@ async def command(service, envelope):
     allowed = {
         "ci.observe": {"job_id"},
         "decisions.shadow": {"job_id"},
+        "decisions.canary": {"task_id"},
         "decisions.kill": {"enabled"},
         "outcome.verify": {"attempt_id", "generation", "criterion_id", "cwd"},
         "rollout.verify": {"task_id", "operation_id"},
@@ -189,6 +203,47 @@ async def command(service, envelope):
             "state": "disabled" if p["enabled"] else "configured_policy",
             "kill": p["enabled"],
         }
+    if kind == "decisions.canary":
+        if service.managed_service is None:
+            raise StateError("managed_task_required")
+        store = service.managed_service.store
+        task = store.get(p["task_id"])
+        if (
+            task["origin"]["thread_id"] != envelope.origin.thread_id
+            or not envelope.origin.run_id
+            or task["project"]["project_id"] != envelope.project_id
+        ):
+            raise StateError("canary_origin_or_project_mismatch")
+        from oraculo.managed_tasks import workspace
+
+        def snapshot():
+            current = store.get(task["id"])
+            ws = workspace(current["child_workspace"]["path"])
+            return Snapshot(
+                project=envelope.project_id,
+                repository=ws["common_dir"],
+                head=ws["head"],
+                source=current["base_sha"],
+                task=current["id"],
+                attempt="canary",
+                generation=0,
+                event="operator-canary",
+                ci_run="none",
+                ci_attempt=1,
+                revision=current.get("snapshot_revision", 0),
+                state_hash=content_hash([current, ws]),
+                policy_hash=content_hash(service.config.model_dump(mode="json")),
+                catalog_hash=content_hash(service.catalog),
+            )
+
+        snap = snapshot()
+        result = await service.decisions.choose(
+            snap,
+            2,
+            {"kind": "implementation"},
+            lambda: snapshot().model_dump(mode="json"),
+        )
+        return dict(result, applied=False, purpose="accounted_connectivity_canary")
     if kind == "outcome.verify":
         attempt = service.owner(envelope, executor=True)
         cwd = await checkout(service, project["path"], p.get("cwd"))
@@ -205,9 +260,55 @@ async def command(service, envelope):
         if kind == "decisions.shadow":
             return await shadow(service, envelope.project_id, job["id"])
         binding = CIBinding.model_validate(json.loads(job["payload"])["ci_binding"])
-        return await service.ci_events.observe(
+        observation = await service.ci_events.observe(
             envelope.project_id, binding, service.ci_observer
         )
+        if (
+            observation["disposition"] == "accepted"
+            and observation["event"]["conclusion"] == "failed"
+            and service.config.decisions.mode in {"active", "assisted"}
+        ):
+            cwd = await checkout(
+                service, project["path"], json.loads(job["payload"]).get("cwd")
+            )
+            snap = decision_snapshot(service, envelope.project_id, job["id"], cwd)
+            from oraculo.decisions import sanitized_features
+
+            signals = [
+                k
+                for k, v in sanitized_features(
+                    observation["event"]["diagnostic"]
+                ).items()
+                if v
+            ]
+            if len(signals) <= 1:
+                result = dict(
+                    state="deterministic",
+                    recommendation=signals[0] if signals else "unknown",
+                    reason="unambiguous_or_missing_evidence",
+                )
+            else:
+                result = await service.decisions.advise(
+                    snap,
+                    observation["event"]["diagnostic"],
+                    lambda: decision_snapshot(
+                        service, envelope.project_id, job["id"], cwd
+                    ).model_dump(mode="json"),
+                )
+            # Classification is consumed as a feature of later authorized route
+            # selection. It cannot approve retry, spawn, merge or a CI outcome.
+            service.state.set_meta(
+                "ci-triage:v1:" + job["id"],
+                dict(
+                    result,
+                    head=binding.head,
+                    applied=False,
+                    disposition="routing_feature"
+                    if result["state"] == "answered"
+                    else "baseline_retained",
+                ),
+            )
+        return observation
     if service.managed_service is None:
         raise StateError("managed_task_required")
     store = service.managed_service.store

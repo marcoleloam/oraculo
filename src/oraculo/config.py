@@ -20,11 +20,19 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class RoutingTraits(StrictModel):
+    capability: Literal[
+        "general", "coding", "reasoning", "research", "verification"
+    ] = "general"
+    latency: Literal["standard", "fast", "deliberate"] = "standard"
+
+
 class ProviderConfig(StrictModel):
     instance_id: str
     auth_kind: Literal["existing_subscription"] = "existing_subscription"
     billing_verified: bool = False
     models: list[str] = Field(default_factory=list)
+    routing_traits: dict[str, RoutingTraits] = Field(default_factory=dict)
     # None means no provider-specific ceiling: the service ceiling applies.
     max_executors: int | None = Field(default=None, ge=1, strict=True)
 
@@ -52,13 +60,16 @@ class DecisionsTariff(StrictModel):
 class DecisionsConfig(StrictModel):
     # API spend is independent of subscription billing; defaults cannot send.
     enabled: bool = Field(default=False, strict=True)
-    mode: Literal["off", "shadow"] = "off"
+    mode: Literal["off", "shadow", "assisted", "active"] = "off"
     model: Literal["gpt-6-luna"] = "gpt-6-luna"
     credential_reference: str | None = Field(
         default=None, pattern=r"^ref:[a-zA-Z0-9_.-]{1,100}$"
     )
     daily_budget_microusd: int = Field(default=0, ge=0, le=1000000, strict=True)
     run_budget_microusd: int = Field(default=0, ge=0, le=1000000, strict=True)
+    # Logical task, across contexts/retries/restarts. run_budget remains a
+    # legacy shadow ceiling; active/assisted use task_budget only.
+    task_budget_microusd: int = Field(default=100000, ge=0, le=100000, strict=True)
     max_calls: int = Field(default=80, ge=0, le=80, strict=True)
     max_concurrent: int = Field(default=2, ge=1, le=2, strict=True)
     deadline_seconds: float = Field(default=3, gt=0, le=3)
@@ -67,8 +78,18 @@ class DecisionsConfig(StrictModel):
 
 class RolloutTarget(StrictModel):
     # Pinned by service configuration, never by an executor request.
-    verifier_argv: list[str] = Field(min_length=1, max_length=100)
-    cwd: Path
+    verifier_argv: list[str] = Field(default_factory=list, max_length=100)
+    cwd: Path | None = None
+    runtime_root: Path | None = None
+
+    @model_validator(mode="after")
+    def destination(self):
+        if self.runtime_root is not None:
+            if self.verifier_argv or self.cwd is not None:
+                raise ValueError("runtime destination cannot also execute argv")
+        elif not self.verifier_argv or self.cwd is None:
+            raise ValueError("verifier argv and cwd or runtime_root required")
+        return self
 
 
 class Config(StrictModel):

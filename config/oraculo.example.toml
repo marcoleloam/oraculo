@@ -54,6 +54,11 @@ mode = "off"
 model = "gpt-6-luna"
 daily_budget_microusd = 0
 run_budget_microusd = 0
+task_budget_microusd = 100000
 # credential_reference = "ref:oraculo-openai-decisions"
 # No tariff authorization/upper-bound contract is supplied by default.
-# No rollout target or CI authentication observer is installed by default.
+# active/assisted require explicit daily authorization and reviewed tariff;
+# see docs/OPERATIONAL_ORCHESTRATION.md. CI observer uses authenticated gh/REST.
+# Optional usable local destination (enable only for the managed installation):
+# [rollout_targets.local]
+# runtime_root = "~/.local/share/oraculo"

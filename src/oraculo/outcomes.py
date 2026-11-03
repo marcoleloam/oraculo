@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from oraculo.config import StrictModel
 from oraculo.protocol import content_hash
@@ -20,16 +20,42 @@ from oraculo.state import StateError
 
 class OutcomeContract(StrictModel):
     version: Literal[2] = 2
-    kind: Literal["command_artifact", "semantic"] = "command_artifact"
+    kind: Literal["command_artifact", "semantic", "ci"] = "command_artifact"
     commit: str = Field(pattern=r"^[a-f0-9]{40}$")
-    argv: list[str] = Field(min_length=1, max_length=100)
-    artifact: str = Field(min_length=1, max_length=500)
-    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    argv: list[str] = Field(default_factory=list, max_length=100)
+    artifact: str = Field(default="", max_length=500)
+    sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     verifier: Literal["service-command-artifact-v2"] = "service-command-artifact-v2"
     review_task: str | None = None
+    ci_binding: dict | None = None
+
+    @model_serializer(mode="wrap")
+    def legacy_shape(self, handler):
+        value = handler(self)
+        if self.ci_binding is None:
+            value.pop("ci_binding", None)
+        return value
 
     @model_validator(mode="after")
     def valid(self):
+        if self.kind == "ci":
+            from oraculo.ci_events import CIBinding
+
+            binding = CIBinding.model_validate(self.ci_binding)
+            if (
+                binding.head != self.commit
+                or self.argv
+                or self.artifact
+                or self.sha256
+                or self.review_task
+            ):
+                raise ValueError(
+                    "CI outcome requires exact commit/binding and no caller command"
+                )
+            self.ci_binding = binding.model_dump(mode="json")
+            return self
+        if not self.argv or not self.artifact or self.sha256 is None or self.ci_binding:
+            raise ValueError("command outcome requires argv, artifact and digest")
         path = Path(self.artifact)
         if (
             path.is_absolute()
@@ -217,7 +243,10 @@ class Outcomes:
                 and self.satisfied(attempt, criterion_id)
             ):
                 return dict(before, replay=True)
-            self.state.require_orchestration_schema()
+            if contract.kind == "ci":
+                self.state.require_operational_schema()
+            else:
+                self.state.require_orchestration_schema()
             self.state.set_meta(request_key, {"hash": request_hash, "state": "intent"})
             before = {
                 "verification_state": "intent",
@@ -244,13 +273,37 @@ class Outcomes:
             ).strip()
             if head != contract.commit:
                 raise StateError("outcome_commit_mismatch")
-            command = await self.service.run_command(contract.argv, cwd, capture=True)
-            receipt["command"] = command
-            if command["exit"] != 0:
-                raise StateError("outcome_command_failed")
-            digest = artifact_digest(cwd, contract.artifact)
-            if digest != contract.sha256:
-                raise StateError("outcome_artifact_changed")
+            if contract.kind == "ci":
+                from oraculo.ci_events import CIBinding
+                from oraculo.ci_host import RepositoryCIObserver
+
+                if not isinstance(self.service.ci_observer, RepositoryCIObserver):
+                    raise StateError("outcome_authenticated_host_required")
+                project = self.state.get_objective(job["objective_id"])["project_id"]
+                observation = await self.service.ci_events.observe(
+                    project,
+                    CIBinding.model_validate(contract.ci_binding),
+                    self.service.ci_observer,
+                )
+                if (
+                    observation["disposition"] != "accepted"
+                    or not observation.get("host_evidence")
+                    or observation["event"]["conclusion"] != "passed"
+                ):
+                    raise StateError("outcome_ci_not_passed")
+                receipt["ci_observation"] = observation
+                receipt["verifier"] = "service-ci-v1"
+                digest = None
+            else:
+                command = await self.service.run_command(
+                    contract.argv, cwd, capture=True
+                )
+                receipt["command"] = command
+                if command["exit"] != 0:
+                    raise StateError("outcome_command_failed")
+                digest = artifact_digest(cwd, contract.artifact)
+                if digest != contract.sha256:
+                    raise StateError("outcome_artifact_changed")
             after = (
                 await self.service.run_command(["git", "rev-parse", "HEAD"], cwd)
             ).strip()
@@ -310,8 +363,30 @@ class Outcomes:
             return False
         try:
             clean_source(Path(r["cwd"]), contract.artifact)
-            if artifact_digest(Path(r["cwd"]), contract.artifact) != contract.sha256:
+            if (
+                contract.kind != "ci"
+                and artifact_digest(Path(r["cwd"]), contract.artifact)
+                != contract.sha256
+            ):
                 return False
+            if contract.kind == "ci":
+                from oraculo.ci_events import CIBinding, CIEvents
+
+                job = self.state.get_job(attempt["job_id"])
+                project = self.state.get_objective(job["objective_id"])["project_id"]
+                current = CIEvents(self.state).current(
+                    project, CIBinding.model_validate(contract.ci_binding)
+                )
+                recorded = r.get("ci_observation")
+                if (
+                    not current
+                    or not recorded
+                    or current["event_hash"] != recorded["event_hash"]
+                    or current["event"]["conclusion"] != "passed"
+                    or not current.get("host_evidence")
+                    or time.time() - current["observed_at"] >= 300
+                ):
+                    return False
             # Re-check HEAD at report consumption; a stale receipt cannot pass.
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"],

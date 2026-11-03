@@ -194,7 +194,14 @@ def rollout_identity(root: Path, environment: str, health_probe):
     )
 
 
-def create_manifest(bundle, release_id, source_commit, schema_min, schema_max):
+def create_manifest(
+    bundle,
+    release_id,
+    source_commit,
+    schema_min,
+    schema_max,
+    delivery_source_commit=None,
+):
     """Seal a reviewed, flat wheelhouse plus hash-locked requirements."""
     manifest = dict(
         schema_version=1,
@@ -205,6 +212,10 @@ def create_manifest(bundle, release_id, source_commit, schema_min, schema_max):
         schema_max=schema_max,
         files=inventory(bundle),
     )
+    if delivery_source_commit is not None:
+        if not re.fullmatch(r"[a-f0-9]{40}", delivery_source_commit):
+            raise ValueError("invalid_delivery_source_commit")
+        manifest["delivery_source_commit"] = delivery_source_commit
     if any(
         "/" in name or not (name.endswith(".whl") or name == "requirements.txt")
         for name in manifest["files"]
@@ -1116,6 +1127,7 @@ def main(argv=None):
     seal.add_argument("--source-commit", required=True)
     seal.add_argument("--schema-min", type=int, required=True)
     seal.add_argument("--schema-max", type=int, required=True)
+    seal.add_argument("--delivery-source-commit")
     args = parser.parse_args(argv)
     try:
         if args.command == "manifest":
@@ -1125,6 +1137,7 @@ def main(argv=None):
                 args.source_commit,
                 args.schema_min,
                 args.schema_max,
+                args.delivery_source_commit,
             )
         else:
             result = dispatch(args)

@@ -14,7 +14,7 @@ from oraculo.state import DedupeConflict, State, StateError
 
 
 class TaskStore:
-    def __init__(self, path: Path, *, read_only=False, schema_max=6):
+    def __init__(self, path: Path, *, read_only=False, schema_max=7):
         if read_only:
             # Offline inspection must not run State's schema migrations or
             # contend with the daemon's writer authority. URI mode also forbids
@@ -514,7 +514,10 @@ class TaskStore:
                 "observed_at": time.time(),
                 "receipt": receipt,
             }
-            self.state.require_orchestration_schema()
+            if "observed_host_policy" in receipt:
+                self.state.require_operational_schema()
+            else:
+                self.state.require_orchestration_schema()
             self.state.set_meta(key, record)
             # The task's existing durable return outbox is reused; no new queue.
             self.update(
@@ -530,6 +533,27 @@ class TaskStore:
 
         task = self.get(task_id)
         rollout = task.get("rollout_verification")
+        if (
+            rollout
+            and rollout.get("state") == "confirmed"
+            and hasattr(self, "rollout_binding")
+        ):
+            current_hash = self.rollout_binding(
+                (rollout.get("identity") or {}).get("environment")
+            )
+            if (
+                current_hash is None
+                or rollout.get("verifier_config_hash") != current_hash
+            ):
+                task = dict(
+                    task,
+                    rollout_verification=dict(
+                        rollout,
+                        state="unknown",
+                        reason="verifier_configuration_changed",
+                    ),
+                )
+                rollout = task["rollout_verification"]
         if (
             rollout
             and rollout.get("state") == "confirmed"

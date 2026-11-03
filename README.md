@@ -12,11 +12,12 @@ A memória funciona com o Obsidian fechado. Aprendizados de projeto podem ser pr
 
 O fluxo de [tarefas geridas](docs/MANAGED_TASKS.md) resolve o projeto autorizado, consulta sua memória e abre um contexto com branch e worktree próprios. Mantém o vínculo com a conversa de origem até a validação, publicação do PR, checks, merge e encerramento. Trabalho concluído, memória salva, PR aberto, merge e implantação são estados separados. A entrada depende de um adapter cooperativo na origem; este pacote não instala um hook global no T3. A preparação e o push do código revisado continuam sob responsabilidade da origem.
 
-## Versão 0.2.0
+## Versão 0.3.0
 
-A [nota da versão](docs/releases/RELEASE_0_2_0.md) descreve orquestração com CI,
-critérios verificáveis e rollout, schema até 6 e rollback compatível. Decisions
-permanece desligado, com orçamento zero. O [cadastro dinâmico de projetos](docs/PROJECT_REGISTRATION.md)
+A [nota da versão](docs/releases/RELEASE_0_3_0.md) descreve orquestração com CI,
+critérios verificáveis e rollout local, schema até 7 e rollback compatível. Decisions
+permanece desligado por padrão; a [configuração operacional](docs/OPERATIONAL_ORCHESTRATION.md)
+habilita seleção entre opções já autorizadas, orçamento durável e observação CI real. O [cadastro dinâmico de projetos](docs/PROJECT_REGISTRATION.md)
 preserva a configuração presa pelo daemon e dispensa restart. Pacote preparado,
 CI aprovado e runtime ativado continuam exigindo provas próprias.
 

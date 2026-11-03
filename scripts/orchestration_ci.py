@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -31,6 +32,10 @@ SELECTION = (
     "runtime_recovery_identity",
     "runtime_migration",
     "ci_events",
+    "ci_host",
+    "ci_azure",
+    "operational_decisions",
+    "local_rollout",
     "decisions",
     "decisions_eval",
     "outcomes",
@@ -132,6 +137,10 @@ def main():
             ["git", "status", "--porcelain"], "clean"
         ):
             raise ValueError("clean exact source required")
+        run(
+            [sys.executable, "-B", "scripts/validate_ci_exports.py"],
+            "ci-exports",
+        )
         run(["uv", "sync", "--frozen", "--group", "dev"], "sync")
         run(
             ["uv", "run", "--frozen", "ruff", "check", "src", "tests", "scripts"],
@@ -161,6 +170,7 @@ def main():
                 "-q",
                 *[f"tests/test_{name}.py" for name in SELECTION],
                 "--junitxml=" + str(junit),
+                "--durations=25",
             ],
             "pytest",
         )

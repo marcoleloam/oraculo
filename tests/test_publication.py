@@ -246,6 +246,19 @@ def test_explicit_nondefault_remote(repo):
     )
 
 
+def test_publication_discovers_unique_public_safe_remote_without_mutation(repo):
+    from oraculo.publication import RepositoryPublisher
+
+    git(repo, "remote", "rename", "origin", "public-safe")
+    spec = specification(repo)
+    spec.pop("remote")
+    host = Host(spec)
+    before = git(repo, "remote", "-v")
+    receipt = RepositoryPublisher(host).ensure_pr(spec)
+    assert receipt["repository"] == "example/public-project"
+    assert git(repo, "remote", "-v") == before
+
+
 def test_create_and_reconcile_receipt(repo):
     spec = specification(repo)
     host = Host(spec)

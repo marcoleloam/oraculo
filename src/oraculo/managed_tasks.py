@@ -664,8 +664,22 @@ class ManagedTasks:
                 and req.get("independent") is not True
             ):
                 raise LaunchPreflightError("implicit_top_level_intent_refused")
+        route = task.get("decision_route")
+        if not task.get("launch_attempted") and not task.get("launch_arguments"):
+            from oraculo.decision_routing import managed_route
+
+            route = await managed_route(self, task, req, caps, plan)
+            if route:
+                self.store.state.require_operational_schema()
+                self.store.update(
+                    task_id,
+                    task["phase"],
+                    {"routing": "prepared"},
+                    decision_route=route,
+                )
+        effective_target = req.get("target") or (route or {}).get("target")
         if self.admission is not None:
-            provider = (req.get("target") or {}).get("providerInstanceId") or caps.get(
+            provider = (effective_target or {}).get("providerInstanceId") or caps.get(
                 "inheritedProviderInstanceId"
             )
             reservation = self.admission.reserve_managed(
@@ -773,8 +787,8 @@ class ManagedTasks:
                     mode="async",
                     clientRequestId=task_id + ":delegate",
                 )
-                if req.get("target"):
-                    arguments["target"] = req["target"]
+                if effective_target:
+                    arguments["target"] = effective_target
             elif req.get("model_selection"):
                 arguments["modelSelection"] = req["model_selection"]
             self.store.update(
@@ -786,6 +800,28 @@ class ManagedTasks:
                 transport_mode=mode,
             )
             task = self.store.get(task_id)
+        if route:
+            # Memory and host I/O may have changed policy/catalog/source. This
+            # gate cannot authorize a new effect from stale model output.
+            from oraculo.routing import Router
+
+            fresh = await self.host.call("orchestrator_capabilities", {})
+            options = Router(self.config).candidates(
+                "implementation", fresh, explicit=route["target"]
+            )
+            current = workspace(plan["ws"]["path"])
+            if (
+                not options
+                or current != plan["ws"]
+                or content_hash(self.config.model_dump(mode="json"))
+                != route["config_hash"]
+                or (
+                    route["selected"]
+                    and not getattr(self, "decisions").usable(route["advice"])
+                )
+                or self.admission.get_meta("runtime_maintenance")
+            ):
+                raise StateError("managed_route_effect_revalidation_failed")
         # launch has NO idempotency key. Persist before sending; every later call
         # only reconciles list/read, even when an empty response looks retryable.
         self.store.update(
@@ -801,6 +837,18 @@ class ManagedTasks:
             task["launch_arguments"],
         )
         await self._accept_launch(self.store.get(task_id), child)
+        if route:
+            current = self.store.get(task_id)
+            self.store.update(
+                task_id,
+                current["phase"],
+                {"routing": "executed"},
+                decision_route=dict(
+                    route,
+                    applied=route["selected"],
+                    fallback_executed=route["fallback"],
+                ),
+            )
 
     async def _cancel(self, task_id: str, actor: dict):
         """Origin-only: drop a task that never bound a child and free its slot.
@@ -958,6 +1006,12 @@ class ManagedTasks:
         )
 
     async def _accept_launch(self, task: dict, receipt: dict):
+        route = task.get("decision_route")
+        if route and any(
+            receipt.get(k) != route["target"][k]
+            for k in ("providerInstanceId", "model")
+        ):
+            raise StateError("managed_route_host_target_unconfirmed")
         if self.admission is not None:
             self.admission.bind_managed(task["id"], receipt)
         native = task["transport_mode"] == "native_child"

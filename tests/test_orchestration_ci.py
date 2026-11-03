@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import types
@@ -21,8 +22,121 @@ def load(name):
     return module
 
 
+def ci_layout(root, *, public=False):
+    templates = root / "templates/ci"
+    templates.mkdir(parents=True)
+    for source in (ROOT / "templates/ci").glob("*.template"):
+        shutil.copyfile(source, templates / source.name)
+    if public:
+        workflows = root / ".github/workflows"
+        workflows.mkdir(parents=True)
+        for template, target in (
+            ("oraculo-suite.yml.template", "ci.yml"),
+            ("oraculo-ci.yml.template", "orchestration.yml"),
+        ):
+            (workflows / target).write_bytes(
+                (templates / template).read_bytes().split(b"\n", 1)[1]
+            )
+
+
+@pytest.mark.parametrize("public", [False, True])
+def test_ci_exports_allow_private_and_canonical_public_layout_without_mutation(
+    tmp_path, public
+):
+    ci_layout(tmp_path, public=public)
+    before = {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    }
+    # No installed dependencies, YAML parser, Git, service or network are needed.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(ROOT / "scripts/validate_ci_exports.py"),
+            "--root",
+            str(tmp_path),
+        ],
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    checked = json.loads(result.stdout)["checked"]
+    assert len(checked) == (5 if public else 3)
+    assert {
+        p.relative_to(tmp_path): p.read_bytes()
+        for p in tmp_path.rglob("*")
+        if p.is_file()
+    } == before
+    assert (tmp_path / ".github").exists() is public
+
+
+@pytest.mark.parametrize("target", ["ci.yml", "orchestration.yml"])
 @pytest.mark.parametrize(
-    "failure", [None, "junit_skip", "brain", "final_head", "final_dirty"]
+    "mutation", ["duplicate_name", "duplicate_job_name", "drift", "crlf", "header"]
+)
+def test_ci_exports_reject_every_active_workflow_divergence(tmp_path, target, mutation):
+    module = load("validate_ci_exports")
+    ci_layout(tmp_path, public=True)
+    path = tmp_path / ".github/workflows" / target
+    content = path.read_bytes()
+    if mutation == "duplicate_name":
+        content = b"name: Orchestration offline gate\n" + content
+    elif mutation == "duplicate_job_name":
+        content = content.replace(b"    name:", b"    name: injected\n    name:", 1)
+    elif mutation == "drift":
+        content = content.replace(b"timeout-minutes: 30", b"timeout-minutes: 29")
+    elif mutation == "crlf":
+        content = content.replace(b"\n", b"\r\n")
+    else:
+        content = module.INACTIVE_HEADER + content
+    path.write_bytes(content)
+    with pytest.raises(ValueError, match="differs from canonical"):
+        module.validate_exports(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "template",
+    ["oraculo-suite.yml.template", "oraculo-ci.yml.template", "full-ci.yml.template"],
+)
+@pytest.mark.parametrize(
+    "mutation", ["duplicate_name", "duplicate_job_name", "job_name", "header"]
+)
+def test_ci_templates_require_unique_exact_names_even_without_public_workflows(
+    tmp_path, template, mutation
+):
+    module = load("validate_ci_exports")
+    ci_layout(tmp_path)
+    path = tmp_path / "templates/ci" / template
+    content = path.read_bytes()
+    if mutation == "duplicate_name":
+        content += b"'name': duplicate\n"
+    elif mutation == "duplicate_job_name":
+        content = content.replace(b"    name:", b'    "name": duplicate\n    name:', 1)
+    elif mutation == "job_name":
+        content = content.replace(b"    name:", b"    name: wrong", 1)
+    else:
+        content = content.split(b"\n", 1)[1]
+    path.write_bytes(content)
+    with pytest.raises(ValueError):
+        module.validate_exports(tmp_path)
+    assert not (tmp_path / ".github").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "junit_skip",
+        "brain",
+        "final_head",
+        "final_dirty",
+        "export_name",
+        "export_drift",
+        "template_name",
+    ],
 )
 def test_ci_receipt_requires_subgates_and_final_exact_clean_source(
     tmp_path, monkeypatch, failure
@@ -30,6 +144,20 @@ def test_ci_receipt_requires_subgates_and_final_exact_clean_source(
     module = load("orchestration_ci")
     root = tmp_path / "source"
     root.mkdir()
+    ci_layout(root, public=True)
+    (root / "scripts").mkdir()
+    shutil.copyfile(
+        ROOT / "scripts/validate_ci_exports.py", root / "scripts/validate_ci_exports.py"
+    )
+    if failure in {"export_name", "export_drift", "template_name"}:
+        path = root / (
+            "templates/ci/oraculo-ci.yml.template"
+            if failure == "template_name"
+            else ".github/workflows/orchestration.yml"
+        )
+        content = path.read_bytes()
+        content += b"name: injected\n" if failure != "export_drift" else b"# drift\n"
+        path.write_bytes(content)
     module.ROOT = root
     output = tmp_path / "evidence"
     monkeypatch.setattr(
@@ -48,9 +176,12 @@ def test_ci_receipt_requires_subgates_and_final_exact_clean_source(
         ],
     )
     calls = []
+    real_run = subprocess.run
 
     def run(argv, **kwargs):
         calls.append(argv)
+        if "scripts/validate_ci_exports.py" in argv:
+            return real_run(argv, **kwargs)
         stdout = b""
         if argv[:3] == ["git", "rev-parse", "HEAD"]:
             stdout = (
@@ -109,6 +240,13 @@ def test_ci_receipt_requires_subgates_and_final_exact_clean_source(
     assert receipt["state"] == ("failed" if failure else "passed")
     assert receipt["run_id"] == "synthetic" and receipt["run_attempt"] == 1
     assert receipt["checks"]
+    assert "scripts/validate_ci_exports.py" in calls[2]
+    if failure in {"export_name", "export_drift", "template_name"}:
+        assert not any(argv[0] == "uv" for argv in calls)
+        assert receipt["checks"][-1]["exit"] != 0
+        assert receipt["checks"][-1]["log"] == "ci-exports.log"
+    else:
+        assert calls[3][:2] == ["uv", "sync"]
     if failure in {None, "final_head", "final_dirty"}:
         assert any("scripts/verify_distribution.py" in argv for argv in calls)
         assert calls[-1][:2] == ["git", "status"] or failure == "final_head"
@@ -184,6 +322,19 @@ def test_inactive_ci_template_pins_actions_and_preserves_always_evidence():
     assert upload["if"] == "always()" and upload["with"]["if-no-files-found"] == "error"
     assert upload["with"]["retention-days"] == "7"
     assert "steps.proof.outputs.path" in upload["with"]["path"]
+    assert spec["jobs"]["offline"]["name"] == "Orchestration offline gate"
+    assert spec["jobs"]["offline"]["timeout-minutes"] == "30"
+    full = yaml.load(
+        (ROOT / "templates/ci/full-ci.yml.template").read_text(), Loader=yaml.BaseLoader
+    )
+    job = full["jobs"]["tests"]
+    assert job["name"] == "Tests (${{ matrix.os }})"
+    assert job["strategy"]["matrix"]["os"] == ["ubuntu-latest", "macos-latest"]
+    assert job["timeout-minutes"] == "30"
+    assert any(
+        "--durations=25" in step.get("run", "") and "--junitxml=" in step.get("run", "")
+        for step in job["steps"]
+    )
 
 
 def test_uv_output_marker_is_metadata_and_unexpected_extra_files_still_fail(tmp_path):

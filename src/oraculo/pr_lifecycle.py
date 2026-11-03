@@ -54,6 +54,91 @@ class RepositoryPRLifecycle:
     def inspect(self, pr, policy, cwd):
         return self._adapter(pr, cwd).inspect(pr, policy, cwd)
 
+    def observe_ci(self, binding, cwd):
+        from oraculo.ci_host import github_ci
+
+        if binding.repository.count("/") == 2:
+            from oraculo.ci_azure import azure_ci
+
+            return azure_ci(self, binding, cwd)
+        return github_ci(self, binding, cwd)
+
+    def validate_host_policy(self, pr, policy, cwd):
+        """A caller's source label/boolean cannot reduce actual host rules."""
+        from oraculo.publication import discover_repository_remote
+
+        remote = discover_repository_remote(
+            cwd,
+            repository=pr["repository"],
+            host=pr["host"],
+            remote=pr.get("remote"),
+            runner=self.runner,
+        )
+        if pr.get("host") == "github":
+            from oraculo.ci_host import github_policy
+
+            observed = github_policy(
+                self.runner, pr["repository"], pr["base"], pr["head_sha"], Path(cwd)
+            )
+        elif pr.get("host") == "azure":
+            from oraculo.publication import inspect_repository
+
+            adapter = self._adapter(pr, cwd)
+            m = adapter._identity(
+                inspect_repository(
+                    cwd,
+                    remote=remote["remote"],
+                    base=pr["base"],
+                    runner=adapter.runner,
+                )
+            )
+            _, current = adapter._get(m, pr["number"])
+            if current["state"] == "merged":
+                return {"source": "historical_merge_observed", "required_checks": None}
+            policies = adapter._pages(
+                m,
+                "policy/evaluations",
+                policy=True,
+                params={
+                    "artifactId": f"vstfs:///CodeReview/CodeReviewId/{m['project_id']}/{pr['number']}",
+                    "includeNotApplicable": "true",
+                },
+            )
+            checks, reviews = [], False
+            for row in policies:
+                config = row.get("configuration") or {}
+                if config.get("isEnabled") is True and config.get("isBlocking") is True:
+                    settings = config.get("settings") or {}
+                    if settings.get("statusName"):
+                        checks.append(
+                            (
+                                settings["statusGenre"] + "/"
+                                if settings.get("statusGenre")
+                                else ""
+                            )
+                            + settings["statusName"]
+                        )
+                    reviews = reviews or settings.get("minimumApproverCount", 0) > 0
+            observed = dict(
+                required_checks=checks,
+                required_review=reviews,
+                source="authenticated_azure_policy_evaluations",
+            )
+        else:
+            raise PublicationError("ci_policy_host_unsupported")
+        if (
+            not observed["required_checks"]
+            or policy.get("allow_no_checks")
+            or not set(observed["required_checks"])
+            <= set(policy.get("required_checks") or [])
+            or (
+                observed.get("required_review")
+                and policy.get("required_review") is not True
+            )
+        ):
+            raise PublicationError("ci_actual_host_policy_not_satisfied")
+        return observed
+
     def merge(self, pr, policy, cwd, **kwargs):
         return self._adapter(pr, cwd).merge(pr, policy, cwd, **kwargs)
 
@@ -62,7 +147,10 @@ def _policy(pr: dict, policy: dict) -> tuple[dict, str]:
     if not isinstance(pr, dict) or not isinstance(policy, dict):
         raise PublicationError("pr_merge_policy_invalid")
     policy = copy.deepcopy(policy)
-    if policy.get("merge_authorized") is not True:
+    if (
+        policy.get("merge_authorized") is not True
+        and policy.get("observe_only") is not True
+    ):
         raise PublicationError("pr_merge_not_authorized")
     repo, base, head = (policy.get(k) for k in ("repository", "base", "head_sha"))
     checks = policy.get("required_checks")
@@ -293,6 +381,8 @@ class GitHubPRLifecycle:
         """
         policy = copy.deepcopy(policy)
         pr = copy.deepcopy(pr)
+        if policy.get("merge_authorized") is not True:
+            raise PublicationError("pr_merge_not_authorized")
         if type(reconcile_only) is not bool or (
             before_merge is not None and not callable(before_merge)
         ):
