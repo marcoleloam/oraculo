@@ -380,3 +380,71 @@ async def test_operator_canary_uses_runtime_accounting_and_never_selects_executi
         origin={"thread_id": "other", "run_id": "run"},
     )
     assert not denied["ok"] and len(transport.calls) == 1
+
+
+# Regression 2026-11-04: inheritance or explicit choice must never be refused by
+# the config allowlist (`providers.<x>.models`); it only drives auto-ranking.
+@pytest.mark.parametrize("case", ["inherited", "explicit"])
+async def test_managed_start_never_refuses_model_outside_allowlist(system, case):
+    s = system.service
+    t = ChoiceTransport()
+    install(s, t)  # allowlist: codex -> current, alternative
+    system.engine.admission = s.state
+    system.engine.decisions = s.decisions
+    original = system.host.call
+
+    async def host(name, arguments):
+        result = await original(name, arguments)
+        if name == "orchestrator_capabilities":
+            result["inheritedModel"] = "outside" if case == "inherited" else None
+            result["providers"][0]["models"] = [
+                {"id": "current"},
+                {"id": "alternative"},
+                {"id": "outside"},
+            ]
+        if name == "delegate_task" and arguments.get("target"):
+            result.update(arguments["target"])
+        return result
+
+    system.host.call = host
+    extra = (
+        {"target": {"providerInstanceId": "codex", "model": "outside"}}
+        if case == "explicit"
+        else {}
+    )
+    result = await start(system, **extra)
+    assert result["phase"] == "executing", result
+    task = system.store.get(result["id"])
+    assert not t.calls and not task.get("decision_route")
+    launched = task["launch_arguments"].get("target")
+    if case == "explicit":
+        assert launched == {"providerInstanceId": "codex", "model": "outside"}
+    else:
+        assert not launched  # host inherits the origin model unchanged
+
+
+async def test_managed_explicit_model_absent_from_host_catalog_is_refused(system):
+    s = system.service
+    install(s, ChoiceTransport())
+    system.engine.admission = s.state
+    system.engine.decisions = s.decisions
+    result = await start(
+        system, target={"providerInstanceId": "codex", "model": "missing"}
+    )
+    assert result["phase"] == "blocked"
+    assert "explicit_model_not_in_host_catalog" in json.dumps(result)
+
+
+async def test_grant_explicit_model_outside_allowlist_is_honored(running_service):
+    t = ChoiceTransport()
+    install(running_service, t)
+    running_service.catalog["providers"][0]["models"] = [
+        "current",
+        "alternative",
+        "outside",
+    ]
+    result, receipt = await grant(
+        running_service, explicit={"providerInstanceId": "codex", "model": "outside"}
+    )
+    assert result["ok"] and result["data"]["attempt"]["model"] == "outside", result
+    assert not t.calls

@@ -157,14 +157,16 @@ async def managed_route(engine, task, req, caps, plan):
         explicit = dict(
             providerInstanceId=selected.get("instanceId"), model=selected.get("model")
         )
-    if not explicit and caps.get("inheritedModel"):
-        explicit = dict(
-            providerInstanceId=caps.get("inheritedProviderInstanceId"),
-            model=caps["inheritedModel"],
-        )
     if explicit:
-        if not router.candidates("implementation", caps, explicit=explicit):
-            raise StateError("explicit_subscription_model_not_eligible")
+        # User-chosen provider/model: only the host catalog can refuse it;
+        # the config allowlist/profiles never apply. Capacity is admission's.
+        if not Router(engine.config).candidates(
+            "implementation", caps, explicit=explicit
+        ):
+            raise StateError("explicit_model_not_in_host_catalog")
+        return None
+    if caps.get("inheritedModel"):
+        # Inheritance from the origin conversation is unconditional.
         return None
     options = router.candidates("implementation", caps)
     if len(options) < 2:
