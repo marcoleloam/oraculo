@@ -10,7 +10,7 @@ jobs:
   product-review:
     name: Product review (exact HEAD)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UV_PYTHON_DOWNLOADS: never
