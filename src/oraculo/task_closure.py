@@ -30,17 +30,31 @@ class TaskClosure:
             and policy.get("observe_only") is not True
         ):
             raise StateError("merge_authorization_required")
-        if not policy.get("policy_source"):
+        if (
+            not isinstance(policy.get("policy_source"), str)
+            or not policy["policy_source"].strip()
+        ):
             raise StateError("project_merge_policy_source_required")
         if (task.get("merge_attempted") or task.get("merge_receipt")) and task.get(
             "merge_policy"
         ) != policy:
             raise StateError("uncertain_merge_policy_immutable")
+        transitions = list(task.get("merge_policy_transitions") or [])
+        if task.get("merge_policy") != policy or not task.get("merge_policy_actor"):
+            transitions.append(
+                dict(
+                    previous=task.get("merge_policy"),
+                    policy=policy,
+                    authorized_by=actor,
+                )
+            )
         self.store.update(
             task_id,
             "pr_policy_recorded",
             {"policy_sha256": content_hash(policy), "authorized_by": actor},
             merge_policy=policy,
+            merge_policy_actor=actor,
+            merge_policy_transitions=transitions,
         )
 
     def _requirements(self, task, *, integration=True):
@@ -147,8 +161,15 @@ class TaskClosure:
         historical = receipt["state"] == "merged" and bool(
             receipt.get("observation_timing")
         )
+        no_ci = bool(
+            actual_policy
+            and actual_policy.get("allow_no_checks") is True
+            and required == []
+            and task["merge_policy"].get("allow_no_checks") is True
+        )
         if (
-            (historical or (checks and len(checks) == len(required)))
+            not no_ci
+            and (historical or (checks and len(checks) == len(required)))
             and all(c.get("completed") is True for c in checks)
             and hasattr(self.lifecycle, "observe_pr_ci")
         ):
@@ -166,7 +187,11 @@ class TaskClosure:
                     receipt,
                     self.store.get(task_id).get("snapshot_revision", 0),
                 )
-        confirmed = await rounds.observe(task_id, receipt, execution)
+        if no_ci:
+            receipt["ci_outcome"] = "not_required_by_explicit_policy"
+            confirmed = await rounds.observe_no_ci(task_id, receipt)
+        else:
+            confirmed = await rounds.observe(task_id, receipt, execution)
         execution_passed = (
             execution is None or execution["event"]["conclusion"] == "passed"
         )
@@ -176,8 +201,13 @@ class TaskClosure:
             and (
                 not confirmed
                 or receipt.get("blockers")
-                or execution is None
-                or execution["event"]["conclusion"] != "passed"
+                or (
+                    not no_ci
+                    and (
+                        execution is None
+                        or execution["event"]["conclusion"] != "passed"
+                    )
+                )
             )
         ):
             raise StateError("historical_merge_ci_evidence_required")
@@ -186,6 +216,13 @@ class TaskClosure:
         self._requirements(self.store.get(task_id))
 
         def revalidate_ci():
+            if no_ci:
+                fresh_policy = self.lifecycle.validate_host_policy(
+                    task["publication"],
+                    task["merge_policy"],
+                    task["publication_spec"]["cwd"],
+                )
+                rounds.require_same_policy(actual_policy, fresh_policy)
             fresh = self.lifecycle.inspect(
                 task["publication"],
                 task["merge_policy"],
@@ -510,7 +547,27 @@ class TaskClosure:
                 )
             ):
                 raise StateError("github_merge_observation_mismatch")
-            execution = self.lifecycle.observe_pr_ci(publication, policy, cwd)
+            no_ci = (
+                policy.get("allow_no_checks") is True
+                and policy.get("required_checks") == []
+            )
+            if no_ci:
+                records = task.get("ci_rounds") or []
+                if (
+                    not records
+                    or records[-1]["facts"].get("outcome")
+                    != "not_required_by_explicit_policy"
+                ):
+                    raise StateError("ci_policy_memory_required")
+                CIRoundMemory.require_same_policy(
+                    records[-1]["facts"]["observed_host_policy"],
+                    self.lifecycle.validate_host_policy(publication, policy, cwd),
+                )
+            execution = (
+                None
+                if no_ci
+                else self.lifecycle.observe_pr_ci(publication, policy, cwd)
+            )
             rounds = task.get("ci_rounds") or []
             previous = rounds[-1]["report"]["evidence"]["execution"] if rounds else None
 
@@ -526,8 +583,13 @@ class TaskClosure:
                 return scope
 
             if (
-                execution is None
-                or execution["event"]["conclusion"] != "passed"
+                (
+                    not no_ci
+                    and (
+                        execution is None
+                        or execution["event"]["conclusion"] != "passed"
+                    )
+                )
                 or actual.get("blockers")
                 or settled_execution_scope(execution)
                 != settled_execution_scope(previous)

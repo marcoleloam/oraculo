@@ -281,7 +281,11 @@ def test_no_checks_requires_explicit_policy_and_missing_required_never_passes(tm
     host.observed["statusCheckRollup"] = None
     observed = GitHubPRLifecycle(host).inspect(pr(), policy(), tmp_path)
     assert observed["blockers"] == ["pr_required_checks_missing"]
-    permitted = policy(required_checks=[], allow_no_checks=True)
+    permitted = policy(
+        required_checks=[],
+        allow_no_checks=True,
+        policy_source="Origin intentionally requires no CI",
+    )
     assert GitHubPRLifecycle(host).inspect(pr(), permitted, tmp_path)["ready"]
 
 

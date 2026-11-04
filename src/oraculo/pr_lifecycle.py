@@ -196,8 +196,8 @@ class RepositoryPRLifecycle:
         else:
             raise PublicationError("ci_policy_host_unsupported")
         if (
-            not observed["required_checks"]
-            or policy.get("allow_no_checks")
+            (not observed["required_checks"] and not observed.get("allow_no_checks"))
+            or (policy.get("allow_no_checks") and not observed.get("allow_no_checks"))
             or not set(observed["required_checks"])
             <= set(policy.get("required_checks") or [])
             or (
@@ -247,7 +247,11 @@ def _policy(pr: dict, policy: dict) -> tuple[dict, str]:
         or any(s not in ("CLEAN", "HAS_HOOKS") for s in allowed_states)
     ):
         raise PublicationError("pr_merge_policy_invalid")
-    if not checks and not policy.get("allow_no_checks", False):
+    if not checks and (
+        not policy.get("allow_no_checks", False)
+        or not isinstance(policy.get("policy_source"), str)
+        or not policy["policy_source"].strip()
+    ):
         raise PublicationError("pr_required_checks_unspecified")
     if (
         pr.get("host") != "github"
@@ -270,7 +274,9 @@ def _policy(pr: dict, policy: dict) -> tuple[dict, str]:
     return policy, digest
 
 
-def _checks(rows: object, required: list[str]) -> tuple[list[dict], list[str]]:
+def _checks(
+    rows: object, required: list[str], *, ignore_optional=False
+) -> tuple[list[dict], list[str]]:
     # gh represents the absence of status rollup as either null or an empty list.
     if rows is None:
         rows = []
@@ -309,6 +315,8 @@ def _checks(rows: object, required: list[str]) -> tuple[list[dict], list[str]]:
             blockers.append("pr_check_context_ambiguous")
         names.add(name)
         checks.append({"name": name, "completed": complete, "conclusion": result})
+        if ignore_optional and name not in required:
+            continue
         if not complete:
             blockers.append("pr_checks_pending")
         elif result not in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
@@ -415,7 +423,9 @@ class GitHubPRLifecycle:
         ):
             raise PublicationError("pr_host_response_invalid")
         checks, blockers = _checks(
-            observed["statusCheckRollup"], policy["required_checks"]
+            observed["statusCheckRollup"],
+            policy["required_checks"],
+            ignore_optional=policy.get("allow_no_checks") is True,
         )
         if observed["isDraft"]:
             blockers.append("pr_is_draft")
