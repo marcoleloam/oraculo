@@ -244,7 +244,15 @@ def _policy(pr: dict, policy: dict) -> tuple[dict, str]:
         or len(set(checks)) != len(checks)
         or not isinstance(allowed_states, list)
         or not allowed_states
-        or any(s not in ("CLEAN", "HAS_HOOKS") for s in allowed_states)
+        or any(
+            s
+            not in (
+                ("CLEAN", "HAS_HOOKS", "UNSTABLE")
+                if checks == [] and policy.get("allow_no_checks") is True
+                else ("CLEAN", "HAS_HOOKS")
+            )
+            for s in allowed_states
+        )
     ):
         raise PublicationError("pr_merge_policy_invalid")
     if not checks and (
@@ -434,7 +442,10 @@ class GitHubPRLifecycle:
         elif observed["mergeable"] != "MERGEABLE":
             blockers.append("pr_mergeability_pending")
         if observed["mergeStateStatus"] not in policy.get(
-            "allowed_merge_states", ["CLEAN"]
+            "allowed_merge_states",
+            ["CLEAN", "UNSTABLE"]
+            if policy["required_checks"] == [] and policy.get("allow_no_checks") is True
+            else ["CLEAN"],
         ):
             blockers.append("pr_merge_state_blocked")
         if observed["reviewDecision"] == "CHANGES_REQUESTED":

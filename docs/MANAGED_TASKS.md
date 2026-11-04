@@ -1133,7 +1133,9 @@ Essa política registra `not_required_by_explicit_policy`, nunca PASS, com autor
 da origem, hash da política, transições e fatos remotos em memória canônica.
 Não cria IDs de run/attempt nem exige logs de uma execução inexistente. Um run
 opcional cancelado permanece no histórico; rodadas CI failed anteriores também
-permanecem imutáveis. Sucesso da escrita de memória não é sucesso de CI.
+permanecem imutáveis. Sucesso da escrita de memória não é sucesso de CI. Somente nessa política,
+o estado GitHub `UNSTABLE` de checks opcionais não bloqueia o merge normal;
+conflitos, drafts, estado desconhecido e demais bloqueios continuam valendo.
 A memória tem intenção durável e chave idempotente; replay omite `policy`.
 Mudanças de requisitos após a escrita, antes do merge ou do settlement bloqueiam.
 Relatórios de implementação negativos e descendentes funcionais malsucedidos

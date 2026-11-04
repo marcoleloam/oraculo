@@ -18,6 +18,7 @@ flow = flow_fixture
     "case",
     [
         "clean",
+        "unstable",
         "transition",
         "retry",
         "after_write",
@@ -38,8 +39,25 @@ async def test_no_ci_journey(flow, monkeypatch, tmp_path, entrypoint, historical
     host.merged = historical
     policy.update(method="merge", required_checks=[], allow_no_checks=True)
     host.conclusion = "cancelled"
+
     # A read-only observation uses the existing immutable policy; no new merge intent.
-    lifecycle = RepositoryPRLifecycle(host)
+    def transport(argv, cwd):
+        raw = host(argv, cwd)
+        if case == "unstable" and argv[:3] == ["gh", "pr", "view"]:
+            value = json.loads(raw)
+            value["mergeStateStatus"] = "UNSTABLE"
+            value["statusCheckRollup"] = [
+                dict(
+                    __typename="CheckRun",
+                    name="optional cancelled CI",
+                    status="COMPLETED",
+                    conclusion="CANCELLED",
+                )
+            ]
+            return json.dumps(value)
+        return raw
+
+    lifecycle = RepositoryPRLifecycle(transport)
     monkeypatch.setattr("oraculo.pr_lifecycle.RepositoryPRLifecycle", lambda: lifecycle)
     store = flow.service.managed_service.store
     before = copy.deepcopy(store.get(task["id"]))
@@ -126,7 +144,7 @@ async def test_no_ci_journey(flow, monkeypatch, tmp_path, entrypoint, historical
         blocked = await flow.invoke("pr-check", task_id=task["id"])
         assert blocked["blocked_reason"] == "ci_round_memory_write_unconfirmed"
         pending_id = store.get(task["id"])["ci_rounds"][-1]["id"]
-    if case not in {"clean", "transition", "retry"}:
+    if case not in {"clean", "unstable", "transition", "retry"}:
         if case == "work_failed":
             current = store.get(task["id"])
             report = copy.deepcopy(current["report"])
@@ -450,6 +468,8 @@ def test_no_ci_absent_or_cancelled_rollup(tmp_path, rollup, historical):
         if argv[:3] == ["gh", "pr", "view"]:
             value = json.loads(raw)
             value["statusCheckRollup"] = rollup
+            if rollup and not historical:
+                value["mergeStateStatus"] = "UNSTABLE"
             return json.dumps(value)
         return raw
 
@@ -460,3 +480,25 @@ def test_no_ci_absent_or_cancelled_rollup(tmp_path, rollup, historical):
     observed = lifecycle.inspect(pr, policy, tmp_path)
     assert observed["blockers"] == []
     assert observed["state"] == ("merged" if historical else "open")
+
+
+@pytest.mark.parametrize("state", ["BLOCKED", "UNKNOWN", "DIRTY"])
+def test_no_ci_does_not_waive_other_merge_states(tmp_path, state):
+    from test_github_policy_compatibility import setup
+
+    host, lifecycle, pr, policy = setup(tmp_path)
+    policy.update(required_checks=[], allow_no_checks=True)
+
+    def transport(argv, cwd):
+        raw = host(argv, cwd)
+        if argv[:3] == ["gh", "pr", "view"]:
+            value = json.loads(raw)
+            value["mergeStateStatus"] = state
+            return json.dumps(value)
+        return raw
+
+    lifecycle.runner = transport
+    assert lifecycle.validate_host_policy(pr, policy, tmp_path)["allow_no_checks"]
+    assert (
+        "pr_merge_state_blocked" in lifecycle.inspect(pr, policy, tmp_path)["blockers"]
+    )
