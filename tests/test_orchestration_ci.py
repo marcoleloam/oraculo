@@ -88,7 +88,7 @@ def test_ci_exports_reject_every_active_workflow_divergence(tmp_path, target, mu
     elif mutation == "duplicate_job_name":
         content = content.replace(b"    name:", b"    name: injected\n    name:", 1)
     elif mutation == "drift":
-        content = content.replace(b"timeout-minutes: 30", b"timeout-minutes: 29")
+        content = content.replace(b"timeout-minutes:", b"timeout-minutes: 29 #", 1)
     elif mutation == "crlf":
         content = content.replace(b"\n", b"\r\n")
     else:
@@ -331,7 +331,14 @@ def test_inactive_ci_template_pins_actions_and_preserves_always_evidence():
     job = full["jobs"]["tests"]
     assert job["name"] == "Tests (${{ matrix.os }})"
     assert job["strategy"]["matrix"]["os"] == ["ubuntu-latest", "macos-latest"]
-    assert job["timeout-minutes"] == "30"
+    assert job["timeout-minutes"] == "${{ matrix.timeout }}"
+    assert {
+        row["os"]: (row["runner"], row["timeout"])
+        for row in job["strategy"]["matrix"]["include"]
+    } == {
+        "ubuntu-latest": ("ubuntu-latest", "30"),
+        "macos-latest": ("macos-26-intel", "120"),
+    }
     assert any(
         "--durations=25" in step.get("run", "") and "--junitxml=" in step.get("run", "")
         for step in job["steps"]
