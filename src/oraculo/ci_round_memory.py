@@ -183,6 +183,124 @@ class CIRoundMemory:
             diagnosis=diagnosis,
         )
 
+    @staticmethod
+    def policy_scope(policy):
+        """Compare policy facts, excluding moving base and transport timestamps."""
+        remote = policy["remote_capability"]
+        return dict(
+            **{
+                k: policy[k]
+                for k in (
+                    "repository",
+                    "base",
+                    "head_sha",
+                    "required_checks",
+                    "required_review",
+                    "allow_no_checks",
+                    "project_policy_sha256",
+                    "remote_required_checks",
+                    "remote_required_review",
+                    "review_count",
+                    "specialized_review",
+                    "check_sources",
+                )
+            },
+            capability={
+                k: remote[k] for k in ("state", "protection", "rules", "repository_id")
+            },
+            requirements=[
+                {
+                    k: o.get(k)
+                    for k in ("endpoint", "stdout", "http_status", "returncode")
+                }
+                for o in remote["observations"]
+                if "/protection" in o["endpoint"] or "/rules/branches/" in o["endpoint"]
+            ],
+        )
+
+    @classmethod
+    def require_same_policy(cls, previous, current):
+        if cls.policy_scope(previous) != cls.policy_scope(current):
+            raise StateError("ci_host_policy_changed_after_memory")
+
+    async def observe_no_ci(self, task_id, receipt):
+        """Audit a policy exemption, never a successful check execution."""
+        task = self.store.get(task_id)
+        policy = task["merge_policy"]
+        observed = receipt["observed_host_policy"]
+        if (
+            policy.get("required_checks") != []
+            or policy.get("allow_no_checks") is not True
+            or observed.get("allow_no_checks") is not True
+            or not task.get("merge_policy_actor")
+        ):
+            raise StateError("ci_explicit_project_policy_required")
+        records = copy.deepcopy(task.get("ci_rounds", []))
+        identity = dict(
+            task_id=task_id,
+            project_id=task["project"]["project_id"],
+            repository=receipt["repository"],
+            pr=receipt["number"],
+            head=receipt["head_sha"],
+            base=receipt["base"],
+            policy_sha256=content_hash(policy),
+            observed_runs=[],
+            check_identities=[],
+            precision="explicit_policy_without_execution",
+        )
+        if receipt.get("observation_timing") == "after_external_merge":
+            identity.update(
+                observation_timing="after_external_merge",
+                merge_sha=receipt["merge_sha"],
+            )
+        ident = "ci-policy-" + content_hash(identity)
+        prior = next((r for r in records if r["id"] == ident), None)
+        if prior:
+            self.require_same_policy(prior["facts"]["observed_host_policy"], observed)
+        else:
+            facts = dict(
+                identity=identity,
+                outcome="not_required_by_explicit_policy",
+                checks=[],
+                check_bindings=[],
+                policy=policy,
+                observed_host_policy=observed,
+                authorized_by=task["merge_policy_actor"],
+                policy_transitions=task.get("merge_policy_transitions", []),
+            )
+            report = dict(
+                title="Explicit no-CI policy observation",
+                summary="CI loop anchor: "
+                + ident
+                + "\nnot_required_by_explicit_policy; no CI execution or PASS asserted.",
+                topics=["CI", "policy", "evaluation"],
+                evidence=dict(
+                    facts=facts,
+                    previous=dict(task_id=task_id, round_id=records[-1]["id"])
+                    if records
+                    else None,
+                    execution=None,
+                    repository_observation=receipt,
+                    implementation_report_sha256=content_hash(task["report"]),
+                ),
+                limitations=[
+                    "Memory write success is not a passing CI run or deployment."
+                ],
+            )
+            records.append(
+                dict(
+                    id=ident,
+                    key=task_id + ":" + ident,
+                    facts=facts,
+                    work_status="succeeded",
+                    report=report,
+                    memory=None,
+                )
+            )
+            self._update(task_id, records, "intent")
+        await self.flush(task_id)
+        return True
+
     async def observe(self, task_id, receipt, execution=None):
         """Persist terminal required checks before ready/merge; no local clock ID."""
         task = self.store.get(task_id)

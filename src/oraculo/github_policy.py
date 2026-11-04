@@ -315,7 +315,7 @@ def github_policy(runner, repository, base, head, cwd, managed_policy=None):
                 ).items()
             )
             or not isinstance(required, list)
-            or not required
+            or (not required and policy.get("allow_no_checks") is not True)
             or any(not isinstance(c, str) or not c.strip() for c in required)
             or len(set(required)) != len(required)
             or type(policy.get("required_review")) is not bool
@@ -326,7 +326,8 @@ def github_policy(runner, repository, base, head, cwd, managed_policy=None):
                     or not policy["policy_source"].strip()
                 )
             )
-            or policy.get("allow_no_checks", False) is not False
+            or type(policy.get("allow_no_checks", False)) is not bool
+            or (bool(required) and policy.get("allow_no_checks", False))
             or (
                 not checks
                 and policy.get("observe_only") is not True
@@ -334,6 +335,11 @@ def github_policy(runner, repository, base, head, cwd, managed_policy=None):
             )
         ):
             reader.fail("ci_explicit_project_policy_required")
+        if not required and (
+            protection_state not in {"available", "not_protected"}
+            or rules_state != "available"
+        ):
+            reader.fail("ci_no_checks_policy_discovery_required")
         if not set(checks) <= set(required) or (
             (count or specialized_review) and not policy["required_review"]
         ):
@@ -352,7 +358,7 @@ def github_policy(runner, repository, base, head, cwd, managed_policy=None):
         merge_authorized=False,
         required_checks=sorted(set(effective)),
         required_review=required_review,
-        allow_no_checks=False,
+        allow_no_checks=not effective,
         policy_source="authenticated_github_protection_and_rules"
         if state == "enforced"
         else "origin_project_policy_with_authenticated_github_capability",
@@ -468,7 +474,9 @@ def verify_github_merge(runner, pr, policy, cwd, receipt, observed_policy):
     ):
         reader.fail("pr_merge_identity_or_ancestry_unverified")
     checks, blockers = _checks(
-        snapshot.get("statusCheckRollup"), policy["required_checks"]
+        snapshot.get("statusCheckRollup"),
+        policy["required_checks"],
+        ignore_optional=policy.get("allow_no_checks") is True,
     )
     if snapshot.get("reviewDecision") == "CHANGES_REQUESTED":
         blockers.append("pr_changes_requested")

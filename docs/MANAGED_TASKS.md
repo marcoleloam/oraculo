@@ -1123,7 +1123,28 @@ Esse exemplo permite apenas observação. Para uma política de merge já gravad
 **não a substitua**: omita `policy` no replay. Um pedido de merge efetivo usa
 `merge_authorized: true`; `observe_only: true` proíbe emissão. Após uma intenção
 incerta, a política permanece imutável e somente a reconciliação é permitida.
-`allow_no_checks` não participa desta compatibilidade.
+Para um projeto explicitamente sem CI, a origem deve declarar conjuntamente
+`required_checks: []`, `allow_no_checks: true` e `policy_source` não vazio,
+com os mesmos bindings exatos e autorização acima. Não basta uma lista vazia.
+A descoberta remota autenticada e conclusiva continua obrigatória: ambos os
+endpoints precisam estar disponíveis (ou ausência clássica explicitamente
+confirmada, com regras disponíveis). Limitação de plano não comprova a ausência
+de requisitos para esta política sem CI. Checks/workflows exigidos,
+revisão, codeowners e aprovação do último push não são dispensados.
+
+Essa política registra `not_required_by_explicit_policy`, nunca PASS, com autoria
+da origem, hash da política, transições e fatos remotos em memória canônica.
+Não cria IDs de run/attempt nem exige logs de uma execução inexistente. Um run
+opcional cancelado permanece no histórico; rodadas CI failed anteriores também
+permanecem imutáveis. Sucesso da escrita de memória não é sucesso de CI. Somente nessa política,
+o estado GitHub `UNSTABLE` de checks opcionais não bloqueia o merge normal;
+conflitos, drafts, estado desconhecido e demais bloqueios continuam valendo.
+A memória tem intenção durável e chave idempotente; replay omite `policy`.
+Mudanças de requisitos após a escrita, antes do merge ou do settlement bloqueiam.
+Relatórios de implementação negativos e descendentes funcionais malsucedidos
+continuam bloqueando pelos gates normais. Merge externo é apenas observado,
+com identidade e ancestralidade reais, permitindo avanço coerente da base sem
+emitir outro merge. Nenhuma aprovação humana genérica é acrescentada.
 
 O adaptador autentica o ator e confere repositório, branch e commit via `gh api`.
 Consulta proteção clássica **e** regras aplicáveis. Registra o resultado de cada
