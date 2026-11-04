@@ -646,7 +646,7 @@ async def test_ci_memory_loop_recovery_anchor_precedes_long_truncated_evidence(
 ):
     task, _, (_, policy, transport) = await setup(flow, monkeypatch)
     transport.required[:] = [
-        "Product review (exact HEAD) " + "boundary evidence " * 300
+        "Product review (exact HEAD) " + "boundary evidence " * 200
     ]
     result = await flow.invoke("pr-check", task_id=task["id"], policy=policy)
     assert result["phase"] == "pr_waiting", result
@@ -755,6 +755,48 @@ class MixedCITransport(CITransport):
             )
             data["total_count"] = len(data["jobs"])
         return json.dumps(data)
+
+
+@pytest.mark.parametrize("missing", [True, False])
+async def test_ci_memory_loop_declared_actions_coverage_requires_matching_actual_job(
+    flow, monkeypatch, missing
+):
+    task, _, (_, policy, transport) = await setup(flow, monkeypatch)
+    transport.conclusion = "success"
+    original = transport.__class__.__call__
+
+    def incomplete(self, argv, cwd):
+        raw = original(self, argv, cwd)
+        if (
+            argv[0:2] == ["gh", "api"]
+            and "/attempts/" in argv[2]
+            and "/jobs?" in argv[2]
+        ):
+            data = json.loads(raw)
+            if missing:
+                data["jobs"], data["total_count"] = [], 0
+            else:
+                for job in data["jobs"]:
+                    job["conclusion"] = "failure"
+            return json.dumps(data)
+        return raw
+
+    monkeypatch.setattr(transport.__class__, "__call__", incomplete)
+    result = await flow.invoke("merge", task_id=task["id"], policy=policy)
+    assert result["blocked_reason"] == (
+        "ci_round_check_execution_unproven"
+        if missing
+        else "ci_round_check_evidence_mismatch"
+    ), result
+    assert result["ci_rounds"] == [] and not result["merged"]
+    assert (
+        result["pr_observation"]["receipt"]["ci_execution"]["event"]["conclusion"]
+        == "failed"
+    )
+    assert (
+        result["work_status"] == "succeeded"
+        and result["memory"]["write_state"] == "saved"
+    )
 
 
 @pytest.mark.parametrize("entrypoint", ["api", "cli"])

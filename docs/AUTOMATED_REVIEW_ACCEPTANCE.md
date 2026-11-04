@@ -166,12 +166,17 @@ redispatch: a origem chama o serviço ao receber o evento de PR, como antes.
 Sem observação/retorno do host, o serviço não inventa uma rodada.
 
 `ci_rounds` expõe identidade, resultado e recibo de memória de cada rodada;
-o relatório completo mantém a prova autenticada, task/projeto/PR/HEAD/política,
+o relatório completo mantém a observação autenticada original e sua referência
+imutável no ledger, task/projeto/PR/HEAD/política,
 relatório e memória da implementação. Uma falha CI fica em ciclo `failed`, embora
 a entrega continue `succeeded`. Cancelamento/neutral/skip conservam a conclusão
 original nos checks; não provam falha funcional nem sucesso obrigatório.
 Checks pendentes/ausentes não ganham resultado terminal fabricado. Check verde
 também não aprova reviewDecision, revoga recusa do provedor ou autoriza merge.
+Prova autenticada conflitante/incompleta também fica no ledger/outbox, com o
+motivo do bloqueio; não vira rodada terminal canônica aprovada. Se o observador
+declara cobertura Actions e falta o job correspondente ou sua conclusão diverge,
+isso bloqueia em vez de rebaixar silenciosamente o check a snapshot.
 
 No GitHub, a descoberta de IDs usa a API autenticada e reaproveita o observador
 existente para conferir PR/repositório/base/HEAD, workflow/run/attempt, check-suite,
@@ -181,6 +186,8 @@ observador comprovou check/run/attempt/job/HEAD. Checks adicionais da política
 managed continuam identificados pelo snapshot exato, mesmo ao lado de workflows
 remotos conhecidos. Quando o host só expõe checks (incluindo o caminho Azure
 atual), a precisão desse check é `check_snapshot_without_run_attempt`.
+O caminho Azure normaliza `state` para resultado/pendência mantendo `state` e
+`iterationId` originais; uma iteração não é promovida a build/run/attempt.
 Não se fabrica attempt=1. Estados diferentes sem ID identificam snapshots
 diferentes, sem certificar execuções distintas. O relógio local `observed_at`
 nunca identifica tentativa/rodada; replay exato não grava outro ciclo. O snapshot

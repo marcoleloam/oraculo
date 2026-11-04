@@ -147,6 +147,15 @@ class TaskClosure:
                 task["merge_policy"],
                 task["publication_spec"]["cwd"],
             )
+            if execution is not None:
+                # Preserve conflicting authenticated proof before rejecting it.
+                # This observation is not approval or a terminal memory round.
+                receipt = dict(receipt, ci_execution=execution)
+                self.store.record_pr_observation(
+                    task_id,
+                    receipt,
+                    self.store.get(task_id).get("snapshot_revision", 0),
+                )
         confirmed = await rounds.observe(task_id, receipt, execution)
         if receipt["ready"] and not confirmed:
             raise StateError("ci_round_memory_terminal_evidence_required")

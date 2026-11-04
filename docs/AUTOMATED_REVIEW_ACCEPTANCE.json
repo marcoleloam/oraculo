@@ -8,7 +8,8 @@
     "tests/test_task_closure.py",
     "tests/test_pr_lifecycle.py",
     "tests/test_nested_delivery_review.py",
-    "tests/test_ci_round_memory.py"
+    "tests/test_ci_round_memory.py",
+    "tests/test_azure_task_closure.py"
   ],
   "scenarios": [
     {

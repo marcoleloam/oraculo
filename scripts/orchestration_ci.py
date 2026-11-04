@@ -34,6 +34,7 @@ SELECTION = (
     "ci_events",
     "ci_host",
     "ci_round_memory",
+    "azure_task_closure",
     "ci_azure",
     "operational_decisions",
     "local_rollout",

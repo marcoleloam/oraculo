@@ -183,6 +183,26 @@ class CIRoundMemory:
         required = task["merge_policy"].get("required_checks", [])
         if not isinstance(checks, list):
             raise StateError("ci_round_checks_unobserved")
+        if receipt.get("host") == "azure":
+            # Native states/iterations are preserved; an iteration is not a run.
+            conclusions = dict(
+                notSet="PENDING",
+                pending="PENDING",
+                succeeded="SUCCESS",
+                failed="FAILURE",
+                error="ERROR",
+                notApplicable="NEUTRAL",
+            )
+            if any(c.get("state") not in conclusions for c in checks):
+                raise StateError("ci_round_azure_check_state_unproven")
+            checks = [
+                dict(
+                    c,
+                    completed=c["state"] not in {"notSet", "pending"},
+                    conclusion=conclusions[c["state"]],
+                )
+                for c in checks
+            ]
         selected = sorted(
             [c for c in checks if c.get("name") in required], key=lambda c: c["name"]
         )
@@ -236,6 +256,12 @@ class CIRoundMemory:
             precision="per_check_execution_or_snapshot",
         )
         scope = self.execution_scope(execution, required)
+        if execution and "check_bindings" in execution["evidence"]:
+            expected = set(execution["evidence"]["policy"]["required_checks"]) & set(
+                required
+            )
+            if expected - {c["name"] for c in scope["check_bindings"]}:
+                raise StateError("ci_round_check_execution_unproven")
         per_check = []
         for check in selected:
             bindings = [
@@ -342,6 +368,7 @@ class CIRoundMemory:
                     previous=previous,
                     facts=facts,
                     execution=execution,
+                    repository_observation=task.get("pr_observation"),
                     implementation_report_sha256=content_hash(task["report"]),
                     implementation_memory_cycle=task["memory"]["id"],
                 ),
