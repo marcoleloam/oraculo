@@ -13,6 +13,7 @@ import json
 import time
 import zlib
 
+from oraculo.capability_options import option_values
 from oraculo.protocol import canonical_json, content_hash
 from oraculo.run_continuity import (
     cancelled_before_start,
@@ -128,30 +129,26 @@ class HostResults:
                 if not isinstance(provider["constraints"], list):
                     raise StateError("native_bridge_result_incomplete")
                 for model in provider["models"]:
-                    required(model, ("id", "options"))
+                    required(model, ("id",))
+                    # Only a provider unable to run either kind of child may
+                    # omit an unconfigurable model's options.
+                    if "options" not in model and not (
+                        provider["canRunChildTask"]
+                        or provider["canRunCrossProviderChildTask"]
+                    ):
+                        continue
+                    required(model, ("options",))
                     if not isinstance(model["options"], list):
                         raise StateError("native_bridge_model_options_unproven")
+                    ids = set()
                     for option in model["options"]:
-                        required(option, ("id", "type"))
-                        if option["type"] == "select":
-                            required(option, ("options",))
-                            if (
-                                not isinstance(option["options"], list)
-                                or not option["options"]
-                            ):
-                                raise StateError("native_bridge_model_options_unproven")
-                            for choice in option["options"]:
-                                required(choice, ("id",))
-                            choices = [c["id"] for c in option["options"]]
-                            if len(set(choices)) != len(choices) or (
-                                option.get("currentValue") is not None
-                                and option["currentValue"] not in choices
-                            ):
-                                raise StateError(
-                                    "native_bridge_model_options_incoherent"
-                                )
-                        elif option["type"] != "boolean":
+                        required(option, ("id",))
+                        if not isinstance(option["id"], str) or not option["id"]:
                             raise StateError("native_bridge_model_options_unproven")
+                        if option["id"] in ids:
+                            raise StateError("native_bridge_model_options_incoherent")
+                        ids.add(option["id"])
+                        option_values(option)
             if self.caller is not None and self.caller != value["parentThreadId"]:
                 raise StateError("native_bridge_caller_changed")
             self.caller = value["parentThreadId"]

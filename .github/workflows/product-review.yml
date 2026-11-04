@@ -1,8 +1,6 @@
 name: Oraculo product review
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

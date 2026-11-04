@@ -88,7 +88,7 @@ def test_ci_exports_reject_every_active_workflow_divergence(tmp_path, target, mu
     elif mutation == "duplicate_job_name":
         content = content.replace(b"    name:", b"    name: injected\n    name:", 1)
     elif mutation == "drift":
-        content = content.replace(b"timeout-minutes: 30", b"timeout-minutes: 29")
+        content = content.replace(b"timeout-minutes:", b"timeout-minutes: 29 #", 1)
     elif mutation == "crlf":
         content = content.replace(b"\n", b"\r\n")
     else:
@@ -331,7 +331,14 @@ def test_inactive_ci_template_pins_actions_and_preserves_always_evidence():
     job = full["jobs"]["tests"]
     assert job["name"] == "Tests (${{ matrix.os }})"
     assert job["strategy"]["matrix"]["os"] == ["ubuntu-latest", "macos-latest"]
-    assert job["timeout-minutes"] == "30"
+    assert job["timeout-minutes"] == "${{ matrix.timeout }}"
+    assert {
+        row["os"]: (row["runner"], row["timeout"])
+        for row in job["strategy"]["matrix"]["include"]
+    } == {
+        "ubuntu-latest": ("ubuntu-latest", "30"),
+        "macos-latest": ("macos-26-intel", "120"),
+    }
     assert any(
         "--durations=25" in step.get("run", "") and "--junitxml=" in step.get("run", "")
         for step in job["steps"]
@@ -351,3 +358,33 @@ def test_uv_output_marker_is_metadata_and_unexpected_extra_files_still_fail(tmp_
     (tmp_path / ".gitignore").write_bytes(b"unexpected private content")
     with pytest.raises(ValueError):
         module.distribution_paths(tmp_path)
+
+
+def test_temporary_automatic_scope_retains_regressions_and_manual_full_suite():
+    spec = yaml.load(
+        (ROOT / "templates/ci/oraculo-suite.yml.template").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    assert set(spec["on"]) == {"pull_request", "push", "workflow_dispatch"}
+    assert spec["on"]["workflow_dispatch"]["inputs"]["full"]["default"] == "false"
+    steps = spec["jobs"]["tests"]["steps"]
+    pytest_steps = [s for s in steps if "pytest " in s.get("run", "")]
+    assert len(pytest_steps) == 2
+    automatic, manual = pytest_steps
+    for path in ("test_host_ack.py", "test_service.py", "test_orchestration_ci.py"):
+        assert "tests/" + path in automatic["run"]
+    assert (
+        automatic["if"]
+        == "${{ github.event_name != 'workflow_dispatch' || !inputs.full }}"
+    )
+    assert (
+        manual["if"] == "${{ github.event_name == 'workflow_dispatch' && inputs.full }}"
+    )
+    assert "tests/" not in manual["run"]
+    assert all("--junitxml=" in s["run"] for s in pytest_steps)
+    assert not any(s.get("continue-on-error") for s in steps)
+    for name in ("oraculo-ci.yml.template", "product-review.yml.template"):
+        broad = yaml.load(
+            (ROOT / "templates/ci" / name).read_text(), Loader=yaml.BaseLoader
+        )
+        assert set(broad["on"]) == {"workflow_dispatch"}

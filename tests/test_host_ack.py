@@ -357,3 +357,127 @@ raise SystemExit(main())
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def current_capabilities():
+    """Synthetic current T3 schema, including disabled unconfigurable model."""
+    value = capabilities()
+    value["providers"][0]["models"][0]["options"] = [
+        dict(id="reasoningEffort", values=["low", "high"], default="low"),
+        dict(id="serviceTier", values=["default", "priority"], default="default"),
+        dict(id="fastMode", values=[False, True]),
+    ]
+    value["providers"].append(
+        dict(
+            providerInstanceId="disabled",
+            driverKind="disabled",
+            models=[dict(id="default")],
+            canRunChildTask=False,
+            canRunCrossProviderChildTask=False,
+            constraints=["disabled"],
+        )
+    )
+    return value
+
+
+async def test_current_capabilities_cli_ack_and_stdio_preserve_literal(
+    tmp_path, capsys
+):
+    value = current_capabilities()
+    writer = io.StringIO()
+
+    class Reader:
+        def readline(self):
+            f = json.loads(writer.getvalue())
+            raw = dict(
+                structuredContent=value,
+                content=[dict(type="text", text=json.dumps(value))],
+            )
+            fp, rp = tmp_path / "frame", tmp_path / "raw"
+            fp.write_text(json.dumps(f))
+            rp.write_text(json.dumps(raw))
+            assert (
+                main(["bridge", "ack", "--frame", str(fp), "--from-file", str(rp)]) == 0
+            )
+            ack = capsys.readouterr().out
+            assert decode_ack(f, json.loads(ack)) == raw
+            return ack
+
+    assert (
+        await StdioHostTransport(Reader(), writer).call("orchestrator_capabilities", {})
+        == value
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "empty",
+        "duplicate",
+        "number",
+        "object",
+        "blank",
+        "default",
+        "typed_default",
+        "current",
+        "hybrid",
+        "duplicate_id",
+        "blank_id",
+        "missing_enabled",
+        "null_enabled",
+        "cross_enabled",
+        "invalid_disabled",
+    ],
+)
+def test_current_capabilities_fail_closed(defect):
+    value = current_capabilities()
+    model = value["providers"][0]["models"][0]
+    option = model["options"][0]
+    if defect == "empty":
+        option["values"] = []
+    elif defect == "duplicate":
+        option["values"] = ["low", "low"]
+    elif defect == "number":
+        option.update(values=[False, 1], default=False)
+    elif defect == "object":
+        option["values"] = [{}]
+    elif defect == "blank":
+        option["values"] = [""]
+    elif defect == "default":
+        option["default"] = "unknown"
+    elif defect == "typed_default":
+        option.update(values=[True], default=1)
+    elif defect == "current":
+        option["currentValue"] = "unknown"
+    elif defect == "hybrid":
+        option["type"] = "boolean"
+    elif defect == "duplicate_id":
+        model["options"].append(copy.deepcopy(option))
+    elif defect == "blank_id":
+        option["id"] = ""
+    elif defect == "missing_enabled":
+        model.pop("options")
+    elif defect == "null_enabled":
+        model["options"] = None
+    elif defect == "cross_enabled":
+        value["providers"][-1]["canRunCrossProviderChildTask"] = True
+    else:
+        value["providers"][-1]["models"][0]["options"] = None
+    with pytest.raises(StateError, match="native_bridge_"):
+        make_ack(frame("orchestrator_capabilities"), json.dumps(value).encode())
+
+
+@pytest.mark.parametrize(
+    "values,default",
+    [
+        (["false", False, True], False),
+        (["high"], None),
+        ([True], True),
+    ],
+)
+def test_current_choices_preserve_types_and_nullable_default(values, default):
+    value = current_capabilities()
+    value["providers"][0]["models"][0]["options"] = [
+        dict(id="option", values=values, default=default)
+    ]
+    assert HostResults().validate("orchestrator_capabilities", {}, value) == value
