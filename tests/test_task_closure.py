@@ -24,6 +24,14 @@ class Lifecycle:
             "blockers": self.blockers,
             "state": "merged" if self.merged else "open",
             "merge_sha": "b" * 40 if self.merged else None,
+            "checks": [
+                {
+                    "name": name,
+                    "completed": self.ready,
+                    "conclusion": "SUCCESS" if self.ready else "PENDING",
+                }
+                for name in policy["required_checks"]
+            ],
         }
 
     def merge(self, pr, policy, cwd, *, before_merge=None, reconcile_only=False):
@@ -187,6 +195,8 @@ async def test_final_memory_failure_preserves_merge_and_retry_settles(
     system, monkeypatch
 ):
     task, policy, lifecycle, calls = await setup(system)
+    # Isolate the post-merge memory fault from the earlier required CI cycle.
+    await system.engine.command("pr-check", {"task_id": task["id"], "policy": policy})
     original = system.service.publisher.publish
     monkeypatch.setattr(
         system.service.publisher,

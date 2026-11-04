@@ -1054,6 +1054,19 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     raise StateError("review_adjudication_service_upgrade_required")
                 if (
+                    args.action == "start"
+                    and payload.get("task_role")
+                    in {"quality_review", "functional_tests"}
+                    and capabilities.get("data", {}).get("delivery_review_separation")
+                    is not True
+                ):
+                    raise StateError("delivery_review_service_upgrade_required")
+                if (
+                    args.action in {"pr-check", "merge", "settle"}
+                    and capabilities.get("data", {}).get("ci_round_memory") is not True
+                ):
+                    raise StateError("ci_round_memory_service_upgrade_required")
+                if (
                     args.action in {"complete-origin", "supersede"}
                     and capabilities.get("data", {}).get("origin_terminal_recovery")
                     is not True

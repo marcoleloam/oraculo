@@ -434,3 +434,28 @@ def test_absent_open_pr_evidence_cannot_imply_success(tmp_path, field):
     with pytest.raises(PublicationError, match="pr_host_response_invalid"):
         GitHubPRLifecycle(host).merge(pr(), policy(), tmp_path)
     assert host.merge_calls == 0
+
+
+@pytest.mark.parametrize("state", ["missing", "pending", "failed", "success"])
+def test_product_ci_available_is_not_required_unless_policy_demands_it(tmp_path, state):
+    host = Host()
+    name = "Product review (exact HEAD)"
+    lifecycle = GitHubPRLifecycle(host)
+    # Creating a workflow alone cannot add a required check to the real rules.
+    existing = lifecycle.inspect(pr(), policy(), tmp_path)
+    assert existing["ready"] is True
+    demanded = policy(required_checks=["tests", "lint", name])
+    if state != "missing":
+        host.observed["statusCheckRollup"].append(
+            check(
+                name,
+                status="IN_PROGRESS" if state == "pending" else "COMPLETED",
+                conclusion="FAILURE" if state == "failed" else "SUCCESS",
+            )
+        )
+    observed = lifecycle.inspect(pr(), demanded, tmp_path)
+    assert observed["ready"] is (state == "success")
+    if state != "success":
+        assert observed["blockers"]
+        assert host.merge_calls == 0
+    assert not any("--admin" in argv for argv, _ in host.calls)

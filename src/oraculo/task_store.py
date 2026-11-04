@@ -500,8 +500,9 @@ class TaskStore:
                 "url"
             ) != publication.get("url"):
                 raise StateError("pr_observation_binding_mismatch")
+            stable = {k: v for k, v in receipt.items() if k != "observed_at"}
             key = "pr-observation:v1:" + content_hash(
-                [task_id, publication, task.get("merge_policy"), receipt]
+                [task_id, publication, task.get("merge_policy"), stable]
             )
             previous = self.state.get_meta(key)
             if previous:
@@ -579,11 +580,22 @@ class TaskStore:
                 "continuation_bootstrap",
                 "origin_completion",
                 "review_adjudication",
+                "delivery_review",
+                "ci_rounds",
                 "supersession",
                 "launch_arguments",
                 "events",
             }
         } | {
+            "ci_rounds": [
+                {
+                    "id": r["id"],
+                    "facts": r["facts"],
+                    "previous": r["report"]["evidence"]["previous"],
+                    "memory": r.get("memory"),
+                }
+                for r in task.get("ci_rounds", [])
+            ],
             "presentation": task_view(task),
             "title": (task.get("request") or {}).get("title"),
             "origin_completion": (
@@ -600,6 +612,37 @@ class TaskStore:
                     for k in ("basis", "actor", "at", "report_sha256")
                 }
                 if task.get("review_adjudication")
+                else None
+            ),
+            "delivery_review": (
+                {
+                    "state": task["delivery_review"]["state"],
+                    "review_approved": False,
+                    "integration_authorized": False,
+                    "quality_reviews": [
+                        {
+                            k: r[k]
+                            for k in (
+                                "task_id",
+                                "thread_id",
+                                "host_status",
+                                "quality_state",
+                                "approval",
+                                "independence",
+                                "human_certification",
+                                "provider_restriction",
+                                "redispatch_permitted",
+                            )
+                        }
+                        | {"owner_task_id": r.get("owner_task_id", task["id"])}
+                        for r in task["delivery_review"]["quality_reviews"]
+                    ],
+                    "scope_validations": [
+                        {"task_id": s["task_id"], "commit": s["target"]["commit"]}
+                        for s in task["delivery_review"].get("scope_validations", [])
+                    ],
+                }
+                if task.get("delivery_review")
                 else None
             ),
             "supersession": (

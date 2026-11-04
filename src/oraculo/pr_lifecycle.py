@@ -63,6 +63,58 @@ class RepositoryPRLifecycle:
             return azure_ci(self, binding, cwd)
         return github_ci(self, binding, cwd)
 
+    def observe_pr_ci(self, pr, policy, cwd):
+        """Discover actual GitHub identities, then reuse the strict CI observer.
+
+        Azure/external statuses currently expose only the authenticated lifecycle
+        check snapshot here. No synthetic build ID or attempt is substituted.
+        """
+        if pr.get("host") != "github":
+            return None
+        from oraculo.ci_events import CIBinding
+
+        def read(suffix):
+            return json.loads(
+                self.runner(
+                    ["gh", "api", "repos/" + pr["repository"] + suffix], Path(cwd)
+                )
+            )
+
+        pull = read(f"/pulls/{pr['number']}")
+        checks = read(
+            f"/commits/{pr['head_sha']}/check-runs?filter=latest&per_page=100"
+        )
+        runs = read(f"/actions/runs?head_sha={pr['head_sha']}&per_page=100")
+        rows, workflows = checks.get("check_runs"), runs.get("workflow_runs")
+        if (
+            not isinstance(rows, list)
+            or not isinstance(workflows, list)
+            or checks.get("total_count") != len(rows)
+            or runs.get("total_count") != len(workflows)
+        ):
+            raise PublicationError("ci_host_checks_or_runs_truncated")
+        required = [c for c in rows if c.get("name") in policy["required_checks"]]
+        if not required:
+            return None
+        suite = (required[0].get("check_suite") or {}).get("id")
+        candidates = [
+            r
+            for r in workflows
+            if suite is not None and r.get("check_suite_id") == suite
+        ]
+        if len(candidates) != 1:
+            raise PublicationError("ci_check_run_binding_unverified")
+        candidate = candidates[0]
+        binding = CIBinding(
+            repository=pr["repository"],
+            pr=pr["number"],
+            head=pr["head_sha"],
+            base=pull["base"]["sha"],
+            run=str(candidate["id"]),
+            attempt=candidate["run_attempt"],
+        )
+        return self.observe_ci(binding, cwd)
+
     def validate_host_policy(self, pr, policy, cwd):
         """A caller's source label/boolean cannot reduce actual host rules."""
         from oraculo.publication import discover_repository_remote

@@ -14,6 +14,14 @@ INACTIVE_HEADER = (
 # template, optional public destination, workflow name, job id, job name, header
 CONTRACTS = (
     (
+        "product-review.yml.template",
+        "product-review.yml",
+        "Oraculo product review",
+        "product-review",
+        "Product review (exact HEAD)",
+        INACTIVE_HEADER,
+    ),
+    (
         "oraculo-suite.yml.template",
         "ci.yml",
         "CI",

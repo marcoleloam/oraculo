@@ -43,7 +43,7 @@ class TaskClosure:
             merge_policy=policy,
         )
 
-    def _requirements(self, task):
+    def _requirements(self, task, *, integration=True):
         require_implementation(task)
         if not task.get("publication") or not task.get("publication_spec"):
             raise StateError("publication_required_before_merge")
@@ -60,6 +60,11 @@ class TaskClosure:
             raise StateError("validated_work_and_merge_policy_required")
         if self.engine._report_failed(task.get("report")):
             raise StateError("work_not_successful")
+        if integration and any(
+            r.get("quality_state") == "changes_requested"
+            for r in (task.get("delivery_review") or {}).get("quality_reviews", [])
+        ):
+            raise StateError("quality_review_changes_requested")
         if task["merge_policy"]["head_sha"] != task["publication"]["head_sha"]:
             raise StateError("new_head_requires_new_validation_and_publication")
         if specification.get("source_commit") != task["report"].get("commit"):
@@ -105,9 +110,14 @@ class TaskClosure:
         )
 
     async def check(self, task_id, *, merge=False):
+        from oraculo.ci_round_memory import CIRoundMemory
+
         task = self.store.get(task_id)
         require_implementation(task)
-        self._requirements(task)
+        self._requirements(task, integration=False)
+        rounds = CIRoundMemory(self.engine)
+        await rounds.flush(task_id)
+        task = self.store.get(task_id)
         actual_policy = None
         if hasattr(self.lifecycle, "validate_host_policy"):
             actual_policy = self.lifecycle.validate_host_policy(
@@ -123,6 +133,58 @@ class TaskClosure:
         self.store.record_pr_observation(
             task_id, receipt, task.get("snapshot_revision", 0)
         )
+        execution = None
+        required = task["merge_policy"].get("required_checks", [])
+        checks = [c for c in receipt.get("checks") or [] if c.get("name") in required]
+        if (
+            checks
+            and len(checks) == len(required)
+            and all(c.get("completed") is True for c in checks)
+            and hasattr(self.lifecycle, "observe_pr_ci")
+        ):
+            execution = self.lifecycle.observe_pr_ci(
+                task["publication"],
+                task["merge_policy"],
+                task["publication_spec"]["cwd"],
+            )
+        confirmed = await rounds.observe(task_id, receipt, execution)
+        if receipt["ready"] and not confirmed:
+            raise StateError("ci_round_memory_terminal_evidence_required")
+        self._requirements(self.store.get(task_id))
+
+        def revalidate_ci():
+            fresh = self.lifecycle.inspect(
+                task["publication"],
+                task["merge_policy"],
+                task["publication_spec"]["cwd"],
+            )
+            if any(
+                fresh.get(k) != receipt.get(k)
+                for k in (
+                    "head_sha",
+                    "url",
+                    "state",
+                    "ready",
+                    "policy_sha256",
+                )
+            ):
+                raise StateError("ci_round_snapshot_changed")
+            if sorted(
+                [c for c in fresh.get("checks", []) if c.get("name") in required],
+                key=lambda c: c["name"],
+            ) != sorted(checks, key=lambda c: c["name"]):
+                raise StateError("ci_round_snapshot_changed")
+            if execution is not None and rounds.execution_scope(
+                self.lifecycle.observe_pr_ci(
+                    task["publication"],
+                    task["merge_policy"],
+                    task["publication_spec"]["cwd"],
+                ),
+                required,
+            ) != rounds.execution_scope(execution, required):
+                raise StateError("ci_round_execution_changed")
+
+        revalidate_ci()
         if receipt["state"] == "merged":
             if not receipt.get("merge_sha"):
                 raise StateError("merge_not_confirmed")
@@ -197,6 +259,7 @@ class TaskClosure:
             await self.engine._execution_gate(task)
 
         def before_merge():
+            revalidate_ci()
             if hasattr(self.lifecycle, "validate_host_policy"):
                 self.lifecycle.validate_host_policy(
                     task["publication"],
@@ -236,8 +299,11 @@ class TaskClosure:
         await self.finalize(task_id)
 
     async def finalize(self, task_id):
+        from oraculo.ci_round_memory import CIRoundMemory
+
         task = self.store.get(task_id)
         self._requirements(task)
+        await CIRoundMemory(self.engine).flush(task_id)
         require_implementation(task)
         merged = task.get("merge_receipt")
         if not merged or not task["merged"]:
@@ -293,7 +359,7 @@ class TaskClosure:
             await self.host.call(
                 "t3_thread_organize", {"threadId": thread_id, "action": "settle"}
             )
-            # The managed execution gate also revalidates any human review.
+            # Revalidate human or automated review after host settlement.
             # Generic settlement remains strict about unsuccessful descendants.
             _, _, snapshot = await self.engine._execution_gate(task)
             if snapshot["thread"]["settled"] is not True:

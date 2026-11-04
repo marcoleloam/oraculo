@@ -142,6 +142,21 @@ class ReviewAdjudication:
             else "descendants_successful"
         )
         report = task.get("report") or task.get("submitted_report")
+        delivery = None
+        if report and snapshot.get("childrenTerminal") is True:
+            from oraculo.delivery_review import DeliveryReview
+
+            try:
+                delivery = await DeliveryReview(self.engine).observe(
+                    task, snapshot, enforce=False
+                )
+                if (
+                    delivery["quality_reviews"]
+                    and not delivery["unknown_descendant_roles"]
+                ):
+                    reason = "implementation_delivery_separate_from_quality_review"
+            except StateError as exc:
+                delivery = dict(state="delivery_evidence_incomplete", reason=str(exc))
         return dict(
             reason=reason,
             snapshot=snapshot,
@@ -155,14 +170,14 @@ class ReviewAdjudication:
                 commit=report.get("commit") if report else None,
             ),
             missing_evidence=[
-                "Technical human review of the exact final diff and request scope",
-                "Passing test outputs with verified private artifact hashes",
-                "Human review attestation from a separate host thread",
-                "Explicit human origin approval bound to the review artifact",
+                "Immutable pre-execution task role and exact target binding for optional quality review",
+                "Complete terminal execution and passing mandatory functional test evidence",
+                "CI/PR review remains separate; no human message is a generic delivery prerequisite",
             ]
             if reason == "terminal_descendant_review_required"
             else [],
             certification="not_granted_by_diagnosis",
+            delivery_review=delivery,
         )
 
     async def document(self, task, snapshot, reference):

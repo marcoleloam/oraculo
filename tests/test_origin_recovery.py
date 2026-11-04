@@ -53,6 +53,11 @@ async def test_origin_completes_failed_host_preserving_failure_and_live_sibling(
     stored = flow.service.managed_service.store.get(task["id"])
     assert stored["child"] == task["child"]
     assert stored["origin_completion"]["runs"][0]["status"] == "failed"
+    assert (
+        stored["origin_completion"]["basis"] == "origin_validation_after_host_failure"
+    )
+    assert stored["origin_completion"]["independence"] == "not_independent"
+    assert stored["origin_completion"]["human_certification"] is False
     assert stored["completion_evidence"]["runs"][0]["status"] == "failed"
     assert stored["report"] == payload["report"]
     assert stored.get("submitted_report") is None

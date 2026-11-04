@@ -176,3 +176,16 @@ Missing/truncated run history is a blocker, never permission to edit evidence.
 The origin uses the existing task ID with `resume`; it does not rebind IDs or
 resubmit an old report to refresh its timestamp. Parent-owned finish stays with
 the parent after the executor's actual terminal return.
+
+Implementation delivery and quality review are distinct. A pre-execution
+`task_role=quality_review` or `functional_tests` on a validation task requires
+`review_target` bound to the original implementation/report/request/HEAD. An
+optional quality review without an opinion does not require human approval to
+save verified implementation memory/release its reservation. Mandatory functional
+negatives, unknown role/scope, live work and incomplete history still block.
+Product review runs in the official `Product review (exact HEAD)` CI check;
+remote required checks/reviews and unresolved quality findings gate integration.
+No provider refusal is waived and no redispatch is authorized by delivery.
+Use the same task ID with diagnose-review/resume after the official runtime
+upgrade; never retrofit roles or rewrite negative reports. See
+`docs/AUTOMATED_REVIEW_ACCEPTANCE.md` for precise recovery limits.

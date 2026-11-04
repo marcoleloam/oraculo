@@ -99,7 +99,7 @@ PHASES = {
 
 
 BLOCKERS = {
-    "terminal_descendant_review_required": "Todos os descendentes terminaram, mas falta parecer válido para um resultado sem sucesso.",
+    "terminal_descendant_review_required": "Descendente terminou sem sucesso; faltam papel/alvo originais ou prova funcional para separar entrega e revisão.",
     "thread_children_pending_or_unknown": "Há descendente ativo ou cujo término ainda não foi comprovado.",
     "memory_write_unconfirmed": "O salvamento da memória ainda não foi confirmado.",
     "terminal_execution_unproven": "O término da execução ainda não foi comprovado.",

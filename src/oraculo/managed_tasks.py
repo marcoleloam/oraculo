@@ -225,6 +225,9 @@ class ManagedTasks:
                     return {"state": "not_work", "created": False}
                 if payload.get("deliverable_kind", "implementation") not in KINDS:
                     raise StateError("invalid_deliverable_kind")
+                from oraculo.delivery_review import DeliveryReview
+
+                DeliveryReview(self).start_role(payload, actor)
                 text = payload.get("text")
                 if not isinstance(text, str) or not text.strip() or len(text) > 32000:
                     raise StateError("task_brief_required")
@@ -553,6 +556,10 @@ class ManagedTasks:
             requested_base + "^{commit}",
             error="invalid_base_ref",
         )
+        if req.get("task_role") in {"quality_review", "functional_tests"} and (
+            req.get("review_target", {}).get("commit") != base_sha
+        ):
+            raise StateError("validation_role_base_mismatch")
         plan = dict(
             project=project,
             ws=ws,
@@ -651,6 +658,11 @@ class ManagedTasks:
                 "plan_approved",
                 "validation_ready",
             }:
+                delivery = task.get("delivery_review") or {}
+                if delivery.get("mandatory_validations") or delivery.get(
+                    "quality_reviews"
+                ):
+                    await self._execution_gate(task)
                 return
             report = task.get("submitted_report") or task.get("report")
             if report:
@@ -1614,6 +1626,9 @@ class ManagedTasks:
             from oraculo.review_adjudication import ReviewAdjudication
 
             await ReviewAdjudication(self).gate(task, snapshot)
+            from oraculo.delivery_review import DeliveryReview
+
+            await DeliveryReview(self).gate(task, snapshot)
             self._successful_snapshot(task, snapshot)
         chain = self._terminal_snapshot(
             task, snapshot, workspace_required=workspace_required
@@ -1674,8 +1689,10 @@ class ManagedTasks:
         """Keep host truth intact when the latest request never executed."""
         thread = snapshot["thread"]
         audit = task.get("origin_completion")
-        if snapshot.get("childrenSuccessful") is not True and not task.get(
-            "review_adjudication"
+        if (
+            snapshot.get("childrenSuccessful") is not True
+            and not task.get("review_adjudication")
+            and not snapshot.get("deliveryReview")
         ):
             reason = (
                 "terminal_descendant_review_required"
@@ -1729,6 +1746,15 @@ class ManagedTasks:
             from oraculo.review_adjudication import ReviewAdjudication
 
             await ReviewAdjudication(self).gate(task, snapshot)
+            from oraculo.delivery_review import DeliveryReview
+
+            await DeliveryReview(self).gate(
+                dict(
+                    task,
+                    report=report or task.get("report") or task.get("submitted_report"),
+                ),
+                snapshot,
+            )
             self._successful_snapshot(task, snapshot)
         chain = terminal_chain(snapshot)
         original = next(r for r in chain if r["runId"] == task["child"]["childRunId"])
@@ -1815,6 +1841,18 @@ class ManagedTasks:
                     )
             if task["work_status"] != "succeeded":
                 raise StateError("work_not_successful")
+            delivery = task.get("delivery_review") or {}
+            if delivery.get("mandatory_validations") or delivery.get("quality_reviews"):
+                await self._execution_gate(task)
+                if task["phase"] == "blocked" and not task.get("publication"):
+                    self.store.update(
+                        task_id,
+                        self._certified_phase(task),
+                        {
+                            "delivery_evidence_revalidated": True,
+                            "memory_cycle_id": task["memory"]["id"],
+                        },
+                    )
             return
         kind, failed = await self._prevalidate_report(task, report)
         for field in ("report", "submitted_report"):
@@ -1876,6 +1914,11 @@ class ManagedTasks:
             work_status=status,
             deliverable_kind=kind,
             approval_state="pending" if kind == "plan" else "not_required",
+            **(
+                {"delivery_review": snapshot["deliveryReview"]}
+                if snapshot.get("deliveryReview")
+                else {}
+            ),
         )
         cycle = (
             task["memory"]
@@ -2210,6 +2253,9 @@ class ManagedTasks:
         )
         if not self._saved(saved):
             raise StateError("pr_memory_write_unconfirmed")
+        # Linking and memory writes yield to other work. Retain the PR receipt,
+        # but do not mark it ready with edited review evidence or new execution.
+        await self._execution_gate(self.store.get(task_id))
         if pr["state"] == "merged" and spec.get("reconcile_only") is True:
             self.store.update(
                 task_id,
