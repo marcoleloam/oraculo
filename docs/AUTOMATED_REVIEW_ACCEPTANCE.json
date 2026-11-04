@@ -9,7 +9,8 @@
     "tests/test_pr_lifecycle.py",
     "tests/test_nested_delivery_review.py",
     "tests/test_ci_round_memory.py",
-    "tests/test_azure_task_closure.py"
+    "tests/test_azure_task_closure.py",
+    "tests/test_legacy_delivery.py"
   ],
   "scenarios": [
     {
@@ -61,10 +62,35 @@
       "id": "nested_scope",
       "requirement": "Recursive implementation/review/test trees bind each review to its real delivered owner; reject swapped/outside owners, stale scope and nested functional negatives",
       "test_prefix": "test_nested_"
+    },
+    {
+      "id": "legacy_delivery",
+      "requirement": "Explicit post-execution automated origin policy recovers legacy delivery at a later HEAD through API/CLI with original failed/saved receipt unchanged, no invented preexecution role or technical approval",
+      "test_prefix": "test_legacy_delivery_journey_"
+    },
+    {
+      "id": "legacy_negative",
+      "requirement": "Original functional/technical negatives, ambiguous scope and incomplete authentic operational proof remain blocking despite green final checks",
+      "test_prefix": "test_legacy_delivery_original_negative_"
+    },
+    {
+      "id": "legacy_freshness",
+      "requirement": "Fresh HEAD/log/run/history/request/memory gates before, during and after memory prohibit stale release and cached reuse",
+      "test_prefix": "test_legacy_delivery_fresh_gates_"
+    },
+    {
+      "id": "legacy_origin",
+      "requirement": "Only the real origin may append the current policy; artifact swaps, bounds, conflicting replay and older daemon fail closed",
+      "test_prefix": "test_legacy_delivery_rejects_"
+    },
+    {
+      "id": "legacy_historical_stream",
+      "requirement": "Original official transport stream remains a historical control artifact, distinct from fresh caller-bound terminal corroboration; reject mixed/truncated/hidden/functional data and missing/incoherent current host proof without changing failed/saved originals",
+      "test_prefix": "test_legacy_stream_"
     }
   ],
   "full_autonomy_gaps": [
     "Provider/publisher ports are synthetic in local evaluation; live remote CI and branch protection observations require actual PR receipts.",
-    "No automatic provider redispatch, runtime activation or live independent semantic review is performed or certified. Existing tasks without pre-execution role/target metadata require adequate evidence; no semantic reclassification of private legacy tasks."
+    "No automatic provider redispatch, runtime activation or live independent semantic review is performed or certified. Legacy recovery is a current origin policy with original canonical operational receipts; missing evidence blocks and no historical role or final-HEAD review is inferred."
   ]
 }

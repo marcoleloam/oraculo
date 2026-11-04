@@ -337,6 +337,16 @@ class ManagedService:
 async def command(config, action, payload, transport):
     from oraculo.cli import make_envelope, request
 
+    if action in {"diagnose-delivery", "recover-delivery"}:
+        capabilities = await request(
+            config, make_envelope("managed.capabilities", "*", {})
+        )
+        if (
+            not capabilities.get("ok")
+            or capabilities.get("data", {}).get("protocol_version") != PROTOCOL_VERSION
+            or capabilities.get("data", {}).get("legacy_delivery_recovery") is not True
+        ):
+            raise StateError("legacy_delivery_service_upgrade_required")
     if action in {"list", "status", "history"}:
         result = await request(
             config,

@@ -189,3 +189,27 @@ No provider refusal is waived and no redispatch is authorized by delivery.
 Use the same task ID with diagnose-review/resume after the official runtime
 upgrade; never retrofit roles or rewrite negative reports. See
 `docs/AUTOMATED_REVIEW_ACCEPTANCE.md` for precise recovery limits.
+
+For legacy delivery blocked by an unclassified interrupted native descendant,
+use `task diagnose-delivery` from the real original origin. It validates canonical
+reports and original operational receipts, returning eligibility and concrete
+missing evidence. An empty implementation_checks before that gate is unknown,
+not a test failure. With adequate proof, `task recover-delivery` appends an explicit
+`post_execution_delivery_policy_v1` automated origin decision via a private digest-
+bound artifact. See `docs/MANAGED_TASKS.md` for the exact contract. Never backfill
+role/target metadata or claim a human/final-HEAD review. A host label or rationale
+alone cannot waive functional/technical negatives. Reuse the same intent on lost
+response; old daemons must advertise `legacy_delivery_recovery=true`. Memory and
+fresh execution/evidence gates remain mandatory. Recovery does not authorize
+provider redispatch, publication, merge or activation; pending auto-publication
+is suspended and external lifecycle steps retain separate receipts.
+
+An original legacy host proof can be the official stdio control stream rather
+than a task_status JSON receipt. Preserve its bytes and digest. Only the strict
+known stream grammar with matching canonical event history is supported; it is
+explicitly historical control evidence, not a terminal response. Terminal
+corroboration must be obtained now by the caller-bound service for the original
+execution and labelled post-execution. Never extract a JSON substring, substitute
+a fresh log for the old check, or claim a running launch receipt was terminal.
+Neither transport grammar nor current terminality proves semantic operational
+scope; original technical/functional negatives remain blocking.

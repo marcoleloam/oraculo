@@ -170,6 +170,8 @@ def parser() -> argparse.ArgumentParser:
             "recover-report",
             "diagnose-review",
             "adjudicate-review",
+            "diagnose-delivery",
+            "recover-delivery",
             "complete-origin",
             "supersede",
             "recover-report-bootstrap",
@@ -1047,6 +1049,12 @@ def main(argv: list[str] | None = None) -> int:
                     "data", {}
                 ).get("invalid_report_recovery"):
                     raise StateError("report_recovery_service_upgrade_required")
+                if (
+                    args.action in {"diagnose-delivery", "recover-delivery"}
+                    and capabilities.get("data", {}).get("legacy_delivery_recovery")
+                    is not True
+                ):
+                    raise StateError("legacy_delivery_service_upgrade_required")
                 if (
                     args.action in {"diagnose-review", "adjudicate-review"}
                     and capabilities.get("data", {}).get("terminal_review_adjudication")
