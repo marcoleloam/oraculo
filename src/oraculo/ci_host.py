@@ -70,6 +70,63 @@ def github_ci(lifecycle, binding, cwd, managed_policy=None):
 
     pull = read(f"/pulls/{binding.pr}")
     run = read(f"/actions/runs/{binding.run}")
+    association_endpoint = f"repos/{repo}/commits/{binding.head}/pulls?per_page=100"
+    associated, associations = None, {}
+
+    def associate(linked_run):
+        nonlocal associated
+        rows = linked_run.get("pull_requests", [])
+        if not isinstance(rows, list) or any(
+            not isinstance(p, dict) or type(p.get("number")) is not int for p in rows
+        ):
+            reader.fail("ci_run_pr_association_invalid")
+        source = "workflow_run_pull_requests"
+        if rows:
+            # A conflicting nonempty host relation must never use the fallback.
+            if len(rows) != 1 or rows[0]["number"] != binding.pr:
+                reader.fail("ci_host_binding_mismatch")
+        else:
+            # Only the observed pull_request execution shape is supported. A
+            # green push/dispatch or unknown event cannot prove this PR's CI.
+            if linked_run.get("event") != "pull_request":
+                reader.fail("ci_run_pr_association_unproven")
+            if associated is None:
+                associated, _ = reader.read(association_endpoint)
+            if not isinstance(associated, list) or len(associated) >= 100:
+                reader.fail("ci_commit_pr_association_invalid_or_truncated")
+            if len(associated) != 1:
+                reader.fail("ci_commit_pr_association_unproven")
+            relation = associated[0]
+            if (
+                not isinstance(relation, dict)
+                or type(relation.get("number")) is not int
+                or not isinstance(relation.get("head"), dict)
+                or not isinstance(relation.get("base"), dict)
+                or not isinstance(relation["base"].get("repo"), dict)
+                or not isinstance(relation["base"]["repo"].get("full_name"), str)
+                or not isinstance(relation.get("state"), str)
+            ):
+                reader.fail("ci_commit_pr_association_invalid_or_truncated")
+            if (
+                relation["number"] != binding.pr
+                or relation["head"].get("sha") != binding.head
+                or relation["base"].get("ref") != pull["base"]["ref"]
+                or relation["base"]["repo"]["full_name"].lower() != repo.lower()
+                or relation.get("state") not in {"open", "closed"}
+                or relation["state"] != pull.get("state")
+            ):
+                reader.fail("ci_host_binding_mismatch")
+            source = "commit_associated_pull_requests"
+        associations[str(linked_run["id"])] = dict(
+            source=source,
+            repository=repo,
+            pr=binding.pr,
+            head=binding.head,
+            base=pull["base"]["ref"],
+            suite=linked_run.get("check_suite_id"),
+            attempt=linked_run.get("run_attempt"),
+        )
+
     if (
         pull.get("number") != binding.pr
         or (pull.get("head") or {}).get("sha") != binding.head
@@ -80,9 +137,9 @@ def github_ci(lifecycle, binding, cwd, managed_policy=None):
         or run.get("head_sha") != binding.head
         or run.get("run_attempt") != binding.attempt
         or (run.get("repository") or {}).get("full_name", "").lower() != repo.lower()
-        or not any(p.get("number") == binding.pr for p in run.get("pull_requests", []))
     ):
         raise StateError("ci_host_binding_mismatch")
+    associate(run)
     base = pull["base"]["ref"]
     policy = github_policy(runner, repo, base, binding.head, cwd, managed_policy)
     pr = dict(
@@ -135,24 +192,23 @@ def github_ci(lifecycle, binding, cwd, managed_policy=None):
         key = str(candidate["id"])
         fresh_run = run if key == binding.run else read(f"/actions/runs/{key}")
         if (
-            fresh_run.get("head_sha") != binding.head
+            str(fresh_run.get("id")) != key
+            or fresh_run.get("head_sha") != binding.head
             or fresh_run.get("check_suite_id") != suite
             or (fresh_run.get("repository") or {}).get("full_name", "").lower()
             != repo.lower()
-            or not any(
-                p.get("number") == binding.pr
-                for p in fresh_run.get("pull_requests", [])
-            )
             or type(fresh_run.get("run_attempt")) is not int
             or fresh_run.get("run_attempt") != candidate.get("run_attempt")
         ):
             raise StateError("ci_host_binding_mismatch")
+        associate(fresh_run)
         linked[key] = fresh_run
-    observed_jobs, check_bindings = [], []
+    observed_jobs, check_bindings, job_snapshots = [], [], {}
     passed = set(c["name"] for c in required) == set(policy["required_checks"])
     for run_id, linked_run in linked.items():
         attempt = linked_run["run_attempt"]
         jobs = read(f"/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
+        job_snapshots[run_id] = jobs
         rows = jobs.get("jobs")
         if (
             not isinstance(rows, list)
@@ -255,6 +311,18 @@ def github_ci(lifecycle, binding, cwd, managed_policy=None):
         or any(read(f"/actions/runs/{k}") != v for k, v in linked.items())
         or read(f"/commits/{binding.head}/check-runs?filter=latest&per_page=100")
         != checks
+        or read(f"/actions/runs?head_sha={binding.head}&per_page=100") != runs
+        or any(
+            read(
+                f"/actions/runs/{k}/attempts/{linked[k]['run_attempt']}/jobs?per_page=100"
+            )
+            != v
+            for k, v in job_snapshots.items()
+        )
+        or (
+            associated is not None
+            and reader.read(association_endpoint)[0] != associated
+        )
         or github_policy(runner, repo, base, binding.head, cwd, managed_policy)
         != policy
     ):
@@ -277,6 +345,10 @@ def github_ci(lifecycle, binding, cwd, managed_policy=None):
         required_checks_hash=content_hash(checks),
         runs=observed_jobs,
         check_bindings=sorted(check_bindings, key=lambda c: c["name"]),
+        run_pr_associations=associations,
+        association_observations=[
+            o for o in reader.observations if o["endpoint"] == association_endpoint
+        ],
         run_hash=content_hash(run),
         pull_hash=content_hash(pull),
         source="authenticated_gh_api",

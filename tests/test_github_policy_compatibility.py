@@ -426,8 +426,9 @@ class ManagedPolicyHost(PolicyHost):
 
 @pytest.mark.parametrize("entrypoint", ["api", "cli"])
 @pytest.mark.parametrize("historical", [False, True])
+@pytest.mark.parametrize("run_association", ["native", "commit"])
 async def test_github_policy_compatibility_journey(
-    flow, monkeypatch, tmp_path, entrypoint, historical
+    flow, monkeypatch, tmp_path, entrypoint, historical, run_association
 ):
     from test_ci_round_memory import setup as managed_setup
     from test_stdio_fifo import run_cli_fifo
@@ -441,6 +442,11 @@ async def test_github_policy_compatibility_journey(
     policy["method"] = "merge"
     # A read-only observation uses the existing immutable policy; no new merge intent.
     lifecycle = RepositoryPRLifecycle(host)
+    if run_association == "commit":
+        from test_github_run_association import AssociationTransport
+
+        host.pr_number = 12
+        lifecycle.runner = AssociationTransport(host)
     monkeypatch.setattr("oraculo.pr_lifecycle.RepositoryPRLifecycle", lambda: lifecycle)
     store = flow.service.managed_service.store
     before = copy.deepcopy(store.get(task["id"]))
@@ -500,6 +506,13 @@ async def test_github_policy_compatibility_journey(
     current = store.get(task["id"])
     round1 = current["ci_rounds"][0]
     assert round1["memory"]["write_receipt"]["state"] == "confirmed"
+    if run_association == "commit":
+        saved_proof = round1["report"]["evidence"]["execution"]["evidence"]
+        assert saved_proof["association_observations"]
+        assert all(
+            p["source"] == "commit_associated_pull_requests"
+            for p in saved_proof["run_pr_associations"].values()
+        )
     assert len(round1["facts"]["check_bindings"]) == len(policy["required_checks"])
     assert round1["facts"]["identity"].get("observation_timing") == (
         "after_external_merge" if historical else None

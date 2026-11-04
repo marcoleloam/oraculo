@@ -37,6 +37,8 @@ def _metadata_projection(endpoint):
         return "{sha,parents:[.parents[]? | {sha}]}"
     if "/compare/" in endpoint:
         return "{status,merge_base_commit:{sha:.merge_base_commit.sha}}"
+    if re.search(r"/commits/[^/?]+/pulls\?per_page=100$", endpoint):
+        return 'if type == "array" then map({number,head:{sha:.head.sha},base:{ref:.base.ref,repo:{full_name:.base.repo.full_name}},state}) else {invalid_type:type} end'
     if re.search(r"/pulls/\d+$", endpoint):
         return "{number,head:{sha:.head.sha},base:{sha:.base.sha,ref:.base.ref,repo:{full_name:.base.repo.full_name}},state,mergeable,merged,merge_commit_sha,merged_at}"
     if re.search(r"/pulls/\d+/reviews\?", endpoint):
@@ -48,7 +50,7 @@ def _metadata_projection(endpoint):
     if "/actions/runs?" in endpoint:
         return "{total_count,workflow_runs:[.workflow_runs[] | {id,check_suite_id,run_attempt}]}"
     if re.search(r"/actions/runs/\d+$", endpoint):
-        return "{id,check_suite_id,head_sha,run_attempt,repository:{full_name:.repository.full_name},pull_requests:[.pull_requests[] | {number}],updated_at,status,conclusion}"
+        return '{id,check_suite_id,head_sha,run_attempt,event,repository:{full_name:.repository.full_name},updated_at,status,conclusion} + (if has("pull_requests") then {pull_requests:(.pull_requests | if type == "array" then map({number}) else {invalid_type:type} end)} else {} end)'
     if "/jobs?" in endpoint:
         return "{total_count,jobs:[.jobs[] | {id,name,status,conclusion,head_sha,run_id,run_attempt,check_run_url} | with_entries(select(.value != null))]}"
     return None

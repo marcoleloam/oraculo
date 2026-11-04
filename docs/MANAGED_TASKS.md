@@ -1165,6 +1165,20 @@ O adaptador confirma via REST a mesma PR, repositório/base/HEAD, `merged=true`,
 commit e instante reais de merge; para merge comum confirma o HEAD original como
 pai e ancestral do merge, e confirma o merge como ancestral da base atual.
 CI ainda disponível é reobservada com os IDs reais.
+Quando `run.pull_requests` está ausente ou vazio, somente runs com evento
+`pull_request` podem usar a associação autenticada
+[`commits/{head}/pulls`](https://docs.github.com/en/rest/commits/commits#list-pull-requests-associated-with-a-commit).
+Uma página limitada a 100 itens deve conter exatamente uma PR com número,
+repositório, HEAD, branch de destino e estado iguais à PR observada. Página cheia,
+múltiplas relações, resposta malformada ou relação ausente bloqueiam; associação
+não vazia conflitante nunca usa essa alternativa. Push/dispatch/target sem relação
+explícita permanecem não suportados. A relação não substitui a prova real de
+check run, app, suite, workflow run, tentativa e job nem os pisos de revisão.
+As projeções `gh --jq` excluem corpos/patches na fronteira do processo; a relação
+e suas leituras ficam na evidência privada da rodada canônica. Relação, runs,
+checks e jobs são relidos antes de aceitar a observação; os mesmos gates são
+aplicados após memória e no settlement. Não há novo payload nem bypass:
+repita `pr-check` do ID original na origem após corrigir o bloqueio.
 A rodada canônica recebe `after_external_merge` e o SHA de merge: **não** afirma
 que a memória precedeu o merge externo, nem que Oráculo o emitiu. Se CI/revisões
 exigidas não puderem ser confirmadas, a recuperação fica bloqueada, preservando
@@ -1225,3 +1239,27 @@ checks/jobs exigidos visíveis terminaram com sucesso. Pendência não cria roda
 terminal; falha/cancelamento registra avaliação CI negativa, preservando os
 resultados reais dos checks e do workflow. A revalidação compara também a
 conclusão da execução; não se converte um resultado negativo em passe.
+
+### Follow-up posterior à entrega certificada
+
+Uma nova execução na mesma conversa certificada continua sendo mudança de
+execução. `thread_changed_since_authorization`/`execution_changed_after_validation`
+não são resolvidos por HEAD limpo, título informativo ou declaração da origem
+sobre ausência de efeitos. O pedido, relatório, `completion_evidence`, run
+original e memória confirmada permanecem imutáveis. Não há neste fluxo aceitação
+pós-certificação que autorize publicar o artefato anterior após um follow-up.
+
+Uma eventual aceitação separada exigiria prova positiva, completa e atribuída ao
+run de todas as ferramentas/efeitos, cadeia original como prefixo exato,
+descendentes/questões ausentes e revalidação do artefato/checks/logs/memória em
+cada gate. O contrato atual de timeline paginada não atesta essa cobertura de
+execução; texto de conversa e runs terminais não a substituem. Sem essa prova,
+o bloqueio permanece; não se recertifica nem se ignora silenciosamente o run novo.
+
+O bridge aceita catálogos modernos de opções `{id,values,default}` e o formato
+legado tipado. `inheritedOptions: null` e opções de modelo ausentes/nulas são
+preservados literalmente, sem inventar catálogo ou reescrever o ACK. Valores
+malformados, defaults incoerentes e os guards do formato legado continuam
+bloqueados. CLI e helper de ACK precisam usar a mesma versão compatível; quando
+a instalação for anterior, execute ambos por `uv run --frozen python -B -m
+oraculo` no checkout validado, sem alterar o serviço instalado.

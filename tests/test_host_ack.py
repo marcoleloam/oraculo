@@ -115,6 +115,22 @@ def test_modern_capability_catalog_rejects_unproven_options(values, default):
         make_ack(frame("orchestrator_capabilities"), json.dumps(value).encode())
 
 
+@pytest.mark.parametrize("model_options", ["omitted", "null", "catalog"])
+def test_modern_nullable_capability_options_roundtrip_is_literal(model_options):
+    value = capabilities()
+    value["inheritedOptions"] = None
+    value["future_catalog_field"] = {"retained": True}
+    model = value["providers"][0]["models"][0]
+    if model_options == "omitted":
+        del model["options"]
+    elif model_options == "null":
+        model["options"] = None
+    else:
+        model["options"] = [dict(id="effort", values=["high"], default="high")]
+    f = frame("orchestrator_capabilities")
+    assert decode_ack(f, make_ack(f, json.dumps(value).encode())) == value
+
+
 def test_literal_compression_roundtrip_preserves_all_options_and_unknown_fields(
     tmp_path, capsys
 ):

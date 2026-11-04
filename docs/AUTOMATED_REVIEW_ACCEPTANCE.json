@@ -11,7 +11,9 @@
     "tests/test_ci_round_memory.py",
     "tests/test_azure_task_closure.py",
     "tests/test_legacy_delivery.py",
-    "tests/test_github_policy_compatibility.py"
+    "tests/test_github_policy_compatibility.py",
+    "tests/test_github_run_association.py",
+    "tests/test_host_ack.py"
   ],
   "scenarios": [
     {
@@ -128,6 +130,16 @@
       "id": "github_workflow_outcome",
       "requirement": "Green check rollup never waives an authenticated pending/failed/cancelled workflow: API/CLI must emit zero merges/intents, keep delivery unchanged and record honest workflow-negative canonical CI memory",
       "test_prefix": "test_github_policy_compatibility_green_checks_do_not_waive_workflow_outcome"
+    },
+    {
+      "id": "github_run_association",
+      "requirement": "Empty or absent workflow PR relations require bounded authenticated exact commit association and unchanged execution graph; conflicting, ambiguous, malformed or changing relationships block, including API/CLI canonical memory and replay after external merge.",
+      "test_prefix": "test_github_run_association_"
+    },
+    {
+      "id": "literal_modern_bridge",
+      "requirement": "Literal modern and legacy capability ACKs preserve nullable inherited/model options and unknown fields; malformed catalogs remain blocked without normalization.",
+      "test_prefix": "test_modern_"
     }
   ],
   "full_autonomy_gaps": [

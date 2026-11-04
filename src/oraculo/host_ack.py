@@ -85,9 +85,9 @@ class HostResults:
             modern = "inheritedOptions" in value
             if modern:
                 inherited = value["inheritedOptions"]
-                if not isinstance(inherited, list):
+                if inherited is not None and not isinstance(inherited, list):
                     raise StateError("native_bridge_model_options_unproven")
-                for option in inherited:
+                for option in inherited or []:
                     required(option, ("id", "value"))
                     if not isinstance(option["id"], str) or type(
                         option["value"]
@@ -139,9 +139,9 @@ class HostResults:
                 if not isinstance(provider["constraints"], list):
                     raise StateError("native_bridge_result_incomplete")
                 for model in provider["models"]:
-                    if modern and "options" not in model:
+                    if modern and model.get("options") is None:
                         required(model, ("id",))
-                        continue  # Preserve omission; never invent an option catalog.
+                        continue  # Preserve null/omission; never invent a catalog.
                     required(model, ("id", "options"))
                     if not isinstance(model["options"], list):
                         raise StateError("native_bridge_model_options_unproven")
