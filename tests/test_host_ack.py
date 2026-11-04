@@ -85,6 +85,36 @@ def capabilities():
     )
 
 
+@pytest.mark.parametrize(
+    "options", [[dict(id="effort", values=["low", "high"], default="low")], None]
+)
+def test_modern_capability_catalog_roundtrip_is_literal(options):
+    value = capabilities()
+    value["inheritedOptions"] = [dict(id="effort", value="high")]
+    model = value["providers"][0]["models"][0]
+    if options is None:
+        del model["options"]
+    else:
+        model["options"] = options
+    raw = json.dumps(value).encode()
+    f = frame("orchestrator_capabilities")
+    assert decode_ack(f, make_ack(f, raw)) == value
+
+
+@pytest.mark.parametrize(
+    "values,default",
+    [([], None), (["high", "high"], None), ([{}], None), (["high"], "missing")],
+)
+def test_modern_capability_catalog_rejects_unproven_options(values, default):
+    value = capabilities()
+    value["inheritedOptions"] = []
+    value["providers"][0]["models"][0]["options"] = [
+        dict(id="effort", values=values, default=default)
+    ]
+    with pytest.raises(StateError):
+        make_ack(frame("orchestrator_capabilities"), json.dumps(value).encode())
+
+
 def test_literal_compression_roundtrip_preserves_all_options_and_unknown_fields(
     tmp_path, capsys
 ):

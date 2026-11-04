@@ -82,6 +82,17 @@ class HostResults:
     def _validate(self, tool, args, result):
         value = unwrap(result)
         if tool == "orchestrator_capabilities":
+            modern = "inheritedOptions" in value
+            if modern:
+                inherited = value["inheritedOptions"]
+                if not isinstance(inherited, list):
+                    raise StateError("native_bridge_model_options_unproven")
+                for option in inherited:
+                    required(option, ("id", "value"))
+                    if not isinstance(option["id"], str) or type(
+                        option["value"]
+                    ) not in (str, bool):
+                        raise StateError("native_bridge_model_options_unproven")
             required(
                 value,
                 (
@@ -128,10 +139,32 @@ class HostResults:
                 if not isinstance(provider["constraints"], list):
                     raise StateError("native_bridge_result_incomplete")
                 for model in provider["models"]:
+                    if modern and "options" not in model:
+                        required(model, ("id",))
+                        continue  # Preserve omission; never invent an option catalog.
                     required(model, ("id", "options"))
                     if not isinstance(model["options"], list):
                         raise StateError("native_bridge_model_options_unproven")
                     for option in model["options"]:
+                        if modern and "type" not in option:
+                            required(option, ("id", "values"))
+                            choices = option["values"]
+                            if (
+                                not isinstance(choices, list)
+                                or not choices
+                                or any(type(c) not in (str, bool) for c in choices)
+                                or len({(type(c), c) for c in choices}) != len(choices)
+                            ):
+                                raise StateError("native_bridge_model_options_unproven")
+                            if option.get("default") is not None and not any(
+                                type(option["default"]) is type(c)
+                                and option["default"] == c
+                                for c in choices
+                            ):
+                                raise StateError(
+                                    "native_bridge_model_options_incoherent"
+                                )
+                            continue
                         required(option, ("id", "type"))
                         if option["type"] == "select":
                             required(option, ("options",))
