@@ -1,7 +1,7 @@
 """Implementation delivery is distinct from quality review and PR integration.
 
-Only an immutable, pre-execution role/target can identify optional quality
-review. A terminal status or free-form explanation cannot classify a failed
+Pre-execution roles and explicit post-execution legacy policy are distinct
+provenance. A terminal status or free-form explanation cannot classify a failed
 functional test as review. No provider operation is performed here.
 """
 
@@ -38,6 +38,8 @@ def check_log(task, check):
         raise StateError("implementation_test_proof_required")
     try:
         path = Path(check["proof"])
+        if not path.is_file() or path.stat().st_size > 16777216:
+            raise StateError("implementation_test_proof_required")
         with path.open("rb") as stream:
             raw = stream.read(16777217)
         digest = hashlib.sha256(raw).hexdigest()
@@ -174,6 +176,9 @@ class DeliveryReview:
 
     async def observe(self, task, snapshot, *, enforce=True):
         bound = descendant_binding(snapshot)  # liveness/history never optional
+        from oraculo.legacy_delivery import LegacyDeliveryRecovery
+
+        legacy = await LegacyDeliveryRecovery(self.engine).gate(task, snapshot)
         # Per-observation only. Nested gates share this cache to avoid repeated
         # subtree validation; a fresh post-memory snapshot starts a new cache.
         snapshot.setdefault("_deliveryScopeProofs", {})
@@ -360,6 +365,8 @@ class DeliveryReview:
                         checks=[check_log(child, c) for c in report["checks"]],
                     )
                 )
+            elif descendant["thread_id"] in legacy:
+                reviews.append(legacy[descendant["thread_id"]])
             elif descendant["status"] != "completed":
                 unknown.append(descendant["thread_id"])
             elif negative:

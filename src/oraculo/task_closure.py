@@ -115,6 +115,8 @@ class TaskClosure:
         task = self.store.get(task_id)
         require_implementation(task)
         self._requirements(task, integration=False)
+        if task.get("legacy_delivery_decision"):
+            await self.engine._execution_gate(task)
         rounds = CIRoundMemory(self.engine)
         await rounds.flush(task_id)
         task = self.store.get(task_id)

@@ -967,3 +967,129 @@ páginas SQLite/WAL nem tráfego total do protocolo. O lote custa trabalho local
 linear para classificar eventos, com consultas e uma gravação de disposição por
 item; continua retendo toda auditoria e não promete redução de armazenamento para
 todo tamanho de tarefa. Tempos de uma fixture local sem rede não são SLA de T3.
+
+### Recuperação legada da entrega por decisão posterior
+
+`managed.capabilities.legacy_delivery_recovery=true` identifica este contrato.
+CLI novo recusa daemon anterior com `legacy_delivery_service_upgrade_required`.
+A origem real usa `task diagnose-delivery --file payload.json`, com
+`{"task_id":"<ID existente>"}`. O serviço lê requests/reports canônicos privados,
+sem concluir que estão ausentes por não aparecerem no status resumido. O diagnóstico
+não altera a tarefa nem coleta código para outro provedor. `eligible=false` traz
+`missing_evidence` com o gate concreto que faltou; isso não é falha dos testes da
+implementação se seus logs ainda não foram coletados.
+
+Quando elegível, `legacy_delivery_diagnosis.evidence` contém o vínculo completo a
+request/report/HEAD atuais, workspace, base, origem, execução e descendentes,
+checks/logs, bases históricas e memória negativa confirmada. A origem escreve um
+JSON **privado fora dos checkouts** com exatamente:
+
+```json
+{
+  "kind": "post_execution_delivery_policy_v1",
+  "author": "automated_origin",
+  "scope": "implementation_delivery_only",
+  "evidence": "COPIAR O OBJETO evidence INTEGRAL, sem editar vínculos",
+  "dispositions": [{
+    "task_id": "<ID do descendente interrompido>",
+    "scope": "host_interruption_only_no_technical_verdict",
+    "rationale": "Decisão atual da origem sobre o escopo comprovado; sem aprovação técnica.",
+    "failed_checks": [{
+      "index": 0,
+      "check_sha256": "<digest do check original>",
+      "log_sha256": "<digest do log original>"
+    }]
+  }]
+}
+```
+
+`evidence` acima é um objeto, não a string explicativa do exemplo. Cada interrupção
+e cada check original failed exigem disposição explícita, na ordem do diagnóstico.
+Execute `task recover-delivery --file decision-request.json` com:
+
+```json
+{
+  "task_id": "<mesma implementação>",
+  "reason": "Aplicar a política atual de entrega versus integração após execução",
+  "decision": {"path": "/private/evidence/delivery-policy.json", "sha256": "<SHA256 dos bytes>"}
+}
+```
+
+O serviço acrescenta um único `legacy_delivery_decision` com ator/run atual,
+data, razão, documento, snapshot host original e hash do relatório. O registro é
+imutável por este lifecycle; repetição exata revalida provas sem outro audit ou
+outra memória; intenção conflitante é recusada. Não modifica `task_role`,
+`review_target`, request/report/run/memória anteriores ou o resultado failed do
+filho. A apresentação pública omite documento e logs privados. A decisão não é
+atestação humana, papel preexecution nem revisão da implementação no HEAD final.
+`review_approved`, `integration_authorized`, `activation_authorized` e
+`provider_redispatch_permitted` permanecem false.
+
+O caminho é deliberadamente limitado a implementação legada positiva e filhos
+nativos diretos sem role/target preexecution, com base histórica igual ou ancestral do HEAD final. A igualdade não
+representa aprovação: final_head_reviewed permanece false em ambos os casos. Exige cadeia host completa, relacionamento canônico,
+relatório original negativo apenas de checks host, sem verdict/achados técnicos,
+recibo estruturado original correspondente a cada check, execução original
+confirmada e memória failed/saved com digest reconstruído do relatório original.
+Efeitos no checkout do descendente, continuação sem escopo operacional comprovado,
+FAIL técnico/funcional, ambiguidades, histórico ausente/truncado ou evidência
+indisponível bloqueiam. Não existe regra “todo filho terminal passa”, nem aceitação
+de rótulo host, título, texto de recusa ou rationale como prova suficiente.
+
+Logs privados devem ser arquivos regulares, com limite de 16 MiB por check;
+decisão tem limite de 512 KiB. Paths relativos, diretórios e symlinks para dentro
+dos checkouts são recusados. Hashes fixam os bytes no primeiro aceite. A fronteira
+de confiança continua sendo operador local, produtores dos relatórios/logs
+originais, serviço de memória e bridge caller-bound: não há assinatura externa
+nem prova criptográfica contra um operador que fabrica evidência autoconsistente
+antes do primeiro aceite. O recibo host comprova execução/status/identidades; não
+prova por si só a natureza semântica de uma tarefa ou ausência de achados. O
+relatório original e a disposição da origem são declarações atribuídas, sujeitas
+a esses limites; se não sustentam o escopo host-only, este caminho não se aplica.
+
+As mesmas provas são relidas antes e depois de memória, em resume/retry e antes
+de publicação/merge, inclusive memória confirmada atual de ambos os lados.
+Mudança durante memória preserva o audit e a memória já confirmada, bloqueando a
+liberação da reserva. Uma resposta perdida não autoriza um novo ID ou a remoção
+da decisão. Publicação automática pendente é suspensa para a recuperação legada;
+publicar exige comando explícito com vínculo seguro e recibos próprios.
+Revisão requerida, achados, CI remoto, merge e ativação continuam etapas com gates
+e recibos próprios. A recuperação não aprova cliente, não o publica/ativa e não
+reenvia conteúdo a um provedor. Testes offline com portas host sintéticas não são
+recibos de sucesso de qualquer caso privado real.
+
+#### Stream histórico de transporte e corroboração atual
+
+Um log legado oficial pode conter frames `ORACULO_HOST_CALL_V1` em linhas JSON
+canônicas, seguidos do JSON final de status managed. Esses frames são **pedidos**
+de ferramenta; stdout não contém os ACKs que vieram por stdin. Nem um frame
+`task_status`, nem o status managed, nem `launch_receipt.status=running` são
+transformados em recibo terminal histórico.
+
+O parser integral aceita a sequência conhecida de cinco consultas (capabilities,
+leitura do caller, projetos, leitura do filho e task_status), notificações JSON de
+controle vinculadas aos eventos e um único status managed final em `validating`.
+IDs, argumentos, protocolo, tempos, projeto, origem, workspaces, base, ciclo de
+memória e prefixo de eventos precisam corresponder aos registros canônicos.
+Conteúdo misto, frames desconhecidos/trocados, truncamento, chaves JSON duplicadas,
+JSON escondido em texto, HTML de notificações e stdout funcional são recusados.
+Este contrato suporta essa gramática específica; outros formatos continuam
+bloqueados com `legacy_delivery_historical_transport_unproven`.
+
+Os bytes e hashes originais permanecem intactos. A evidência é identificada como
+`historical_managed_stdio_stream_v1`, com `historical_terminal_receipt=false` e o
+status histórico de lançamento explicitamente preservado. A prova terminal usada
+na decisão é outra: `terminal_corroboration.basis=current_caller_bound_host_snapshot`,
+`temporal_scope=post_execution`, derivada da árvore host fresca obtida pelo serviço,
+com identidade/relação e cadeia completa comparadas à execução original. A origem
+não impersona o pai de um descendente para consultar seu task_status nativo.
+Ausência ou incoerência da corroboração bloqueia. O audit guarda o snapshot atual;
+nunca afirma que essa observação posterior existia antes.
+
+A gramática comprova o vínculo de controle, não uma interpretação semântica do
+trabalho. A disposição atual da origem continua atribuída e limitada pelos
+relatórios/checks originais e memória failed/saved. Technical/functional FAIL,
+achados ou efeito incerto continuam bloqueando mesmo com transporte bem formado
+e host terminal. Nenhum stream sintético dos testes é prova de elegibilidade de
+uma ocorrência privada; esta exige diagnóstico oficial pela sua origem real e
+serviço atualizado, sem alteração de relatório/log ou reenvio a provedor.

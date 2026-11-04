@@ -332,6 +332,18 @@ class ManagedTasks:
                     )
                 elif action == "recover-report":
                     await self._recover_report(task, payload, actor)
+                elif action in {"diagnose-delivery", "recover-delivery"}:
+                    from oraculo.legacy_delivery import LegacyDeliveryRecovery
+
+                    recovery = LegacyDeliveryRecovery(self)
+                    if action == "diagnose-delivery":
+                        return dict(
+                            self.store.describe(task_id),
+                            legacy_delivery_diagnosis=await recovery.diagnose(
+                                task, actor
+                            ),
+                        )
+                    await recovery.accept(task, payload, actor)
                 elif action in {"diagnose-review", "adjudicate-review"}:
                     from oraculo.task_recovery import TaskRecovery
 
@@ -672,6 +684,7 @@ class ManagedTasks:
                 )
                 if (
                     publication
+                    and not self.store.get(task_id).get("legacy_delivery_decision")
                     and deliverable_kind(self.store.get(task_id)) == "implementation"
                 ):
                     await self._publish(task_id, publication, task["origin"])
@@ -2109,7 +2122,7 @@ class ManagedTasks:
         credential_reference(spec.get("credential"))
         integration_binding(spec)
         uncertain = bool(task.get("publication_attempted") or task.get("publication"))
-        if not uncertain:
+        if not uncertain or task.get("legacy_delivery_decision"):
             await self._execution_gate(task)
         self.store.update(
             task_id,

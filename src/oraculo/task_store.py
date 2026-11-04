@@ -580,6 +580,7 @@ class TaskStore:
                 "continuation_bootstrap",
                 "origin_completion",
                 "review_adjudication",
+                "legacy_delivery_decision",
                 "delivery_review",
                 "ci_rounds",
                 "supersession",
@@ -614,6 +615,27 @@ class TaskStore:
                 if task.get("review_adjudication")
                 else None
             ),
+            "legacy_delivery_decision": (
+                {
+                    k: task["legacy_delivery_decision"][k]
+                    for k in (
+                        "basis",
+                        "actor",
+                        "at",
+                        "report_sha256",
+                        "review_approved",
+                        "integration_authorized",
+                        "provider_redispatch_permitted",
+                        "activation_authorized",
+                        "authorship",
+                        "decision_sha256",
+                        "historical_role_asserted",
+                        "final_head_reviewed",
+                    )
+                }
+                if task.get("legacy_delivery_decision")
+                else None
+            ),
             "delivery_review": (
                 {
                     "state": task["delivery_review"]["state"],
@@ -635,6 +657,16 @@ class TaskStore:
                             )
                         }
                         | {"owner_task_id": r.get("owner_task_id", task["id"])}
+                        | {
+                            k: r[k]
+                            for k in (
+                                "provenance",
+                                "historical_base",
+                                "final_head_reviewed",
+                                "historical_role_asserted",
+                            )
+                            if k in r
+                        }
                         for r in task["delivery_review"]["quality_reviews"]
                     ],
                     "scope_validations": [

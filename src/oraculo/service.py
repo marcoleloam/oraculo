@@ -1254,6 +1254,7 @@ class Service:
                     "origin_terminal_recovery": True,
                     "terminal_review_adjudication": True,
                     "delivery_review_separation": True,
+                    "legacy_delivery_recovery": True,
                     "ci_round_memory": True,
                 }
             else:
