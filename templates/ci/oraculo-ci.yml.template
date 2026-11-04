@@ -1,9 +1,7 @@
 # Export ONLY to a reviewed, sanitized public checkout. This file is inactive.
 name: Oraculo offline validation
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
