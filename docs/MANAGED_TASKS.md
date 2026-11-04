@@ -1093,3 +1093,135 @@ achados ou efeito incerto continuam bloqueando mesmo com transporte bem formado
 e host terminal. Nenhum stream sintético dos testes é prova de elegibilidade de
 uma ocorrência privada; esta exige diagnóstico oficial pela sua origem real e
 serviço atualizado, sem alteração de relatório/log ou reenvio a provedor.
+
+## GitHub: política explícita e capacidade remota indisponível
+
+A origem pode fornecer a política CI do projeto pelo campo `policy` de
+`task pr-check` ou `task merge`. O proprietário continua sendo o mesmo registro
+`merge_policy`, com autoria da origem e bindings exatos de repositório, base e
+HEAD publicado. `policy_source` é a justificativa explícita (inclusive da escolha
+de revisão); `required_review` deve ser booleano e `required_checks` deve listar
+nomes exatos, únicos e não vazios. Exemplo genérico:
+
+```json
+{
+  "task_id": "<existing-task-id>",
+  "policy": {
+    "repository": "example/project",
+    "base": "main",
+    "head_sha": "<full-published-head-sha>",
+    "method": "merge",
+    "observe_only": true,
+    "required_checks": ["Tests", "Product review (exact HEAD)"],
+    "required_review": false,
+    "policy_source": "Origin authorized project CI and automated review; human approval is not required."
+  }
+}
+```
+
+Esse exemplo permite apenas observação. Para uma política de merge já gravada,
+**não a substitua**: omita `policy` no replay. Um pedido de merge efetivo usa
+`merge_authorized: true`; `observe_only: true` proíbe emissão. Após uma intenção
+incerta, a política permanece imutável e somente a reconciliação é permitida.
+`allow_no_checks` não participa desta compatibilidade.
+
+O adaptador autentica o ator e confere repositório, branch e commit via `gh api`.
+Consulta proteção clássica **e** regras aplicáveis. Registra o resultado de cada
+endpoint, saída exata das leituras de metadados, identidade, origem, checks/revisões remotos e
+política efetiva no histórico privado. Uma mensagem HTTP 403 reconhecida de
+upgrade para GitHub Pro/repositório público indica `feature_unavailable`; não
+significa aprovação CI. `Branch not protected` em HTTP 404 indica ausência
+clássica; a consulta de regras continua obrigatória. `protected=true` pode vir
+de rulesets e suas exigências permanecem piso. Sem proteção clássica nem regras
+ativas, esse flag é contraditório; `protected=false` e regras vazias confirmam
+a ausência de proteção. Resposta JSON `null` com sucesso é malformada, nunca
+uma prova de ausência. A ausência de regras
+não é fabricada quando o endpoint está indisponível. Regras alcançáveis continuam
+sendo piso: checks extras do projeto são preservados e não se pode remover
+exigências remotas de checks ou revisão.
+
+401, 403 genérico/permissão, 404 ambíguo, rate limit, servidor/rede, respostas
+malformadas, truncadas ou contraditórias bloqueiam com diagnóstico tipado. Nenhum
+desses erros autoriza fallback. Jobs reais, check run, suite, workflow run,
+tentativa, HEAD e repositório permanecem vinculados. Falha, pendência, ausência,
+skip/cancelamento, fonte errada, duplicidade ou contradição impedem integração.
+
+### PR mesclada fora do adaptador: reconciliação somente de leitura
+
+Na conversa de origem, use o ID original e o mesmo transporte caller-bound:
+
+```sh
+oraculo --config /path/to/config.toml task pr-check --file /private/reconcile.json --stdio-host
+```
+
+`reconcile.json` contém `{"task_id":"<existing-task-id>"}` se a política já foi
+registrada; caso contrário acrescente `policy` conforme o exemplo. `pr-check`
+nunca emite `gh pr merge`, push, bypass, auto-merge, alteração de regras ou
+operação de deployment. O fluxo pode gravar observações/memória e concluir o
+settlement da conversa pelo host; "somente leitura" refere-se ao repositório
+remoto. `task merge` não é necessário para recuperar uma PR já mesclada.
+
+O adaptador confirma via REST a mesma PR, repositório/base/HEAD, `merged=true`,
+commit e instante reais de merge; para merge comum confirma o HEAD original como
+pai e ancestral do merge, e confirma o merge como ancestral da base atual.
+CI ainda disponível é reobservada com os IDs reais.
+A rodada canônica recebe `after_external_merge` e o SHA de merge: **não** afirma
+que a memória precedeu o merge externo, nem que Oráculo o emitiu. Se CI/revisões
+exigidas não puderem ser confirmadas, a recuperação fica bloqueada, preservando
+a observação do merge e todos os registros anteriores. Replay reutiliza as
+rodadas confirmadas; nunca reexecuta implementação/revisão nem altera o pedido,
+relatório negativo, runs ou memória originais. Merge confirmado não é deployment.
+
+A disponibilidade por assinatura segue a
+[documentação GitHub de proteção de branches](https://docs.github.com/en/rest/branches/branch-protection)
+e as regras aplicáveis são consultadas pelo
+[endpoint de regras de branch](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch).
+Os testes de transporte desta compatibilidade são simulados; a avaliação oficial
+`Product review (exact HEAD)` executa também os percursos API/CLI e memória local.
+
+A verificação de revisão histórica usa sempre a contagem remota autenticada,
+mesmo quando a política original só contém `required_review: true`. Campos
+`review_count`/`specialized_review` enviados pelo chamador não reduzem esse piso.
+Aprovações precisam ser reais, atuais no HEAD e de autores distintos com permissão
+de escrita, confirmada no endpoint autenticado de permissões do colaborador.
+`read`/`triage`/`none`, identidade divergente ou permissão inacessível não
+satisfazem o piso. Essa consulta só ocorre quando revisão foi exigida; dismissed,
+changes-requested ou aprovação de outro commit não satisfazem a exigência.
+Codeowners/último push exigem prova especializada ainda não implementada para
+reconciliação histórica: o diagnóstico
+`ci_historical_specialized_review_unproven` bloqueia, sem presumir aprovação.
+A política e a execução CI são reobservadas após memória final e antes/depois do
+settlement; mudança de exigência/execução impede encerramento com prova antiga.
+
+Merges externos sucessivos são reconciliados por ID de tarefa/PR original.
+O HEAD de `main` pode avançar depois do primeiro merge. Cada recibo mantém HEAD,
+SHA/ancestralidade do merge original e execuções CI próprias; a base atual continua
+registrada como observação, sem ser confundida com identidade da execução CI.
+Repetir a observação reutiliza a rodada canônica confirmada, mesmo após avanço de
+`main`, e não une tarefas, relatórios, runs ou memórias de PRs diferentes.
+
+As leituras autenticadas usam projeções `gh api --jq` registradas no próprio
+recibo: ator/repositório/branch, identidades de commits/ancestralidade e dados
+necessários de PR, reviews, runs, checks e jobs. Commits usam Git Database
+`/git/commits/{sha}`. Patches, mensagens de commit, corpos de PR/revisão e saída
+de steps não entram na observação nem na memória canônica. Proteção e regras
+mantêm o corpo original de metadados de política, inclusive erros reais 403.
+Referência: [projeção de resposta no GitHub CLI](https://cli.github.com/manual/gh_api).
+
+A [documentação de branches](https://docs.github.com/en/rest/branches/branches)
+considera proteção clássica **ou** rulesets no flag `protected`. O endpoint de
+regras retorna regras ativas aplicáveis, inclusive de organização; ausência de
+proteção clássica não autoriza ignorá-las.
+
+A elegibilidade para o número de aprovações segue as
+[regras de revisão de branches protegidas](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches),
+com prova de permissão atual via
+[API de colaboradores](https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user).
+Isso não constitui prova de codeowner ou último autor do push.
+
+Rollup/checks verdes não substituem o resultado autenticado do workflow. Run
+pendente, cancelado ou falho impede emissão de merge mesmo quando todos os
+checks/jobs exigidos visíveis terminaram com sucesso. Pendência não cria rodada
+terminal; falha/cancelamento registra avaliação CI negativa, preservando os
+resultados reais dos checks e do workflow. A revalidação compara também a
+conclusão da execução; não se converte um resultado negativo em passe.

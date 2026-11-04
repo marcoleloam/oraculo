@@ -458,7 +458,14 @@ class ManagedTasks:
                 self.store.update(
                     task_id,
                     "blocked",
-                    {"reason": code[:200]},
+                    {
+                        "reason": code[:200],
+                        **(
+                            {"remote_observations": exc.observations}
+                            if hasattr(exc, "observations")
+                            else {}
+                        ),
+                    },
                     blocked_reason=code[:200],
                 )
             await self.flush_returns(task_id)

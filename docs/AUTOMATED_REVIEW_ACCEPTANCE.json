@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "intent": "Implementation delivery records verified execution/tests/report/memory; product review belongs to CI/PR and required remote policy controls merge, without mandatory human delivery approval.",
+  "intent": "Implementation delivery records verified execution/tests/report/memory; product review belongs to CI/PR. Authenticated remote requirements remain a floor for explicit origin project policy when GitHub protection is unavailable, without mandatory human delivery approval.",
   "evaluation_scope": "Offline API/CLI/lifecycle journeys with real local service, Git, memory and test processes; synthetic provider/publisher ports. Deterministic CI evaluation, not independent semantic or human certification.",
   "tests": [
     "tests/test_review_product_acceptance.py",
@@ -10,7 +10,8 @@
     "tests/test_nested_delivery_review.py",
     "tests/test_ci_round_memory.py",
     "tests/test_azure_task_closure.py",
-    "tests/test_legacy_delivery.py"
+    "tests/test_legacy_delivery.py",
+    "tests/test_github_policy_compatibility.py"
   ],
   "scenarios": [
     {
@@ -87,6 +88,46 @@
       "id": "legacy_historical_stream",
       "requirement": "Original official transport stream remains a historical control artifact, distinct from fresh caller-bound terminal corroboration; reject mixed/truncated/hidden/functional data and missing/incoherent current host proof without changing failed/saved originals",
       "test_prefix": "test_legacy_stream_"
+    },
+    {
+      "id": "github_policy_compatibility",
+      "requirement": "Authenticated enforced/unprotected/subscription-limited policy discovery preserves explicit origin policy and remote floor; unknown errors and invalid exact CI block across API/CLI, with immutable delivery and canonical memory",
+      "test_prefix": "test_github_policy_compatibility_"
+    },
+    {
+      "id": "github_historical_merge",
+      "requirement": "API/CLI recover the same externally merged PR with zero remote mutation, authenticated merge identity/original-head ancestry, postmerge CI memory, preserved errors and exact replay",
+      "test_prefix": "test_github_policy_compatibility_journey"
+    },
+    {
+      "id": "github_remote_review_floor",
+      "requirement": "Raw original origin review boolean cannot weaken authenticated approval count or specialized codeowner/last-push constraints; historical verification and post-memory settlement reject stale or forged reductions across API/CLI",
+      "test_prefix": "test_github_policy_compatibility_raw_review_floor_journey"
+    },
+    {
+      "id": "github_sequential_external_merges",
+      "requirement": "Read-only API/CLI reconciliation of two distinct original tasks and sequential external merges accepts advancing main while binding original HEAD/merge ancestry and actual CI per PR, preserving independent immutable reports/runs/memories",
+      "test_prefix": "test_github_policy_compatibility_sequential_external_merges"
+    },
+    {
+      "id": "github_metadata_privacy",
+      "requirement": "Authenticated identity/ancestry reads use declared metadata projections and Git Database commit endpoints; unselected source patches never enter persisted policy/merge proofs",
+      "test_prefix": "test_github_policy_compatibility_metadata_reads"
+    },
+    {
+      "id": "github_ruleset_only",
+      "requirement": "protected=true can come from active rulesets: conclusive classic absence/plan limitation still honors reachable remote checks/reviews through API/CLI, while successful null policy payloads and unexplained protected flags block",
+      "test_prefix": "test_github_policy_compatibility_ruleset_only"
+    },
+    {
+      "id": "github_review_eligibility",
+      "requirement": "Historical approving reviews require matching authenticated reviewer identity, exact HEAD and actual repository write permission; read-only/triage/none, mismatched user or denied permission never satisfy review floor",
+      "test_prefix": "test_github_policy_compatibility_historical_approval_requires_repository_write"
+    },
+    {
+      "id": "github_workflow_outcome",
+      "requirement": "Green check rollup never waives an authenticated pending/failed/cancelled workflow: API/CLI must emit zero merges/intents, keep delivery unchanged and record honest workflow-negative canonical CI memory",
+      "test_prefix": "test_github_policy_compatibility_green_checks_do_not_waive_workflow_outcome"
     }
   ],
   "full_autonomy_gaps": [

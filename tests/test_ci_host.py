@@ -58,7 +58,17 @@ class GitHubCIHost:
             )
         assert argv[1] == "api", argv
         path = argv[2]
-        assert "repos/example/repo/" in path
+        assert "repos/example/repo" in path or path == "user"
+        if path == "user":
+            return json.dumps(dict(login="example-actor", id=7))
+        if path == "repos/example/repo":
+            return json.dumps(dict(full_name="example/repo", id=11, private=False))
+        if path.endswith("/branches/main"):
+            return json.dumps(
+                dict(name="main", protected=True, commit=dict(sha=self.base))
+            )
+        if path.endswith("/commits/" + self.head):
+            return json.dumps(dict(sha=self.head))
         if path.endswith("/pulls/1"):
             value = dict(
                 number=1,
@@ -114,7 +124,7 @@ class GitHubCIHost:
                     required_approving_review_count=int(self.require_review)
                 ),
             )
-        elif path.endswith("/rules/branches/main"):
+        elif path.endswith("/rules/branches/main?per_page=100"):
             value = []
         elif "/attempts/1/jobs?per_page=100" in path:
             rows = [

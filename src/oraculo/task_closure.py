@@ -130,6 +130,12 @@ class TaskClosure:
         receipt = self.lifecycle.inspect(
             task["publication"], task["merge_policy"], task["publication_spec"]["cwd"]
         )
+        if receipt.get("observation_timing") == "after_merge":
+            receipt["observation_timing"] = (
+                "after_recorded_merge_intent"
+                if task.get("merge_attempted")
+                else "after_external_merge"
+            )
         if actual_policy is not None:
             receipt["observed_host_policy"] = actual_policy
         self.store.record_pr_observation(
@@ -138,9 +144,11 @@ class TaskClosure:
         execution = None
         required = task["merge_policy"].get("required_checks", [])
         checks = [c for c in receipt.get("checks") or [] if c.get("name") in required]
+        historical = receipt["state"] == "merged" and bool(
+            receipt.get("observation_timing")
+        )
         if (
-            checks
-            and len(checks) == len(required)
+            (historical or (checks and len(checks) == len(required)))
             and all(c.get("completed") is True for c in checks)
             and hasattr(self.lifecycle, "observe_pr_ci")
         ):
@@ -159,7 +167,21 @@ class TaskClosure:
                     self.store.get(task_id).get("snapshot_revision", 0),
                 )
         confirmed = await rounds.observe(task_id, receipt, execution)
-        if receipt["ready"] and not confirmed:
+        execution_passed = (
+            execution is None or execution["event"]["conclusion"] == "passed"
+        )
+        if (
+            receipt.get("state") == "merged"
+            and receipt.get("observation_timing")
+            and (
+                not confirmed
+                or receipt.get("blockers")
+                or execution is None
+                or execution["event"]["conclusion"] != "passed"
+            )
+        ):
+            raise StateError("historical_merge_ci_evidence_required")
+        if receipt["ready"] and execution_passed and not confirmed:
             raise StateError("ci_round_memory_terminal_evidence_required")
         self._requirements(self.store.get(task_id))
 
@@ -185,15 +207,20 @@ class TaskClosure:
                 key=lambda c: c["name"],
             ) != sorted(checks, key=lambda c: c["name"]):
                 raise StateError("ci_round_snapshot_changed")
-            if execution is not None and rounds.execution_scope(
-                self.lifecycle.observe_pr_ci(
+            if execution is not None:
+                fresh_execution = self.lifecycle.observe_pr_ci(
                     task["publication"],
                     task["merge_policy"],
                     task["publication_spec"]["cwd"],
-                ),
-                required,
-            ) != rounds.execution_scope(execution, required):
-                raise StateError("ci_round_execution_changed")
+                )
+                if (
+                    fresh_execution is None
+                    or fresh_execution["event"]["conclusion"]
+                    != execution["event"]["conclusion"]
+                    or rounds.execution_scope(fresh_execution, required)
+                    != rounds.execution_scope(execution, required)
+                ):
+                    raise StateError("ci_round_execution_changed")
 
         revalidate_ci()
         if receipt["state"] == "merged":
@@ -233,19 +260,26 @@ class TaskClosure:
             )
             await self.finalize(task_id)
             return
+        gate = receipt
+        if receipt["ready"] and not execution_passed:
+            gate = dict(
+                receipt,
+                ready=False,
+                blockers=[*receipt["blockers"], "ci_execution_not_passed"],
+            )
         self.store.update(
             task_id,
-            "pr_ready" if receipt["ready"] else "pr_checks_pending",
+            "pr_ready" if gate["ready"] else "pr_checks_pending",
             {
                 "head_sha": receipt["head_sha"],
-                "ready": receipt["ready"],
-                "blockers": receipt["blockers"],
+                "ready": gate["ready"],
+                "blockers": gate["blockers"],
             },
-            pr_gate=receipt,
+            pr_gate=gate,
         )
         if receipt["state"] == "closed":
             raise StateError("closed_pr_requires_explicit_revision")
-        if receipt["state"] != "merged" and not receipt["ready"]:
+        if receipt["state"] != "merged" and not gate["ready"]:
             await self.watch(task_id)
             return
         if not merge:
@@ -271,8 +305,9 @@ class TaskClosure:
 
         def before_merge():
             revalidate_ci()
+            intent_policy = None
             if hasattr(self.lifecycle, "validate_host_policy"):
-                self.lifecycle.validate_host_policy(
+                intent_policy = self.lifecycle.validate_host_policy(
                     task["publication"],
                     task["merge_policy"],
                     task["publication_spec"]["cwd"],
@@ -281,8 +316,20 @@ class TaskClosure:
                 task_id,
                 "merge_pending",
                 {
+                    "repository": receipt["repository"],
+                    "base": receipt["base"],
                     "head_sha": receipt["head_sha"],
                     "policy_sha256": content_hash(task["merge_policy"]),
+                    **(
+                        {
+                            "observed_host_policy": intent_policy,
+                            "authenticated_actor": intent_policy["remote_capability"][
+                                "actor"
+                            ],
+                        }
+                        if intent_policy and intent_policy.get("remote_capability")
+                        else {}
+                    ),
                 },
                 merge_attempted=True,
             )
@@ -444,6 +491,48 @@ class TaskClosure:
                 observed,
             )
             return
+        if pr.get("merge_verification"):
+            from oraculo.ci_round_memory import CIRoundMemory
+
+            publication, policy = task["publication"], task["merge_policy"]
+            cwd = task["publication_spec"]["cwd"]
+            self.lifecycle.validate_host_policy(publication, policy, cwd)
+            actual = self.lifecycle.inspect(publication, policy, cwd)
+            if actual.get("state") != "merged" or any(
+                actual.get(k) != pr.get(k)
+                for k in (
+                    "repository",
+                    "number",
+                    "url",
+                    "base",
+                    "head_sha",
+                    "merge_sha",
+                )
+            ):
+                raise StateError("github_merge_observation_mismatch")
+            execution = self.lifecycle.observe_pr_ci(publication, policy, cwd)
+            rounds = task.get("ci_rounds") or []
+            previous = rounds[-1]["report"]["evidence"]["execution"] if rounds else None
+
+            def settled_execution_scope(observation):
+                scope = CIRoundMemory.execution_scope(
+                    observation, policy["required_checks"]
+                )
+                if scope is not None:
+                    # Pull-request base.sha may follow main after merge. Its
+                    # fresh value remains in each raw receipt; it is not the
+                    # identity of the original check execution or merge.
+                    scope["event"].pop("base", None)
+                return scope
+
+            if (
+                execution is None
+                or execution["event"]["conclusion"] != "passed"
+                or actual.get("blockers")
+                or settled_execution_scope(execution)
+                != settled_execution_scope(previous)
+            ):
+                raise StateError("ci_round_execution_changed_before_settlement")
         # GitHub supplied the verified commit receipt. T3 exposes the linked
         # PR identities, target and host state, but not commit SHAs.
         expected = [

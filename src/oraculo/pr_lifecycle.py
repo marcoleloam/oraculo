@@ -7,10 +7,10 @@ is not a verified merge. Only a fresh MERGED observation with the bound head/bas
 and a merge commit supplies a successful receipt.
 
 Branch protection/rules remain enforced by GitHub; this adapter never uses admin
-bypass, auto-merge, or local pushes. It does not discover repository rules. The
-caller must derive required_checks and required_review from the remote policy,
-and must block if that discovery is unavailable rather than inventing an empty
-policy. An intentional repository without CI requires allow_no_checks=True.
+bypass, auto-merge, or local pushes. The repository facade discovers remote requirements,
+which remain a floor for an explicit origin project policy. Recognized feature
+unavailability requires a nonempty project policy; unknown discovery errors block.
+The low-level adapter also supports an intentional allow_no_checks policy.
 The policy digest is returned so its durable owner can verify the binding.
 """
 
@@ -52,7 +52,15 @@ class RepositoryPRLifecycle:
         return GitHubPRLifecycle(self.runner)
 
     def inspect(self, pr, policy, cwd):
-        return self._adapter(pr, cwd).inspect(pr, policy, cwd)
+        receipt = self._adapter(pr, cwd).inspect(pr, policy, cwd)
+        if pr.get("host") == "github" and receipt["state"] == "merged":
+            from oraculo.github_policy import verify_github_merge
+
+            observed_policy = self.validate_host_policy(pr, policy, cwd)
+            receipt = verify_github_merge(
+                self.runner, pr, policy, cwd, receipt, observed_policy
+            )
+        return receipt
 
     def observe_ci(self, binding, cwd):
         from oraculo.ci_host import github_ci
@@ -72,13 +80,15 @@ class RepositoryPRLifecycle:
         if pr.get("host") != "github":
             return None
         from oraculo.ci_events import CIBinding
+        from oraculo.github_policy import GitHubReader
+
+        reader = GitHubReader(self.runner, Path(cwd))
 
         def read(suffix):
-            return json.loads(
-                self.runner(
-                    ["gh", "api", "repos/" + pr["repository"] + suffix], Path(cwd)
-                )
-            )
+            value, _ = reader.read("repos/" + pr["repository"] + suffix)
+            if not isinstance(value, dict):
+                reader.fail("ci_host_response_invalid")
+            return value
 
         pull = read(f"/pulls/{pr['number']}")
         checks = read(
@@ -113,7 +123,9 @@ class RepositoryPRLifecycle:
             run=str(candidate["id"]),
             attempt=candidate["run_attempt"],
         )
-        return self.observe_ci(binding, cwd)
+        from oraculo.ci_host import github_ci
+
+        return github_ci(self, binding, cwd, policy)
 
     def validate_host_policy(self, pr, policy, cwd):
         """A caller's source label/boolean cannot reduce actual host rules."""
@@ -130,7 +142,12 @@ class RepositoryPRLifecycle:
             from oraculo.ci_host import github_policy
 
             observed = github_policy(
-                self.runner, pr["repository"], pr["base"], pr["head_sha"], Path(cwd)
+                self.runner,
+                pr["repository"],
+                pr["base"],
+                pr["head_sha"],
+                Path(cwd),
+                policy,
             )
         elif pr.get("host") == "azure":
             from oraculo.publication import inspect_repository
@@ -192,7 +209,10 @@ class RepositoryPRLifecycle:
         return observed
 
     def merge(self, pr, policy, cwd, **kwargs):
-        return self._adapter(pr, cwd).merge(pr, policy, cwd, **kwargs)
+        receipt = self._adapter(pr, cwd).merge(pr, policy, cwd, **kwargs)
+        if pr.get("host") == "github" and receipt["state"] == "merged":
+            return self.inspect(pr, policy, cwd)
+        return receipt
 
 
 def _policy(pr: dict, policy: dict) -> tuple[dict, str]:
