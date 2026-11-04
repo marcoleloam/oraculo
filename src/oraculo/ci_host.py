@@ -196,7 +196,7 @@ def github_ci(lifecycle, binding, cwd):
         ):
             raise StateError("ci_host_binding_mismatch")
         linked[key] = fresh_run
-    observed_jobs = []
+    observed_jobs, check_bindings = [], []
     passed = set(c["name"] for c in required) == set(policy["required_checks"])
     for run_id, linked_run in linked.items():
         attempt = linked_run["run_attempt"]
@@ -226,6 +226,35 @@ def github_ci(lifecycle, binding, cwd):
                 and r.get("check_run_url")
                 == f"https://api.github.com/repos/{repo}/check-runs/{check['id']}"
             ]
+            if len(matched) == 1:
+                # Semantic proof per required check, excluding unrelated jobs,
+                # display fields and local observer clocks. Whole-endpoint hashes
+                # remain in the audit evidence, not round identity/contradictions.
+                job = matched[0]
+                check_bindings.append(
+                    dict(
+                        name=check["name"],
+                        run=run_id,
+                        attempt=attempt,
+                        head=binding.head,
+                        check_id=check["id"],
+                        suite=linked_run.get("check_suite_id"),
+                        check_status=check.get("status"),
+                        check_conclusion=check.get("conclusion"),
+                        job={
+                            k: job.get(k)
+                            for k in (
+                                "name",
+                                "status",
+                                "conclusion",
+                                "head_sha",
+                                "run_id",
+                                "run_attempt",
+                                "check_run_url",
+                            )
+                        },
+                    )
+                )
             passed = (
                 passed
                 and len(matched) == 1
@@ -278,6 +307,7 @@ def github_ci(lifecycle, binding, cwd):
         jobs_hash=content_hash(observed_jobs),
         required_checks_hash=content_hash(checks),
         runs=observed_jobs,
+        check_bindings=sorted(check_bindings, key=lambda c: c["name"]),
         run_hash=content_hash(run),
         pull_hash=content_hash(pull),
         source="authenticated_gh_api",
@@ -286,7 +316,15 @@ def github_ci(lifecycle, binding, cwd):
     # Same upstream snapshot has the same identity; no synthesized local clock
     # may turn an old event into a fresh host event.
     event = binding.model_dump(mode="json") | dict(
-        event_id=content_hash([binding.model_dump(), evidence, conclusion]),
+        # Keep the existing upstream event identity: check_bindings is an
+        # additive semantic projection of these same authenticated endpoints.
+        event_id=content_hash(
+            [
+                binding.model_dump(),
+                {k: v for k, v in evidence.items() if k != "check_bindings"},
+                conclusion,
+            ]
+        ),
         sequence=max(1, int(observed * 1000000)),
         occurred_at=observed,
         conclusion=conclusion,

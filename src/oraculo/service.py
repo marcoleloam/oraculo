@@ -1253,6 +1253,8 @@ class Service:
                     "invalid_report_recovery": True,
                     "origin_terminal_recovery": True,
                     "terminal_review_adjudication": True,
+                    "delivery_review_separation": True,
+                    "ci_round_memory": True,
                 }
             else:
                 if self.managed_service is None:

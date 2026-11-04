@@ -1,6 +1,15 @@
 # Tarefas geridas por projeto
 
-## Revisão terminal sem parecer
+## Entrega e revisão de CI
+
+A entrega verificada da implementação é separada da revisão de qualidade CI/PR.
+Papéis `quality_review` e `functional_tests`, declarados antes da execução com
+alvo/hash/HEAD exatos, evitam confundir falta de parecer com teste funcional
+negativo. Não há aprovação humana genérica para finish. O check oficial
+`Product review (exact HEAD)` e os gates remotos condicionam integração, não a
+gravação da entrega. Veja [contrato, matriz e limites](AUTOMATED_REVIEW_ACCEPTANCE.md).
+
+## Revisão terminal sem parecer (alternativa explícita)
 
 `task diagnose-review` distingue descendentes ativos/desconhecidos de revisão
 terminal sem sucesso. `task adjudicate-review` exige revisão técnica humana,
@@ -10,7 +19,7 @@ continua bloqueando. Veja o [contrato completo](TERMINAL_REVIEW_ADJUDICATION.md)
 
 ## Recuperação explícita pela origem
 
-`task complete-origin` aceita validação independente de uma implementação cujo
+`task complete-origin` registra validação focal pela própria origem de uma implementação cujo
 único run terminou `failed`, sem relatório anterior do executor. Exige a origem
 real, motivo, `expected_child_run_id`, `expected_latest_run_id`, relatório positivo
 com SHA integral do checkout limpo e checks com `result`/`proof`. A origem fornece

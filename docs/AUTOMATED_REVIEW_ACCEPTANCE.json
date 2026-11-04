@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "intent": "Implementation delivery records verified execution/tests/report/memory; product review belongs to CI/PR and required remote policy controls merge, without mandatory human delivery approval.",
+  "evaluation_scope": "Offline API/CLI/lifecycle journeys with real local service, Git, memory and test processes; synthetic provider/publisher ports. Deterministic CI evaluation, not independent semantic or human certification.",
+  "tests": [
+    "tests/test_review_product_acceptance.py",
+    "tests/test_review_product_eval.py",
+    "tests/test_task_closure.py",
+    "tests/test_pr_lifecycle.py",
+    "tests/test_nested_delivery_review.py",
+    "tests/test_ci_round_memory.py",
+    "tests/test_azure_task_closure.py"
+  ],
+  "scenarios": [
+    {
+      "id": "ci_memory_loop",
+      "requirement": "Terminal authenticated CI rounds enter confirmed canonical memory before merge; exact replay/recovery keeps cycle IDs, preserves failed history, and links evidenced correction/new evaluation for a fresh conversation",
+      "test_prefix": "test_ci_memory_loop_"
+    },
+    {
+      "id": "delivery",
+      "requirement": "Deliver implementation without human review or optional quality opinion; retain failed reviewer and unresolved provider restriction",
+      "test_prefix": "test_delivery_completes_without_quality_approval_or_humans"
+    },
+    {
+      "id": "functional",
+      "requirement": "Required functional negatives, unknown roles and live work block delivery effects",
+      "test_prefix": "test_functional_failure_unknown_role_and_live_work_still_block_delivery"
+    },
+    {
+      "id": "correction",
+      "requirement": "Authorized correction uses a new report/HEAD while preserving original failed task/run/report/memory",
+      "test_prefix": "test_functional_negative_correction_preserves_original_report_memory_and_ids"
+    },
+    {
+      "id": "freshness",
+      "requirement": "HEAD/log/run/role changes during memory block release; delivery never means review approval or merge",
+      "test_prefix": "test_delivery_revalidates_after_memory_without_fake_review_pass"
+    },
+    {
+      "id": "integration",
+      "requirement": "Delivery and PR creation are separate from required CI/review, merge and activation",
+      "test_prefix": "test_delivered_quality_review_does_not_authorize_merge_and_ci_revalidates_head"
+    },
+    {
+      "id": "daemon",
+      "requirement": "An older daemon must not silently ignore the explicit validation role contract",
+      "test_prefix": "test_old_daemon_cannot_silently_accept_new_validation_roles"
+    },
+    {
+      "id": "functional_integrity",
+      "requirement": "First accepted delegated functional receipt fixes logs and bindings across memory yield and certified replay, with or without quality review",
+      "test_prefix": "test_mandatory_functional_log_is_bound_to_first_delivery_receipt"
+    },
+    {
+      "id": "required_policy",
+      "requirement": "A workflow is available, not globally mandatory; an explicit managed policy must wait for missing/pending/negative product CI",
+      "test_prefix": "test_product_ci_available_is_not_required_unless_policy_demands_it"
+    },
+    {
+      "id": "nested_scope",
+      "requirement": "Recursive implementation/review/test trees bind each review to its real delivered owner; reject swapped/outside owners, stale scope and nested functional negatives",
+      "test_prefix": "test_nested_"
+    }
+  ],
+  "full_autonomy_gaps": [
+    "Provider/publisher ports are synthetic in local evaluation; live remote CI and branch protection observations require actual PR receipts.",
+    "No automatic provider redispatch, runtime activation or live independent semantic review is performed or certified. Existing tasks without pre-execution role/target metadata require adequate evidence; no semantic reclassification of private legacy tasks."
+  ]
+}

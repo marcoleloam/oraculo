@@ -33,6 +33,7 @@ def ci_layout(root, *, public=False):
         for template, target in (
             ("oraculo-suite.yml.template", "ci.yml"),
             ("oraculo-ci.yml.template", "orchestration.yml"),
+            ("product-review.yml.template", "product-review.yml"),
         ):
             (workflows / target).write_bytes(
                 (templates / template).read_bytes().split(b"\n", 1)[1]
@@ -64,7 +65,7 @@ def test_ci_exports_allow_private_and_canonical_public_layout_without_mutation(
     )
     assert result.returncode == 0, result.stderr.decode()
     checked = json.loads(result.stdout)["checked"]
-    assert len(checked) == (5 if public else 3)
+    assert len(checked) == (7 if public else 4)
     assert {
         p.relative_to(tmp_path): p.read_bytes()
         for p in tmp_path.rglob("*")

@@ -124,7 +124,10 @@ class TaskRecovery:
                 runs=chain,
                 terminal_snapshot=snapshot,
                 report_sha256=content_hash(report),
-                basis="independent_origin_validation_after_host_failure",
+                basis="origin_validation_after_host_failure",
+                scope="origin_validation",
+                independence="not_independent",
+                human_certification=False,
             )
             self.store.update(
                 task["id"],

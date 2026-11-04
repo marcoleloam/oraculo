@@ -1,4 +1,10 @@
-# Revisão terminal interrompida
+# Revisão terminal interrompida — alternativa explícita
+
+O caminho normal separa entrega da implementação e revisão de CI/PR; não exige
+estas mensagens humanas. Veja [papéis, evidências e CI](AUTOMATED_REVIEW_ACCEPTANCE.md).
+O contrato humano abaixo é uma alternativa explícita para casos que o solicitam,
+não um fallback obrigatório para revisão de qualidade terminal sem parecer.
+
 
 `task diagnose-review` distingue término de sucesso. Uma revisão `failed`,
 `interrupted` ou `cancelled` pode estar terminal e continuar sem parecer. Isso

@@ -215,6 +215,51 @@ async def test_observed_merge_receipt_cannot_be_rebound_on_replay(system):
     assert result["merge_receipt"] == original
 
 
+async def test_ci_memory_loop_azure_native_states_keep_iteration_failure_and_canonical_history(
+    system,
+):
+    tasks, spec, host, counts = await integrated_setup(system, status="active")
+    task = tasks[0]
+    host.statuses[0]["state"] = "failed"
+    await publish(system, task, spec)
+    first = await system.engine.command(
+        "pr-check", {"task_id": task["id"], "policy": policy(spec)}
+    )
+    assert first["phase"] == "pr_waiting", first
+    item = first["ci_rounds"][0]
+    check = item["facts"]["checks"][0]
+    assert check["state"] == "failed" and check["conclusion"] == "FAILURE"
+    assert check["iterationId"] == 1
+    assert (
+        item["facts"]["check_bindings"][0]["precision"]
+        == "check_snapshot_without_run_attempt"
+    )
+    assert item["facts"]["identity"]["observed_runs"] == []
+    assert (
+        item["memory"]["write_state"] == "saved"
+        and item["memory"]["work_status"] == "failed"
+    )
+    canonical = system.service.memory_cycles.get(item["memory"]["id"])["report"][
+        "evidence"
+    ]
+    observation = canonical["evidence"]["repository_observation"]
+    assert observation["source"] == "authenticated_repository_lifecycle"
+    assert observation["receipt"]["checks"][0]["state"] == "failed"
+    before = system.service.publisher.git.head()
+    replay = await system.engine.command("pr-check", {"task_id": task["id"]})
+    assert replay["ci_rounds"] == first["ci_rounds"]
+    assert system.service.publisher.git.head() == before
+    host.statuses[0]["state"] = "succeeded"
+    next_round = await system.engine.command("pr-check", {"task_id": task["id"]})
+    assert next_round["phase"] == "pr_ready", next_round
+    assert len(next_round["ci_rounds"]) == 2
+    assert next_round["ci_rounds"][0] == item
+    assert next_round["ci_rounds"][1]["memory"]["write_state"] == "saved"
+    assert next_round["work_status"] == "succeeded" and not next_round["merged"]
+    assert host.merges == counts["settle"] == 0
+    assert system.store.get(task["id"])["report"] == task["report"]
+
+
 @pytest.mark.parametrize(
     "case",
     [
