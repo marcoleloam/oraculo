@@ -66,7 +66,7 @@ class CITransport(GitHubCIHost):
         return json.dumps(replace(data))
 
 
-async def publish(flow, monkeypatch, task, evidence, name):
+async def publish(flow, monkeypatch, task, evidence, name, *, number=12):
     public = flow.service.config.projects_root / name
     initialize(public)
     # A real, different public HEAD for each implementation candidate.
@@ -100,8 +100,28 @@ async def publish(flow, monkeypatch, task, evidence, name):
         task_id=task["id"],
     )
     github = GitHubHost(spec)
+
+    def publisher_transport(argv, cwd):
+        raw = github(argv, cwd)
+        if number == 12 or argv[0] != "gh":
+            return raw
+        if raw.startswith("https://"):
+            return raw.replace("/pull/12", f"/pull/{number}")
+
+        def translate(value, key=None):
+            if isinstance(value, dict):
+                return {k: translate(v, k) for k, v in value.items()}
+            if isinstance(value, list):
+                return [translate(v) for v in value]
+            if isinstance(value, str):
+                return value.replace("/pull/12", f"/pull/{number}")
+            return number if key == "number" and value == 12 else value
+
+        return json.dumps(translate(json.loads(raw)))
+
     monkeypatch.setattr(
-        "oraculo.publication.RepositoryPublisher", lambda: GitHubPublisher(github)
+        "oraculo.publication.RepositoryPublisher",
+        lambda: GitHubPublisher(publisher_transport),
     )
     result = await flow.invoke("publish", task_id=task["id"], publication=spec)
     assert result["phase"] == "pr_open", result
@@ -689,6 +709,39 @@ class MixedCITransport(CITransport):
         self.optional_revision = 1
 
     def __call__(self, argv, cwd):
+        if argv[:2] == ["gh", "api"] and "/actions/runs/84" in argv[2]:
+            self.calls.append(copy.deepcopy(argv))
+            attempt = 2 if self.product == "success" else 1
+            if "/jobs?" in argv[2]:
+                return json.dumps(
+                    dict(
+                        total_count=1,
+                        jobs=[
+                            dict(
+                                name="Product review (exact HEAD)",
+                                head_sha=self.head,
+                                run_id=84,
+                                run_attempt=attempt,
+                                status="completed",
+                                conclusion=self.product,
+                                check_run_url="https://api.github.com/repos/example/public-project/check-runs/200",
+                            )
+                        ],
+                    )
+                )
+            return json.dumps(
+                dict(
+                    id=84,
+                    check_suite_id=184,
+                    head_sha=self.head,
+                    run_attempt=attempt,
+                    repository=dict(full_name="example/public-project"),
+                    pull_requests=[dict(number=12)],
+                    updated_at="2026-11-03T11:00:00Z",
+                    status="completed",
+                    conclusion=self.product,
+                )
+            )
         result = super().__call__(argv, cwd)
         if argv[0] != "gh":
             return result
@@ -830,9 +883,9 @@ async def test_ci_memory_loop_mixed_policy_rerun_optional_facts_and_real_attempt
     assert by_name["Remote unit"]["precision"] == "workflow_check_run_attempt"
     assert (
         by_name["Product review (exact HEAD)"]["precision"]
-        == "check_snapshot_without_run_attempt"
+        == "workflow_check_run_attempt"
     )
-    assert by_name["Product review (exact HEAD)"]["proof"] is None
+    assert by_name["Product review (exact HEAD)"]["proof"]["run"] == "84"
     assert first["memory"]["write_state"] == "saved" and not failed["merged"]
     transport.product = "success"  # rerun only B, A stays run42/attempt1
     passed = await check()

@@ -360,31 +360,21 @@ def test_uv_output_marker_is_metadata_and_unexpected_extra_files_still_fail(tmp_
         module.distribution_paths(tmp_path)
 
 
-def test_temporary_automatic_scope_retains_regressions_and_manual_full_suite():
+def test_automatic_full_scope_and_product_gates_are_restored():
     spec = yaml.load(
         (ROOT / "templates/ci/oraculo-suite.yml.template").read_text(),
         Loader=yaml.BaseLoader,
     )
     assert set(spec["on"]) == {"pull_request", "push", "workflow_dispatch"}
-    assert spec["on"]["workflow_dispatch"]["inputs"]["full"]["default"] == "false"
     steps = spec["jobs"]["tests"]["steps"]
     pytest_steps = [s for s in steps if "pytest " in s.get("run", "")]
-    assert len(pytest_steps) == 2
-    automatic, manual = pytest_steps
-    for path in ("test_host_ack.py", "test_service.py", "test_orchestration_ci.py"):
-        assert "tests/" + path in automatic["run"]
-    assert (
-        automatic["if"]
-        == "${{ github.event_name != 'workflow_dispatch' || !inputs.full }}"
-    )
-    assert (
-        manual["if"] == "${{ github.event_name == 'workflow_dispatch' && inputs.full }}"
-    )
-    assert "tests/" not in manual["run"]
-    assert all("--junitxml=" in s["run"] for s in pytest_steps)
+    assert len(pytest_steps) == 1
+    assert "if" not in pytest_steps[0]
+    assert "tests/" not in pytest_steps[0]["run"]
+    assert "--junitxml=" in pytest_steps[0]["run"]
     assert not any(s.get("continue-on-error") for s in steps)
     for name in ("oraculo-ci.yml.template", "product-review.yml.template"):
         broad = yaml.load(
             (ROOT / "templates/ci" / name).read_text(), Loader=yaml.BaseLoader
         )
-        assert set(broad["on"]) == {"workflow_dispatch"}
+        assert set(broad["on"]) == {"pull_request", "push", "workflow_dispatch"}

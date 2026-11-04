@@ -88,7 +88,7 @@ def main():
                     "PYTHONPATH": str(ROOT / "src"),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 },
-                timeout=1500,
+                timeout=2400,
             )
         receipt["command"] = argv
         receipt["exit_code"] = result.returncode

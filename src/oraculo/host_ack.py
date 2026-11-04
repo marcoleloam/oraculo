@@ -83,6 +83,17 @@ class HostResults:
     def _validate(self, tool, args, result):
         value = unwrap(result)
         if tool == "orchestrator_capabilities":
+            modern = "inheritedOptions" in value
+            if modern:
+                inherited = value["inheritedOptions"]
+                if inherited is not None and not isinstance(inherited, list):
+                    raise StateError("native_bridge_model_options_unproven")
+                for option in inherited or []:
+                    required(option, ("id", "value"))
+                    if not isinstance(option["id"], str) or type(
+                        option["value"]
+                    ) not in (str, bool):
+                        raise StateError("native_bridge_model_options_unproven")
             required(
                 value,
                 (
@@ -130,6 +141,8 @@ class HostResults:
                     raise StateError("native_bridge_result_incomplete")
                 for model in provider["models"]:
                     required(model, ("id",))
+                    if modern and model.get("options") is None:
+                        continue  # Preserve the modern nullable catalog literally.
                     # Only a provider unable to run either kind of child may
                     # omit an unconfigurable model's options.
                     if "options" not in model and not (

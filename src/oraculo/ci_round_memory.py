@@ -41,7 +41,14 @@ class CIRoundMemory:
         return dict(
             event={
                 k: execution["event"].get(k)
-                for k in ("repository", "pr", "head", "base", "run", "attempt")
+                for k in (
+                    "repository",
+                    "pr",
+                    "head",
+                    "base",
+                    "run",
+                    "attempt",
+                )
             },
             runs=sorted(
                 [
@@ -220,6 +227,14 @@ class CIRoundMemory:
             event, evidence = execution["event"], execution["evidence"]
             if event.get("conclusion") == "pending":
                 return False
+            # Successful required jobs cannot waive a cancelled/failed workflow.
+            # Keep the real per-check outcomes; classify the whole CI round.
+            if any(
+                ("status" in r or "conclusion" in r)
+                and (r.get("status") != "completed" or r.get("conclusion") != "success")
+                for r in evidence["runs"]
+            ):
+                status = "failed"
             if any(
                 event.get(k) != v
                 for k, v in dict(
@@ -300,6 +315,9 @@ class CIRoundMemory:
                 )
             )
         identity["check_identities"] = [c["identity"] for c in per_check]
+        if receipt.get("observation_timing") == "after_external_merge":
+            identity["observation_timing"] = "after_external_merge"
+            identity["merge_sha"] = receipt["merge_sha"]
         # Unknown check executions are snapshots, even alongside known workflows.
         ident = "ci-round-" + content_hash(identity)
         facts = dict(
@@ -357,7 +375,7 @@ class CIRoundMemory:
                     ),
                     sort_keys=True,
                 )
-                + f"\nCI checks {status}; implementation delivery remains succeeded; merge not asserted. "
+                + f"\nCI evaluation {status}; implementation delivery remains succeeded; merge not asserted. "
                 "CI failure diagnosis correction evaluation history: "
                 + json.dumps(dict(facts=facts, previous=previous), sort_keys=True),
                 topics=["CI", "failure", "diagnosis", "correction", "evaluation"],
@@ -374,7 +392,14 @@ class CIRoundMemory:
                 ),
                 limitations=[
                     "Authenticated observation; not a provider review or deployment approval.",
-                    "Observed workflow IDs cover host-required checks only; extra managed checks retain snapshot precision.",
+                    "Observed workflow IDs cover the effective host/project required checks when reachable; otherwise snapshot precision is retained.",
+                    *(
+                        [
+                            "CI recorded after external merge; no premerge memory or Oraculo merge emission is asserted."
+                        ]
+                        if receipt.get("observation_timing") == "after_external_merge"
+                        else []
+                    ),
                     "Without observed run/attempt IDs, different snapshots cannot prove different executions.",
                     "CI failure alone supplies no diagnosis, correction or redispatch authorization.",
                 ],

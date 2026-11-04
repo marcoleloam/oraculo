@@ -7,9 +7,10 @@ and optional nullable `default`; legacy hosts use `type`, `options[{id}]` and
 
 Nonempty, distinct choices and valid typed selections are required. Numeric
 values are not booleans. Conflicting hybrid schemas and duplicate option IDs are
-rejected. An explicit empty model `options` list remains valid. Omitted model
-`options` is allowed only when both child-task capability flags are false;
-explicit null or malformed options are rejected even on disabled providers.
+rejected. An explicit empty model `options` list remains valid. For a modern catalog identified by `inheritedOptions`, omitted or null model
+`options` is preserved literally without inventing choices. In a legacy catalog,
+omission is allowed only when both child-task capability flags are false, and
+explicit null is rejected. Malformed non-null options always fail validation.
 The router continues excluding disabled providers.
 
 The service uses the same choices to send `serviceTier=default` and

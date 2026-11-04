@@ -7,16 +7,14 @@ Tests may inject a transport, which is laboratory evidence, never a live receipt
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
 from oraculo.ci_events import CIEvent
+from oraculo.github_policy import github_policy
 from oraculo.pr_lifecycle import RepositoryPRLifecycle
 from oraculo.protocol import content_hash
-from oraculo.publication import PublicationError
 from oraculo.state import StateError
 
 
@@ -44,65 +42,7 @@ class RepositoryCIObserver:
         return CIEvent.model_validate(result["event"])
 
 
-def github_policy(runner, repository, base, head, cwd):
-    """Read both branch protection and applicable rules. Missing access blocks."""
-
-    def read(suffix):
-        try:
-            value = json.loads(
-                runner(["gh", "api", "repos/" + repository + suffix], cwd)
-            )
-        except (OSError, ValueError):
-            raise PublicationError("ci_host_policy_unavailable") from None
-        return value
-
-    branch = quote(base, safe="")
-    protected = read("/branches/" + branch + "/protection")
-    rules = read("/rules/branches/" + branch)
-    if not isinstance(protected, dict) or not isinstance(rules, list):
-        raise PublicationError("ci_host_policy_invalid")
-    status = protected.get("required_status_checks") or {}
-    checks = status.get("contexts", []) + [
-        r.get("context") for r in status.get("checks", [])
-    ]
-    reviews = protected.get("required_pull_request_reviews") or {}
-    count = reviews.get("required_approving_review_count", 0)
-    if type(count) is not int or count < 0:
-        raise PublicationError("ci_host_policy_invalid")
-    for rule in rules:
-        if not isinstance(rule, dict):
-            raise PublicationError("ci_host_policy_invalid")
-        params = rule.get("parameters") or {}
-        if rule.get("type") == "required_status_checks":
-            checks += [
-                r.get("context") for r in params.get("required_status_checks", [])
-            ]
-        if rule.get("type") == "pull_request":
-            required = params.get("required_approving_review_count")
-            if type(required) is not int or required < 0:
-                raise PublicationError("ci_host_policy_invalid")
-            count = max(count, required)
-        # A required workflow cannot be substituted by a similarly named check.
-        if rule.get("type") == "workflows":
-            raise PublicationError("ci_required_workflow_policy_unsupported")
-    if not checks or any(not isinstance(c, str) or not c for c in checks):
-        raise PublicationError("pr_required_checks_unspecified")
-    return dict(
-        repository=repository,
-        base=base,
-        head_sha=head,
-        method="merge",
-        observe_only=True,
-        merge_authorized=False,
-        required_checks=sorted(set(checks)),
-        required_review=count > 0,
-        allow_no_checks=False,
-        policy_source="authenticated_github_protection_and_rules",
-        review_count=count,
-    )
-
-
-def github_ci(lifecycle, binding, cwd):
+def github_ci(lifecycle, binding, cwd, managed_policy=None):
     if (
         not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", binding.repository
@@ -118,17 +58,75 @@ def github_ci(lifecycle, binding, cwd):
         cwd, repository=repo, host="github", runner=runner
     )
 
+    from oraculo.github_policy import GitHubReader
+
+    reader = GitHubReader(runner, cwd)
+
     def read(suffix):
-        try:
-            result = json.loads(runner(["gh", "api", "repos/" + repo + suffix], cwd))
-        except (OSError, ValueError):
-            raise StateError("ci_host_unavailable") from None
-        if not isinstance(result, dict):
-            raise StateError("ci_host_response_invalid")
-        return result
+        value, _ = reader.read("repos/" + repo + suffix)
+        if not isinstance(value, dict):
+            reader.fail("ci_host_response_invalid")
+        return value
 
     pull = read(f"/pulls/{binding.pr}")
     run = read(f"/actions/runs/{binding.run}")
+    association_endpoint = f"repos/{repo}/commits/{binding.head}/pulls?per_page=100"
+    associated, associations = None, {}
+
+    def associate(linked_run):
+        nonlocal associated
+        rows = linked_run.get("pull_requests", [])
+        if not isinstance(rows, list) or any(
+            not isinstance(p, dict) or type(p.get("number")) is not int for p in rows
+        ):
+            reader.fail("ci_run_pr_association_invalid")
+        source = "workflow_run_pull_requests"
+        if rows:
+            # A conflicting nonempty host relation must never use the fallback.
+            if len(rows) != 1 or rows[0]["number"] != binding.pr:
+                reader.fail("ci_host_binding_mismatch")
+        else:
+            # Only the observed pull_request execution shape is supported. A
+            # green push/dispatch or unknown event cannot prove this PR's CI.
+            if linked_run.get("event") != "pull_request":
+                reader.fail("ci_run_pr_association_unproven")
+            if associated is None:
+                associated, _ = reader.read(association_endpoint)
+            if not isinstance(associated, list) or len(associated) >= 100:
+                reader.fail("ci_commit_pr_association_invalid_or_truncated")
+            if len(associated) != 1:
+                reader.fail("ci_commit_pr_association_unproven")
+            relation = associated[0]
+            if (
+                not isinstance(relation, dict)
+                or type(relation.get("number")) is not int
+                or not isinstance(relation.get("head"), dict)
+                or not isinstance(relation.get("base"), dict)
+                or not isinstance(relation["base"].get("repo"), dict)
+                or not isinstance(relation["base"]["repo"].get("full_name"), str)
+                or not isinstance(relation.get("state"), str)
+            ):
+                reader.fail("ci_commit_pr_association_invalid_or_truncated")
+            if (
+                relation["number"] != binding.pr
+                or relation["head"].get("sha") != binding.head
+                or relation["base"].get("ref") != pull["base"]["ref"]
+                or relation["base"]["repo"]["full_name"].lower() != repo.lower()
+                or relation.get("state") not in {"open", "closed"}
+                or relation["state"] != pull.get("state")
+            ):
+                reader.fail("ci_host_binding_mismatch")
+            source = "commit_associated_pull_requests"
+        associations[str(linked_run["id"])] = dict(
+            source=source,
+            repository=repo,
+            pr=binding.pr,
+            head=binding.head,
+            base=pull["base"]["ref"],
+            suite=linked_run.get("check_suite_id"),
+            attempt=linked_run.get("run_attempt"),
+        )
+
     if (
         pull.get("number") != binding.pr
         or (pull.get("head") or {}).get("sha") != binding.head
@@ -139,11 +137,11 @@ def github_ci(lifecycle, binding, cwd):
         or run.get("head_sha") != binding.head
         or run.get("run_attempt") != binding.attempt
         or (run.get("repository") or {}).get("full_name", "").lower() != repo.lower()
-        or not any(p.get("number") == binding.pr for p in run.get("pull_requests", []))
     ):
         raise StateError("ci_host_binding_mismatch")
+    associate(run)
     base = pull["base"]["ref"]
-    policy = github_policy(runner, repo, base, binding.head, cwd)
+    policy = github_policy(runner, repo, base, binding.head, cwd, managed_policy)
     pr = dict(
         host="github",
         repository=repo,
@@ -153,6 +151,11 @@ def github_ci(lifecycle, binding, cwd):
         url=f"https://github.com/{repo}/pull/{binding.pr}",
     )
     receipt = lifecycle.inspect(pr, policy, cwd)
+    if (
+        receipt.get("state") == "open"
+        and policy["remote_capability"]["base_sha"] != binding.base
+    ):
+        raise StateError("ci_host_binding_mismatch")
     # Required checks may belong to multiple workflows (the public Oraculo
     # contract has Linux/macOS in CI and a separate orchestration workflow).
     checks = read(f"/commits/{binding.head}/check-runs?filter=latest&per_page=100")
@@ -173,6 +176,12 @@ def github_ci(lifecycle, binding, cwd):
         if (
             check.get("head_sha") != binding.head
             or (check.get("app") or {}).get("slug") != "github-actions"
+            or any(
+                source["name"] == check.get("name")
+                and source["app_id"]
+                not in (None, -1, (check.get("app") or {}).get("id"))
+                for source in policy.get("check_sources", [])
+            )
         ):
             raise StateError("ci_check_source_unverified")
         suite = (check.get("check_suite") or {}).get("id")
@@ -183,24 +192,23 @@ def github_ci(lifecycle, binding, cwd):
         key = str(candidate["id"])
         fresh_run = run if key == binding.run else read(f"/actions/runs/{key}")
         if (
-            fresh_run.get("head_sha") != binding.head
+            str(fresh_run.get("id")) != key
+            or fresh_run.get("head_sha") != binding.head
             or fresh_run.get("check_suite_id") != suite
             or (fresh_run.get("repository") or {}).get("full_name", "").lower()
             != repo.lower()
-            or not any(
-                p.get("number") == binding.pr
-                for p in fresh_run.get("pull_requests", [])
-            )
             or type(fresh_run.get("run_attempt")) is not int
             or fresh_run.get("run_attempt") != candidate.get("run_attempt")
         ):
             raise StateError("ci_host_binding_mismatch")
+        associate(fresh_run)
         linked[key] = fresh_run
-    observed_jobs, check_bindings = [], []
+    observed_jobs, check_bindings, job_snapshots = [], [], {}
     passed = set(c["name"] for c in required) == set(policy["required_checks"])
     for run_id, linked_run in linked.items():
         attempt = linked_run["run_attempt"]
         jobs = read(f"/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
+        job_snapshots[run_id] = jobs
         rows = jobs.get("jobs")
         if (
             not isinstance(rows, list)
@@ -272,13 +280,26 @@ def github_ci(lifecycle, binding, cwd):
             and linked_run.get("conclusion") == "success"
         )
         observed_jobs.append(
-            dict(run=run_id, attempt=attempt, jobs_hash=content_hash(jobs))
+            dict(
+                run=run_id,
+                attempt=attempt,
+                jobs_hash=content_hash(jobs),
+                status=linked_run.get("status"),
+                conclusion=linked_run.get("conclusion"),
+            )
         )
-    passed = (
-        passed
-        and receipt.get("ready") is True
-        and pull.get("state") == "open"
-        and pull.get("mergeable") is True
+    passed = passed and (
+        (
+            receipt.get("ready") is True
+            and pull.get("state") == "open"
+            and pull.get("mergeable") is True
+        )
+        or (
+            managed_policy is not None
+            and receipt.get("state") == "merged"
+            and receipt.get("merge_verification")
+            and not receipt.get("blockers")
+        )
     )
     # A bounded final read catches source/base/run/policy changes during I/O.
     if (
@@ -290,7 +311,20 @@ def github_ci(lifecycle, binding, cwd):
         or any(read(f"/actions/runs/{k}") != v for k, v in linked.items())
         or read(f"/commits/{binding.head}/check-runs?filter=latest&per_page=100")
         != checks
-        or github_policy(runner, repo, base, binding.head, cwd) != policy
+        or read(f"/actions/runs?head_sha={binding.head}&per_page=100") != runs
+        or any(
+            read(
+                f"/actions/runs/{k}/attempts/{linked[k]['run_attempt']}/jobs?per_page=100"
+            )
+            != v
+            for k, v in job_snapshots.items()
+        )
+        or (
+            associated is not None
+            and reader.read(association_endpoint)[0] != associated
+        )
+        or github_policy(runner, repo, base, binding.head, cwd, managed_policy)
+        != policy
     ):
         raise StateError("ci_snapshot_changed")
     conclusion = "pending"
@@ -303,11 +337,18 @@ def github_ci(lifecycle, binding, cwd):
     observed = max(_stamp(r.get("updated_at")) for r in linked.values())
     evidence = dict(
         policy=policy,
+        observation_timing="after_merge"
+        if receipt.get("state") == "merged"
+        else "before_merge",
         lifecycle=receipt,
         jobs_hash=content_hash(observed_jobs),
         required_checks_hash=content_hash(checks),
         runs=observed_jobs,
         check_bindings=sorted(check_bindings, key=lambda c: c["name"]),
+        run_pr_associations=associations,
+        association_observations=[
+            o for o in reader.observations if o["endpoint"] == association_endpoint
+        ],
         run_hash=content_hash(run),
         pull_hash=content_hash(pull),
         source="authenticated_gh_api",
@@ -316,8 +357,8 @@ def github_ci(lifecycle, binding, cwd):
     # Same upstream snapshot has the same identity; no synthesized local clock
     # may turn an old event into a fresh host event.
     event = binding.model_dump(mode="json") | dict(
-        # Keep the existing upstream event identity: check_bindings is an
-        # additive semantic projection of these same authenticated endpoints.
+        # Bind this metadata snapshot; canonical round identity separately uses
+        # per-check execution facts, without an invented local observer clock.
         event_id=content_hash(
             [
                 binding.model_dump(),
