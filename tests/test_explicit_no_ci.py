@@ -4,12 +4,43 @@ import copy
 import json
 
 import pytest
-from test_github_policy_compatibility import ManagedPolicyHost
+from test_github_policy_compatibility import ManagedPolicyHost, PolicyHost
 from test_report_prevalidation import flow as flow_fixture
 
 from oraculo.pr_lifecycle import RepositoryPRLifecycle
 
 flow = flow_fixture
+
+
+def no_ci_response(argv, raw):
+    if argv[:2] == ["gh", "api"] and argv[2].endswith("/protection"):
+        value = json.loads(raw)
+        value["required_status_checks"] = None
+        return json.dumps(value)
+    return raw
+
+
+class NoCIPolicyHost(PolicyHost):
+    def __call__(self, argv, cwd):
+        raw = super().__call__(argv, cwd)
+        return no_ci_response(argv, raw) if self.policy_checks is None else raw
+
+
+def available_policy(host):
+    host.__class__ = NoCIPolicyHost
+    host.capability = "available"
+    host.protected = True
+
+
+class NoCIManagedHost(ManagedPolicyHost):
+    def __init__(self, head):
+        super().__init__(head)
+        self.capability = "available"
+        self.protected = True
+
+    def __call__(self, argv, cwd):
+        raw = super().__call__(argv, cwd)
+        return no_ci_response(argv, raw) if self.policy_checks is None else raw
 
 
 @pytest.mark.parametrize("entrypoint", ["api", "cli"])
@@ -34,7 +65,7 @@ async def test_no_ci_journey(flow, monkeypatch, tmp_path, entrypoint, historical
     from oraculo.task_transport import SocketMemory
 
     task, _, (_, policy, original) = await managed_setup(flow, monkeypatch)
-    host = ManagedPolicyHost(original.head)
+    host = NoCIManagedHost(original.head)
     host.required = policy["required_checks"].copy()
     host.merged = historical
     policy.update(method="merge", required_checks=[], allow_no_checks=True)
@@ -241,7 +272,7 @@ async def test_no_ci_journey(flow, monkeypatch, tmp_path, entrypoint, historical
         current["pr_observation"]["receipt"]["observed_host_policy"][
             "remote_capability"
         ]["state"]
-        == "feature_unavailable"
+        == "enforced"
     )
     for key in ("request", "report", "submitted_report", "memory", "child", "base_sha"):
         assert current.get(key) == before.get(key)
@@ -312,6 +343,7 @@ async def test_no_ci_journey(flow, monkeypatch, tmp_path, entrypoint, historical
         "blank_reason",
         "unknown",
         "remote_check",
+        "remote_classic_check",
         "workflow",
         "review",
         "codeowner",
@@ -327,6 +359,7 @@ def test_no_ci_remote_floor(tmp_path, case):
     from oraculo.publication import PublicationError
 
     host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
     policy.update(required_checks=[], allow_no_checks=True)
     if case == "no_optin":
         policy.pop("allow_no_checks")
@@ -334,6 +367,8 @@ def test_no_ci_remote_floor(tmp_path, case):
         policy.pop("policy_source")
     if case == "blank_reason":
         policy["policy_source"] = "  "
+    if case == "remote_classic_check":
+        host.policy_checks = ["new mandatory CI"]
     if case == "unknown":
         host.rules_error = (403, "Forbidden")
     if case in {"remote_check", "workflow", "review", "codeowner", "lastpush"}:
@@ -386,6 +421,7 @@ def test_no_ci_policy_change_after_memory(tmp_path, case):
     from oraculo.state import StateError
 
     host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
     policy.update(required_checks=[], allow_no_checks=True)
     first = lifecycle.validate_host_policy(pr, policy, tmp_path)
     changed = copy.deepcopy(first)
@@ -410,6 +446,7 @@ def test_no_ci_historical_identity(tmp_path, case):
     from oraculo.publication import PublicationError
 
     host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
     policy.update(required_checks=[], allow_no_checks=True)
     host.merged = True
 
@@ -460,6 +497,7 @@ def test_no_ci_absent_or_cancelled_rollup(tmp_path, rollup, historical):
     from test_github_policy_compatibility import setup
 
     host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
     policy.update(required_checks=[], allow_no_checks=True)
     host.merged = historical
 
@@ -487,6 +525,7 @@ def test_no_ci_does_not_waive_other_merge_states(tmp_path, state):
     from test_github_policy_compatibility import setup
 
     host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
     policy.update(required_checks=[], allow_no_checks=True)
 
     def transport(argv, cwd):
@@ -502,3 +541,60 @@ def test_no_ci_does_not_waive_other_merge_states(tmp_path, state):
     assert (
         "pr_merge_state_blocked" in lifecycle.inspect(pr, policy, tmp_path)["blockers"]
     )
+
+
+@pytest.mark.parametrize("endpoint", ["protection", "rules"])
+def test_no_ci_inaccessible_policy_stays_blocked(tmp_path, endpoint):
+    from test_github_policy_compatibility import LIMIT, setup
+
+    from oraculo.publication import PublicationError
+
+    host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
+    policy.update(required_checks=[], allow_no_checks=True)
+    host.capability = "available"
+    host.protected = False
+    if endpoint == "protection":
+        host.protection_error = 403, LIMIT
+    else:
+        host.rules_error = 403, LIMIT
+
+    # Remove real check floors so that this specifically tests unreadable policy.
+    def transport(argv, cwd):
+        raw = host(argv, cwd)
+        if argv[:2] == ["gh", "api"] and argv[2].endswith("/protection"):
+            value = json.loads(raw)
+            value["required_status_checks"] = None
+            return json.dumps(value)
+        return raw
+
+    lifecycle.runner = transport
+    with pytest.raises(
+        PublicationError, match="ci_no_checks_policy_discovery_required"
+    ):
+        lifecycle.validate_host_policy(pr, policy, tmp_path)
+
+
+@pytest.mark.parametrize("case", ["unknown", "remote_checks", "changed_before_emit"])
+def test_no_ci_facade_merge_checks_fresh_policy_before_emission(tmp_path, case):
+    from test_github_policy_compatibility import setup
+
+    from oraculo.publication import PublicationError
+
+    host, lifecycle, pr, policy = setup(tmp_path)
+    available_policy(host)
+    policy.update(required_checks=[], allow_no_checks=True)
+    intents = []
+
+    def change():
+        intents.append(True)
+        if case == "changed_before_emit":
+            host.policy_checks = ["new mandatory CI"]
+
+    if case == "unknown":
+        host.rules_error = 403, "Forbidden"
+    if case == "remote_checks":
+        host.policy_checks = ["new mandatory CI"]
+    with pytest.raises(PublicationError):
+        lifecycle.merge(pr, policy, tmp_path, before_merge=change)
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in host.calls)

@@ -209,6 +209,17 @@ class RepositoryPRLifecycle:
         return observed
 
     def merge(self, pr, policy, cwd, **kwargs):
+        if pr.get("host") == "github" and policy.get("allow_no_checks") is True:
+            # The facade must fail before effects even outside TaskClosure.
+            self.validate_host_policy(pr, policy, cwd)
+            before = kwargs.get("before_merge")
+
+            def before_no_ci_merge():
+                if before is not None:
+                    before()
+                self.validate_host_policy(pr, policy, cwd)
+
+            kwargs["before_merge"] = before_no_ci_merge
         receipt = self._adapter(pr, cwd).merge(pr, policy, cwd, **kwargs)
         if pr.get("host") == "github" and receipt["state"] == "merged":
             return self.inspect(pr, policy, cwd)

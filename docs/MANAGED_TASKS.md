@@ -1126,7 +1126,10 @@ incerta, a política permanece imutável e somente a reconciliação é permitid
 Para um projeto explicitamente sem CI, a origem deve declarar conjuntamente
 `required_checks: []`, `allow_no_checks: true` e `policy_source` não vazio,
 com os mesmos bindings exatos e autorização acima. Não basta uma lista vazia.
-A descoberta remota autenticada continua obrigatória: checks/workflows exigidos,
+A descoberta remota autenticada e conclusiva continua obrigatória: ambos os
+endpoints precisam estar disponíveis (ou ausência clássica explicitamente
+confirmada, com regras disponíveis). Limitação de plano não comprova a ausência
+de requisitos para esta política sem CI. Checks/workflows exigidos,
 revisão, codeowners e aprovação do último push não são dispensados.
 
 Essa política registra `not_required_by_explicit_policy`, nunca PASS, com autoria

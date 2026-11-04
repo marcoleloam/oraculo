@@ -335,6 +335,11 @@ def github_policy(runner, repository, base, head, cwd, managed_policy=None):
             )
         ):
             reader.fail("ci_explicit_project_policy_required")
+        if not required and (
+            protection_state not in {"available", "not_protected"}
+            or rules_state != "available"
+        ):
+            reader.fail("ci_no_checks_policy_discovery_required")
         if not set(checks) <= set(required) or (
             (count or specialized_review) and not policy["required_review"]
         ):
