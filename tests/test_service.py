@@ -880,3 +880,44 @@ async def test_dispatch_retry_lost_response_replays_same_key(running_service):
     assert len(remote.calls) == 3
     assert remote.calls[1] == remote.calls[2]
     assert remote.calls[0][2] != remote.calls[1][2]
+
+
+@pytest.mark.parametrize(
+    "tier,fast,expected",
+    [
+        (
+            ["default", "priority"],
+            [False, True],
+            {"serviceTier": "default", "fastMode": False},
+        ),
+        (["priority"], [True], {}),
+        (["priority"], ["false", True], {}),
+    ],
+)
+async def test_current_billing_options_follow_advertised_values(
+    running_service, tier, fast, expected
+):
+    service = running_service
+    service.catalog = {
+        "providers": [
+            {
+                "providerInstanceId": "custom",
+                "models": [
+                    {
+                        "id": "model",
+                        "options": [
+                            {
+                                "id": "serviceTier",
+                                "values": tier,
+                                "default": "priority",
+                            },
+                            {"id": "fastMode", "values": fast, "default": True},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    assert service.target_options("custom", "model") == expected
+    assert service.target_options("custom", "other") == {}
+    assert service.target_options("other", "model") == {}
