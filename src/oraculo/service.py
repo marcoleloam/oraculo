@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from oraculo.capability_options import option_values
 from oraculo.config import Config, resources_root
 from oraculo.memory.bridge import MemoryBridge, artifact_context, public_cycle
 from oraculo.memory.context import Context
@@ -474,11 +475,13 @@ class Service:
         )
         options = {o["id"]: o for o in model_entry.get("options") or []}
         result = {}
-        if "default" in {
-            choice["id"] for choice in options.get("serviceTier", {}).get("options", [])
-        }:
+        if "serviceTier" in options and "default" in option_values(
+            options["serviceTier"]
+        ):
             result["serviceTier"] = "default"
-        if options.get("fastMode", {}).get("type") == "boolean":
+        if "fastMode" in options and any(
+            choice is False for choice in option_values(options["fastMode"])
+        ):
             result["fastMode"] = False
         return result
 
