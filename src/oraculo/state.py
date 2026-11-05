@@ -543,6 +543,13 @@ class State:
             if row and row["state"] != "reserved":
                 raise StateError("managed_reservation_executing")
             self.audit("managed.cancel", {"task_id": task_id, "proof": proof})
+            # A legacy id with no reservation row still freezes every admission
+            # until it leaves this list. Cancel is that terminal proof.
+            untracked = self.get_meta("managed_legacy_untracked") or []
+            self.set_meta(
+                "managed_legacy_untracked",
+                [item for item in untracked if item != task_id],
+            )
             self.connection.execute(
                 "DELETE FROM managed_reservations WHERE id=?", (task_id,)
             )
