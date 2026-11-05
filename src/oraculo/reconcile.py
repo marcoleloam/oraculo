@@ -20,6 +20,25 @@ def _terminal_status(
     return next(iter(statuses)) if len(statuses) == 1 else None
 
 
+def _child_terminal(snapshot: dict[str, Any], thread_id: str) -> bool:
+    """A descendant is terminal when its latest run ended or it never started.
+
+    ``settlement_child_clear`` already treats idle + no latest run + no recent
+    runs + no active run + no pending requests as terminal. ``_terminal_status``
+    cannot, because it requires a run id.
+    """
+    latest = snapshot["thread"].get("latestRunId")
+    if latest:
+        return _terminal_status(snapshot, thread_id, latest) is not None
+    thread = snapshot["thread"]
+    return (
+        thread.get("activeRunId") is None
+        and thread.get("pendingRequestCount", 0) == 0
+        and thread.get("status") == "idle"
+        and not snapshot.get("recentRuns")
+    )
+
+
 def _historical_stop(
     snapshot: dict[str, Any], thread_id: str, run_id: str
 ) -> str | None:
@@ -207,7 +226,7 @@ class Reconciler:
                 root, attempt["thread_id"], attempt["run_id"]
             ) or _historical_stop(root, attempt["thread_id"], attempt["run_id"])
             children_terminal = all(
-                _terminal_status(snapshot, thread_id, snapshot["thread"]["latestRunId"])
+                _child_terminal(snapshot, thread_id)
                 for thread_id, snapshot in snapshots.items()
                 if thread_id != attempt["thread_id"]
             )
