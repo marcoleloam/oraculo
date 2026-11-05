@@ -1,6 +1,7 @@
 """Real disposable Git; synthetic Azure REST data, never external support proof."""
 
 import copy
+import hashlib
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
@@ -162,6 +163,29 @@ def existing(azure, status="active"):
     _, spec, host, adapter = azure
     host.rows = [host.row(status)]
     return adapter.ensure_pr({**spec, "reconcile_only": True, "pr_id": 17})
+
+
+def test_c4_duplicate_source_target_narrows_to_task_marker(azure):
+    """C4: several PRs on one branch resolve by this task's marker."""
+    _repo, spec, host, adapter = azure
+    marker = (
+        "<!-- oraculo-task:"
+        + hashlib.sha256(spec["task_id"].encode()).hexdigest()
+        + " -->"
+    )
+    abandoned = host.row(number=17)
+    current = host.row(number=18)
+    abandoned["description"] = "Abandoned duplicate"
+    current["description"] = "Reviewed change\n\n" + marker
+    host.rows = [abandoned, current]
+    receipt = adapter.ensure_pr({**spec, "reconcile_only": True})
+    assert receipt["number"] == 18
+    assert host.created == 0
+    current["description"] = marker
+    abandoned["description"] = "other\n\n" + marker
+    with pytest.raises(PublicationError, match="publication_pr_ambiguous"):
+        adapter.ensure_pr({**spec, "reconcile_only": True})
+    assert host.created == 0
 
 
 @pytest.mark.parametrize("old_state", ["failed", "pending", "succeeded"])
