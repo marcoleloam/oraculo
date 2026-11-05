@@ -339,12 +339,20 @@ class MemoryCycles:
             item = self.get(cycle_id)
             if "report" in item:
                 if (
-                    item["work_status"] != status
-                    or item["report"]["evidence"] != selected
+                    item["work_status"] == status
+                    and item["report"]["evidence"] == selected
+                ):
+                    return item
+                # A failed write can take corrected evidence and a new proposal.
+                # Saved and not-yet-failed reports stay immutable.
+                if not (
+                    item["write_state"] == "failed" and item["work_status"] == status
                 ):
                     raise ConflictError("memory_finish_reused")
-                return item
-            if item["work_status"] not in {"running", status}:
+                item.pop("proposal", None)
+                item["write_error"] = None
+                item["next_attempt_at"] = 0
+            elif item["work_status"] not in {"running", status}:
                 raise ConflictError("memory_finish_reused")
             finished_at = item.get("finished_at", _now())
             if rejection:
@@ -437,6 +445,9 @@ class MemoryCycles:
             plain(evidence.get("title") or evidence.get("summary"), 140)
             or "Memória da tarefa"
         )
+        # Same slash shielding as the body. markdown() leaves '/' literal, and
+        # a title like "reviews/alpha" is otherwise rejected forever.
+        visible = markdown(title).replace("/", "&#47;")
         content = render_page(
             {
                 "schema_version": 1,
@@ -445,12 +456,12 @@ class MemoryCycles:
                 "type": "source",
                 "sources": [f"[[{raw}]]"],
                 "tags": [],
-                "aliases": [markdown(title)],
+                "aliases": [visible],
                 "reviewed": False,
                 "created": day,
                 "updated": day,
             },
-            f"# {markdown(title)}\n\nWork status: {item['work_status']}\n\n"
+            f"# {visible}\n\nWork status: {item['work_status']}\n\n"
             f"Recorded: {item['finished_at']}\n\n{summary}\n\n"
             f"Structured evidence and provenance: [[{raw}]]\n",
         )
@@ -490,6 +501,13 @@ class MemoryCycles:
                 item = self.get(cycle_id)
                 if item["write_state"] == "saved":
                     return item
+                # A deterministic publication error keeps the bad proposal.
+                # Drop it so the retry rebuilds from the current report.
+                error = item.get("write_error") or ""
+                if item["write_state"] == "failed" and error.startswith(
+                    "MemoryError:"
+                ):
+                    item.pop("proposal", None)
                 if "proposal" not in item:
                     item["proposal"] = self._proposal(item, raw)
                 item["write_attempts"] += 1

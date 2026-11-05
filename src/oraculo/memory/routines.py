@@ -14,6 +14,7 @@ from oraculo.memory.schema import (
     links,
     parse_page,
     project_key,
+    resolve_link,
 )
 from oraculo.protocol import content_hash
 
@@ -153,16 +154,22 @@ class KnowledgeRoutines:
                 metadata, _ = parse_page(content)
             except MemoryError:
                 continue
-            consumed.update(
-                target.removesuffix(".md")
-                for value in metadata.get("sources", [])
-                for target in links(value)
-            )
+            sources = metadata.get("sources")
+            if not isinstance(sources, list):
+                continue
+            for value in sources:
+                if not isinstance(value, str):
+                    continue
+                for target in links(value):
+                    try:
+                        consumed.add(resolve_link(target, set(files), path))
+                    except MemoryError:
+                        continue
         selected, size = [], 0
         for path, content in sorted(files.items()):
             if (
                 not path.startswith(corpus(project_id) + "/raw/")
-                or path.removesuffix(".md") in consumed
+                or path in consumed
             ):
                 continue
             length = len(content.encode())

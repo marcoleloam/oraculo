@@ -4,6 +4,7 @@ import pytest
 
 from oraculo.presentation import (
     PHASES,
+    markdown,
     parse_return_message,
     return_message,
     summary_markdown,
@@ -110,6 +111,13 @@ def test_old_task_without_format_keeps_json(tmp_path):
         == "json"
     )
     store.close()
+
+
+def test_c6_apostrophe_stays_literal_and_hash_stays_escaped():
+    """C6: html.escape(quote=True) plus the '#' escape produced &\\#x27;."""
+    assert markdown("Don't") == "Don't"
+    assert markdown("a#b") == "a\\#b"
+    assert "<script>" not in markdown("</pre><script>alert(1)</script>")
 
 
 def test_untrusted_title_cannot_escape_protocol_html(tmp_path):
