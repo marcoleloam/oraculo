@@ -134,6 +134,29 @@ def test_baseline_calls_real_context_bundle_and_not_an_approximation(
         choose_ranker("acceptance", {"recall_at_10": 0.0}, {})
 
 
+def test_n_memory_freshness_eval_1_legacy_rank_drops_index_preamble(tmp_path):
+    """N-memory-freshness-eval-1: index pages are not ranked baseline hits."""
+
+    vault = tmp_path / "vault"
+    materialize(vault, 50)
+    question = next(
+        item
+        for item in question_bank()
+        if item["split"] == "tuning" and item["relevant_paths"]
+    )
+    measured = measure_question(vault, question, ranker=None)
+    assert measured["ranking_convention"] == "candidates_without_index_preamble"
+    assert any(path.endswith("/wiki/index.md") for path in measured["document_paths"])
+    assert measured["ranked_paths"] == [
+        path
+        for path in measured["document_paths"]
+        if not path.endswith("/wiki/index.md")
+    ]
+    assert measured["recall_at_10"] == recall_at_10(
+        measured["ranked_paths"], question["relevant_paths"]
+    )
+
+
 def test_recall_ignores_no_answer_shape():
     with pytest.raises(MemoryError, match="relevant"):
         recall_at_10(["a"], [])
@@ -143,13 +166,37 @@ def test_tuning_scale_50_is_measured_with_the_real_baseline(tmp_path):
     report = run_benchmark(tmp_path / "work", scales=(50,))
     choice = report["choice"]
     assert choice["split"] == "tuning"
-    assert choice["selected"] == FROZEN_RANKER
-    assert choice["constant_matches"] is True
+    # N-memory-freshness-eval-1: the index preamble made legacy recall look
+    # like zero, so the +10pp branch selected the frozen ranker. Without those
+    # pages the baseline is already above 0.90. Quality holds and MRR matches,
+    # but context does not shrink by 30%, so the gate selects nothing.
+    assert choice["selected"] is None
+    assert choice["constant_matches"] is False
+    assert choice["frozen_constant"] == FROZEN_RANKER
+    normalized = next(
+        item for item in choice["comparisons"] if item["ranker"] == FROZEN_RANKER
+    )
+    assert normalized["quality_preserved"] is True
+    assert normalized["median_context_reduced_30pct"] is False
+    assert normalized["passed"] is False
+    tuning = report["scales"][0]["tuning"]["legacy_bundle"]
+    acceptance_legacy = report["scales"][0]["acceptance"]["legacy_bundle"]
+    assert tuning["ranking_convention"] == "candidates_without_index_preamble"
+    assert acceptance_legacy["ranking_convention"] == (
+        "candidates_without_index_preamble"
+    )
+    assert tuning["recall_at_10"] > 0.90
     acceptance = report["scales"][0]["acceptance_gate"]
     # The gate is whatever the frozen acceptance split produced. Do not rewrite
     # labels from this assertion; a miss stays a miss.
-    assert "passed" in acceptance
-    assert acceptance["baseline_recall_at_10"] is not None
+    assert acceptance["passed"] is False
+    assert acceptance["reason"] == (
+        "baseline_above_0.90_preserve_quality_and_shrink_context"
+    )
+    assert acceptance["baseline_recall_at_10"] > 0.90
+    budgeted = report["scales"][0]["acceptance"]["budgeted"]
+    assert budgeted["mrr"] + 1e-12 >= acceptance_legacy["mrr"]
+    assert report["measured_ranker"] == FROZEN_RANKER
     assert report["scales"][0]["acceptance"]["legacy_bundle"]["no_answer"]["count"] > 0
     legacy_false = report["scales"][0]["acceptance"]["legacy_bundle"]["no_answer"][
         "false_hits"

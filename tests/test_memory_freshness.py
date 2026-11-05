@@ -510,3 +510,65 @@ def test_review_proposal_is_pure_and_keeps_history():
     suggested = parse_page(suggestion["suggestion"][0]["content"])[0]
     assert suggested["reviewed"] is True
     assert json.dumps(files) == snapshot
+
+
+def test_n_memory_freshness_eval_2_malformed_concept_rejects_review():
+    """N-memory-freshness-eval-2: a stray concept page does not crash review."""
+
+    path, content = concept([claim(id="k-original", text="valor antigo")])
+    broken = "projects/alpha/wiki/concepts/alpha--broken.md"
+    files = {
+        path: content,
+        "projects/alpha/wiki/concepts/notes.md": "sem frontmatter\n",
+        broken: (
+            "---\nproject_id: alpha\ntype: concept\nschema_version: 1\n---\n"
+            "# sem identificador\n"
+        ),
+    }
+    result = build_review_proposal(
+        files, "alpha", [{"claim_id": "k-original", "action": "retire"}]
+    )
+    assert result["state"] == "rejected"
+    assert result.get("operation_id") is None
+    assert "proposal" not in result
+    assert {item["code"] for item in result["findings"]} == {"invalid_page"}
+    assert any(item["detail"] == "frontmatter_required" for item in result["findings"])
+    assert any(
+        item["detail"] == "page_id_and_claims_required" for item in result["findings"]
+    )
+
+
+def test_n_memory_freshness_eval_3_duplicate_decisions_reject():
+    """N-memory-freshness-eval-3: repeated decisions are not a publishable page."""
+
+    from oraculo.memory.freshness import _derived_id
+
+    path, content = concept([claim(id="k-original", text="valor antigo")])
+    files = {path: content}
+    decision = {
+        "claim_id": "k-original",
+        "action": "pointer",
+        "pointer": "system:queues",
+    }
+    repeated = build_review_proposal(files, "alpha", [decision, dict(decision)])
+    assert repeated["state"] == "rejected"
+    assert repeated.get("operation_id") is None
+    assert "proposal" not in repeated
+    assert any(item["code"] == "duplicate_decision" for item in repeated["findings"])
+    derived = _derived_id(
+        {"meta": {"project_id": "alpha"}},
+        "k-original",
+        "pointer",
+        "system:queues",
+    )
+    occupied, occupied_content = concept(
+        [
+            claim(id="k-original", text="valor antigo"),
+            claim(id=derived, text="system:queues", kind="hypothesis"),
+        ]
+    )
+    collided = build_review_proposal(
+        {occupied: occupied_content}, "alpha", [decision]
+    )
+    assert collided["state"] == "rejected"
+    assert any(item["code"] == "duplicate_decision" for item in collided["findings"])

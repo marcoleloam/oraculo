@@ -730,6 +730,23 @@ def _selected_bytes(bundle: dict[str, Any]) -> int:
     )
 
 
+def _metric_ranking(
+    bundle: dict[str, Any], ranked: list[str]
+) -> tuple[list[str], str]:
+    """Score the candidate list, not the fixed index preamble.
+
+    ``legacy_bundle`` sets ``index_first`` and prefixes both wiki indexes.
+    Those pages are not ranked hits. Recall and MRR use the remainder.
+    """
+
+    if bundle.get("index_first") is True:
+        return (
+            [path for path in ranked if not path.endswith("/wiki/index.md")],
+            "candidates_without_index_preamble",
+        )
+    return list(ranked), "bundle_order"
+
+
 def measure_question(
     vault: Path, question: dict[str, Any], *, ranker: str | None
 ) -> dict[str, Any]:
@@ -762,6 +779,7 @@ def measure_question(
             raise MemoryError("detail_budget_exceeded")
         if selection["tokens"]["brief"] > selection["budget"]["brief_tokens"]:
             raise MemoryError("brief_budget_exceeded")
+    ranked, ranking_convention = _metric_ranking(bundle, ranked)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     relevant = question["relevant_paths"]
     record: dict[str, Any] = {
@@ -772,6 +790,7 @@ def measure_question(
         "project_id": question["project_id"],
         "abstained": abstained,
         "ranked_paths": ranked,
+        "ranking_convention": ranking_convention,
         "selected_pages": len(bundle["documents"]),
         "selected_bytes": _selected_bytes(bundle),
         "document_paths": [document["path"] for document in bundle["documents"]],
@@ -785,6 +804,19 @@ def measure_question(
         record["recall_at_10"] = recall_at_10(ranked, relevant)
         record["reciprocal_rank"] = reciprocal_rank(ranked, relevant)
     return record
+
+
+def _ranking_convention(records: list[dict[str, Any]]) -> str | list[str] | None:
+    conventions = []
+    for row in records:
+        convention = row.get("ranking_convention")
+        if convention not in conventions:
+            conventions.append(convention)
+    if not conventions:
+        return None
+    if len(conventions) == 1:
+        return conventions[0]
+    return conventions
 
 
 def _mean(values: list[float]) -> float | None:
@@ -857,6 +889,7 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         "latency_ms_p50": pack(answerable).get("latency_ms_p50"),
         "latency_ms_p95": pack(answerable).get("latency_ms_p95"),
         "negative_results": negatives,
+        "ranking_convention": _ranking_convention(records),
         "by_language": by_language,
         "by_type": by_type,
         "no_answer": {

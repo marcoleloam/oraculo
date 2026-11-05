@@ -745,3 +745,60 @@ def test_apply_preserves_frontmatter_except_publisher_stamp(tmp_path, monkeypatc
         (pub.journals / f"{applied['receipts'][0]['operation_id']}.json").read_text()
     )
     assert journal["before"]["projects/alpha/wiki/concepts/alpha--noted.md"]
+
+
+def test_n_memory_compiler_2_replay_across_midnight_returns_receipts(
+    tmp_path, monkeypatch
+):
+    """N-memory-compiler-2: a later-day replay returns the existing receipts."""
+
+    class Clock(date):
+        current = date(2030, 1, 2)
+
+        @classmethod
+        def today(cls):
+            return cls.current
+
+    monkeypatch.setattr("oraculo.memory.publish.date", Clock)
+    pub = publisher(tmp_path)
+    raw = pub.snapshot("alpha", "evidência sintética")
+    legacy = render_page(
+        _frontmatter(
+            page_id="alpha--noted",
+            note="manter-esta-nota",
+            sources=[f"[[{raw.removesuffix('.md')}]]"],
+            aliases=["Nota"],
+        ),
+        "Texto legado.\n",
+    )
+    pub.publish(proposal(legacy, operation="noted", name="noted"))
+    plan = approve(plan_migration(pub, "alpha"))
+    applied = apply_migration(pub, plan)
+    assert applied["state"] == "confirmed"
+    assert applied["receipts"]
+    Clock.current = date(2030, 1, 3)
+    replay = apply_migration(pub, plan)
+    assert replay["state"] == "confirmed"
+    assert replay["receipts"] == applied["receipts"]
+    assert replay["pending_review"] == applied["pending_review"]
+    path = pub.vault / "projects/alpha/wiki/concepts/alpha--noted.md"
+    meta, body = parse_page(path.read_text(encoding="utf-8"))
+    assert meta["updated"] == "2030-01-02"
+    assert body == "Texto legado.\n"
+    meta["updated"] = "2030-02-01"
+    path.write_text(render_page(meta, body), encoding="utf-8")
+    _retarget(pub, path)
+    later = apply_migration(pub, plan)
+    assert later["state"] == "confirmed"
+    meta["updated"] = "2029-12-31"
+    path.write_text(render_page(meta, body), encoding="utf-8")
+    _retarget(pub, path)
+    with pytest.raises(MemoryError, match="^migration_identity_changed$"):
+        apply_migration(pub, plan)
+
+
+def _retarget(pub, path):
+    relative = path.relative_to(pub.vault).as_posix()
+    catalog = json.loads(pub.catalog.read_bytes().decode("utf-8"))
+    catalog[relative] = digest(path.read_bytes())
+    pub.catalog.write_bytes(json.dumps(catalog, sort_keys=True).encode())

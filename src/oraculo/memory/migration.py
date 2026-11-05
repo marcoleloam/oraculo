@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -467,6 +467,66 @@ def _publisher_stamp() -> str:
     return publish_mod.date.today().isoformat()
 
 
+def _stamp_day(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _updated_stamp_allowed(stored: Any, wanted: Any, applied: Any) -> bool:
+    stored_day = _stamp_day(stored)
+    if stored_day is None:
+        return False
+    allowed = {
+        day
+        for day in (
+            _stamp_day(wanted),
+            _stamp_day(applied),
+            _stamp_day(_publisher_stamp()),
+        )
+        if day is not None
+    }
+    if stored_day in allowed:
+        return True
+    applied_day = _stamp_day(applied)
+    return applied_day is not None and stored_day >= applied_day
+
+
+def _journal_after_updated(
+    publisher: Publisher, operation_id: str, path: str
+) -> str | None:
+    journal_path = publisher.journals / f"{operation_id}.json"
+    try:
+        stored = json.loads(journal_path.read_bytes().decode("utf-8"))
+        encoded = stored.get("after", {}).get(path)
+        if not isinstance(encoded, str):
+            return None
+        text = base64.b64decode(encoded, validate=True).decode("utf-8")
+        meta, _body = parse_page(text)
+    except (
+        OSError,
+        json.JSONDecodeError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        MemoryError,
+    ):
+        return None
+    updated = meta.get("updated")
+    if isinstance(updated, date):
+        return updated.isoformat()
+    if isinstance(updated, str):
+        return updated
+    return None
+
+
 def _journal_before(publisher: Publisher, operation_id: str, path: str) -> str:
     journal_path = publisher.journals / f"{operation_id}.json"
     try:
@@ -635,8 +695,14 @@ def _assert_migrated_page(
     wanted_updated = wanted.pop("updated", None)
     if stored != wanted:
         raise MemoryError("migration_identity_changed")
-    # Publisher always rewrites updated. Any other date is a real edit.
-    if stored_updated not in {wanted_updated, _publisher_stamp()}:
+    # Publisher stamps updated on the apply day recorded in the journal.
+    # A later replay, including one that crosses midnight, must accept that
+    # stamp and any later stamp. A date before the apply day is still a change.
+    if not _updated_stamp_allowed(
+        stored_updated,
+        wanted_updated,
+        _journal_after_updated(publisher, operation_id, change["path"]),
+    ):
         raise MemoryError("migration_identity_changed")
 
 

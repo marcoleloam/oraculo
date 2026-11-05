@@ -12,6 +12,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any
 
+from oraculo.memory.claims import _coerce_date
 from oraculo.memory.schema import (
     ConflictError,
     MemoryError,
@@ -88,10 +89,6 @@ _INSTRUCTION = re.compile(
     r")"
 )
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,40}")
-_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
-_AWARE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
-)
 
 
 def concept_page_id(project_id: str, concept: str) -> str:
@@ -190,6 +187,7 @@ def compile_knowledge(
     union = _union_sources(recorded, selected)
     operation_id = _operation_id(project_id, concept, version, union)
     extracted, findings = _extract_all(project_id, concept, selected, current["claims"])
+    findings = list(current.get("claim_findings") or []) + findings
     claims = _merge_claims(current["claims"], extracted)
     claims, contest_findings = _mark_contests(claims)
     findings.extend(contest_findings)
@@ -262,6 +260,16 @@ def compile_knowledge(
             operation_id,
             version,
             findings=findings + [{"code": "conflict", "detail": str(exc)}],
+            proposal=payload,
+            page_id=current["page_id"],
+            path=current["path"],
+        )
+    except MemoryError as exc:
+        return _result(
+            "rejected",
+            operation_id,
+            version,
+            findings=findings + [{"code": str(exc)}],
             proposal=payload,
             page_id=current["page_id"],
             path=current["path"],
@@ -478,11 +486,13 @@ def _load_current(
                 ],
             }
     recorded = _recorded(meta, concept)
+    claims, claim_findings = _existing_claims(meta)
     return {
         "path": relative,
         "page_id": str(meta.get("page_id") or page_id),
         "meta": meta,
-        "claims": _existing_claims(meta),
+        "claims": claims,
+        "claim_findings": claim_findings,
         "recorded": recorded,
         "preserved": _preserved(meta, body),
         "content": content,
@@ -512,11 +522,34 @@ def _recorded(meta: dict[str, Any], concept: str) -> dict[str, Any] | None:
     return {"version": version, "operation_id": operation, "sources": sources}
 
 
-def _existing_claims(meta: dict[str, Any]) -> list[dict[str, Any]]:
+def _existing_claims(
+    meta: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     claims = meta.get("claims")
     if not isinstance(claims, list):
-        return []
-    return [canonical_claim(claim) for claim in claims if isinstance(claim, dict)]
+        return [], []
+    normalized: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        canonical = canonical_claim(claim)
+        previous = claim.get("support")
+        if (
+            isinstance(previous, str)
+            and previous in SUPPORTS
+            and canonical["support"] != previous
+        ):
+            findings.append(
+                {
+                    "code": "existing_claim_downgraded",
+                    "claim_id": canonical["id"],
+                    "support": previous,
+                    "detail": canonical["support"],
+                }
+            )
+        normalized.append(canonical)
+    return normalized, findings
 
 
 def _preserved(meta: dict[str, Any], body: str) -> str:
@@ -941,11 +974,16 @@ def _triple(statement: dict[str, Any]) -> tuple[str, str, str] | None:
 
 
 def _explicit_date(value: Any) -> str | None:
-    if not isinstance(value, str):
+    """Accept the same dates ``claims._coerce_date`` publishes.
+
+    YAML may yield ``date`` or ``datetime`` objects, and a reviewer may write a
+    naive ISO timestamp. Those stay on the claim. Unparseable values stay null.
+    """
+
+    try:
+        return _coerce_date(value)
+    except MemoryError:
         return None
-    if _DATE.fullmatch(value) or _AWARE.fullmatch(value):
-        return value
-    return None
 
 
 def supersedes_ids(value: Any) -> list[str]:
@@ -1047,16 +1085,16 @@ def _canonical_assessment(value: Any, support: str) -> dict[str, str] | None:
         return None
     reviewer = value.get("reviewer")
     reason = value.get("reason")
-    assessed_at = value.get("assessed_at")
+    assessed_at = _explicit_date(value.get("assessed_at"))
     if not all(isinstance(item, str) and item.strip() for item in (reviewer, reason)):
         return None
-    if _explicit_date(assessed_at) is None:
+    if assessed_at is None:
         return None
     return {
         "verdict": support,
         "reviewer": reviewer.strip(),
         "reason": reason.strip(),
-        "assessed_at": assessed_at.strip(),
+        "assessed_at": assessed_at,
     }
 
 
@@ -1124,7 +1162,13 @@ def _mark_contests(
                 }
             )
             continue
+        superseded = []
         for claim in group:
+            assessment = claim.get("assessment")
+            verdict = assessment.get("verdict") if isinstance(assessment, dict) else None
+            if isinstance(assessment, dict) and verdict != "contested":
+                superseded.append(claim.get("id"))
+                claim["assessment"] = None
             claim["support"] = "contested"
         findings.append(
             {
@@ -1136,6 +1180,18 @@ def _mark_contests(
                 "detail": "distinct values stay contested",
             }
         )
+        if superseded:
+            findings.append(
+                {
+                    "code": "assessment_superseded_by_contest",
+                    "subject": subject,
+                    "predicate": predicate,
+                    "claim_ids": superseded,
+                    "detail": (
+                        "reviewer assessment cleared because the triple is now contested"
+                    ),
+                }
+            )
     return claims, findings
 
 
