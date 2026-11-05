@@ -2,10 +2,13 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
+from test_memory_schema import page, proposal, publisher
 
 from oraculo.cli import make_envelope, request
+from oraculo.knowledge_service import tick
 from oraculo.memory.routines import KnowledgeRoutines
 from oraculo.memory.schema import MemoryError
 
@@ -704,6 +707,105 @@ def _frozen_record(vault, path):
 
     text = (vault / path).read_text()
     return {"path": path, "content": text, "sha256": digest(text)}
+
+
+def test_n_memory_retrieval_routines_1_and_4_pending_sources_ignore_bad_entries(
+    tmp_path,
+):
+    """N-1 skips non-strings; N-4 treats stem and filename links as consumed."""
+    pub = publisher(tmp_path)
+    stem_raw = pub.snapshot("alpha", "fonte pelo stem\n")
+    file_raw = pub.snapshot("alpha", "fonte pelo nome\n")
+    pending_raw = pub.snapshot("alpha", "fonte ainda pendente\n")
+    stem = stem_raw.rsplit("/", 1)[-1].removesuffix(".md")
+    filename = file_raw.rsplit("/", 1)[-1]
+    pub.publish(
+        proposal(
+            page(
+                name="stemcite",
+                body="Cita o stem.\n",
+                sources=[f"[[{stem}]]"],
+            ),
+            name="stemcite",
+            operation="stemcite",
+        )
+    )
+    pub.publish(
+        proposal(
+            page(
+                name="filecite",
+                body="Cita o arquivo.\n",
+                sources=[f"[[{filename}]]"],
+            ),
+            name="filecite",
+            operation="filecite",
+        )
+    )
+    concepts = pub.vault / "projects/alpha/wiki/concepts"
+    (concepts / "nested.md").write_text(
+        "---\n"
+        "type: concept\n"
+        "page_id: alpha--nested\n"
+        "project_id: alpha\n"
+        "schema_version: 1\n"
+        "sources:\n"
+        f"  - [[{stem_raw}]]\n"
+        "tags: []\n"
+        "aliases: []\n"
+        "reviewed: false\n"
+        "created: 2026-11-05\n"
+        "updated: 2026-11-05\n"
+        "---\n"
+        "# Nested\n",
+        encoding="utf-8",
+    )
+    (concepts / "null-sources.md").write_text(
+        "---\n"
+        "type: concept\n"
+        "page_id: alpha--null\n"
+        "project_id: alpha\n"
+        "schema_version: 1\n"
+        "sources: null\n"
+        "tags: []\n"
+        "aliases: []\n"
+        "reviewed: false\n"
+        "created: 2026-11-05\n"
+        "updated: 2026-11-05\n"
+        "---\n"
+        "# Null\n",
+        encoding="utf-8",
+    )
+    selected, _metrics = KnowledgeRoutines(
+        SimpleNamespace(publisher=pub, state=None)
+    ).pending_sources("alpha", 20)
+    assert stem_raw not in selected
+    assert file_raw not in selected
+    assert selected == [pending_raw]
+
+
+async def test_n_memory_retrieval_routines_1_tick_isolates_typeerror(
+    running_service, monkeypatch
+):
+    """N-1: a TypeError in one routine must not escape Service.tick."""
+    service = running_service
+    KnowledgeRoutines(service).configure("alpha", enabled=True)
+    warnings = []
+    original = service.log.warning
+
+    def capture(message, *args, **kwargs):
+        warnings.append(message % args if args else message)
+        return original(message, *args, **kwargs)
+
+    monkeypatch.setattr(service.log, "warning", capture)
+
+    def boom(self, project_id):
+        raise TypeError("sources")
+
+    monkeypatch.setattr(
+        "oraculo.knowledge_service.KnowledgeRoutines.tick", boom
+    )
+    await tick(service)
+    assert any("TypeError" in item and "alpha" in item for item in warnings)
 
 
 def test_citation_forms_distinguish_empty_canon_from_uncited_pages(tmp_path):

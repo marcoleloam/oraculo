@@ -116,8 +116,11 @@ def plain(value, limit=240) -> str:
 
 
 def markdown(value) -> str:
-    # Quotes, links, HTML and embedded instructions stay literal display text.
-    return re.sub(r"([\\`*_{}\[\]()#!|>~])", r"\\\1", html.escape(plain(value, 2000)))
+    # Quotes are display text. HTML, links and markdown syntax stay literal.
+    # quote=True would emit &#x27; and the '#' escape below would turn that
+    # into &\#x27;, which Obsidian and notifications show as source text.
+    escaped = html.escape(plain(value, 2000), quote=False)
+    return re.sub(r"([\\`*_{}\[\]()#!|>~])", r"\\\1", escaped)
 
 
 def timestamp(value) -> str:

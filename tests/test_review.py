@@ -8,6 +8,17 @@ from oraculo.memory import ReviewManager
 from oraculo.memory.schema import digest, links, markdown_targets
 
 
+def test_f3_image_embed_does_not_block_review_open(tmp_path):
+    """F3: ![alt](path) is not a page link, so opening a review must ignore it."""
+    pub = publisher(tmp_path)
+    body = "Decisão registrada.\n\n![d](assets/d.png)\n"
+    pub.publish(proposal(page(body=body)))
+    opened = ReviewManager(pub).open("alpha")
+    assert opened["state"] == "open"
+    review_file = next((pub.vault / opened["wiki_folder"]).glob("concepts/*.md"))
+    assert "![d](assets/d.png)" in review_file.read_text()
+
+
 def test_concurrent_review_and_publish_conflict(tmp_path):
     pub = publisher(tmp_path)
     pub.publish(proposal())

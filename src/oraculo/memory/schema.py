@@ -183,6 +183,22 @@ def links(content: str) -> list[str]:
     ]
 
 
+def redact_wikilink(content: str, target: str) -> str:
+    """Replace every wikilink whose stripped target is ``target``.
+
+    ``links()`` drops ``#anchor`` and ``|alias``. The substitution has to
+    accept both or the anchor form stays visible after redaction.
+    """
+    pattern = (
+        r"\[\[" + re.escape(target) + r"(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]"
+    )
+    return re.sub(pattern, "[referência fora do escopo omitida]", content)
+
+
+# Shared with markdown_targets. The lookbehind leaves image embeds alone.
+MARKDOWN_LINK = re.compile(r"(?<!!)\[([^\]\n]*)\]\(([^)\n]+)\)")
+
+
 def resolve_link(target: str, paths: set[str], source: str = "") -> str:
     if (
         not target
@@ -260,7 +276,7 @@ def rewrite_links(content: str, mapping: dict[str, str], source: str = "") -> st
             + ")"
         )
 
-    result = re.sub(r"\[([^\]\n]*)\]\(([^)\n]+)\)", replace_markdown, result)
+    result = MARKDOWN_LINK.sub(replace_markdown, result)
     if result.startswith("---\n"):
         meta, body = parse_page(result)
         note = meta.get("source_note")
@@ -276,8 +292,8 @@ def rewrite_links(content: str, mapping: dict[str, str], source: str = "") -> st
 
 def markdown_targets(content: str) -> list[str]:
     targets = []
-    for match in re.finditer(r"(?<!!)\[[^\]\n]*\]\(([^)\n]+)\)", content):
-        target = match.group(1).strip().strip("<>")
+    for match in MARKDOWN_LINK.finditer(content):
+        target = match.group(2).strip().strip("<>")
         if target.startswith(("https://", "http://", "mailto:", "#")):
             continue
         targets.append(target.split("#", 1)[0])

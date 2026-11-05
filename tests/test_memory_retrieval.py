@@ -99,7 +99,9 @@ def test_scope_precedes_ranking_cache_snippets_and_links(tmp_path):
         harbor,
         "projects/atlas-harbor/wiki/concepts/z-fact.md",
         "O código vigente do cais norte é HQ-17-CARMINE.\n"
-        "Veja [[projects/atlas-ridge/wiki/concepts/z-secret.md]].",
+        "Veja [[projects/atlas-ridge/wiki/concepts/z-secret.md]].\n"
+        "Âncora [[projects/atlas-ridge/wiki/concepts/z-secret.md#sec]].\n"
+        "Alias [[projects/atlas-ridge/wiki/concepts/z-secret.md#sec|secreto]].\n",
         title="Código do cais norte",
         aliases=["código vigente do cais norte"],
         tags=["cais"],
@@ -129,6 +131,16 @@ def test_scope_precedes_ranking_cache_snippets_and_links(tmp_path):
     assert "HQ-17-CARMINE" in visible
     assert "RQ-44-INDIGO" not in visible
     assert "projects/atlas-ridge" not in visible
+    # F6 / N-memory-retrieval-routines-2: #anchor and |alias must be redacted.
+    assert "referência fora do escopo omitida" in visible
+    legacy = Context(harbor).legacy_bundle("atlas-harbor", "código do cais norte")
+    legacy_docs = json.dumps(legacy["documents"], ensure_ascii=False)
+    assert "projects/atlas-ridge" not in legacy_docs
+    assert "referência fora do escopo omitida" in legacy_docs
+    assert any(
+        finding["target"] == "projects/atlas-ridge/wiki/concepts/z-secret.md"
+        for finding in legacy["findings"]
+    )
     assert result["selection"]["snippets"]
     assert all(
         snippet["path"].startswith("projects/atlas-harbor/")
@@ -150,6 +162,52 @@ def test_scope_precedes_ranking_cache_snippets_and_links(tmp_path):
         != result["selection"]["index"]["fingerprint"]
     )
     assert "CARMINE-2" in json.dumps(changed)
+
+
+def test_n_memory_retrieval_routines_3_publisher_aliases_and_tags_rank(tmp_path):
+    """N-memory-retrieval-routines-3: yaml.safe_dump lists start at column 0."""
+    from oraculo.memory.retrieval import _parse_page
+    from oraculo.memory.schema import render_page
+
+    clear_index_cache()
+    root = tmp_path / "vault"
+    relative = "projects/atlas-harbor/wiki/concepts/alias-only.md"
+    content = render_page(
+        {
+            "type": "concept",
+            "page_id": "sample",
+            "project_id": "atlas-harbor",
+            "schema_version": 1,
+            "reviewed": False,
+            "created": "2026-01-15",
+            "updated": "2026-01-15",
+            "sources": [],
+            "tags": ["etiquetaunica"],
+            "aliases": ["código do cais norte"],
+        },
+        "# Nota\n\nTexto sem os termos da consulta.\n",
+    )
+    assert "\n- código do cais norte" in content
+    path = root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(content, encoding="utf-8")
+    (root / "projects/atlas-harbor/.oraculo-project.json").write_text(
+        '{"project_id":"atlas-harbor"}'
+    )
+    parsed = _parse_page(relative, content)
+    assert parsed["aliases"] == ["código do cais norte"]
+    assert parsed["tags"] == ["etiquetaunica"]
+    alias_hit = retrieve(
+        Context(root),
+        "atlas-harbor",
+        "código do cais norte",
+        ranker="field_weights",
+    )
+    assert alias_hit["selection"]["ranked_paths"] == [relative]
+    tag_hit = retrieve(
+        Context(root), "atlas-harbor", "etiquetaunica", ranker="field_weights"
+    )
+    assert tag_hit["selection"]["ranked_paths"] == [relative]
 
 
 def test_cache_is_bounded_by_content_hash(tmp_path):

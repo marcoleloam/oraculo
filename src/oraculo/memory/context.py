@@ -5,7 +5,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .schema import MemoryError, corpus, links, project_key, resolve_link, safe_path
+from .schema import (
+    MemoryError,
+    corpus,
+    links,
+    project_key,
+    redact_wikilink,
+    resolve_link,
+    safe_path,
+)
 
 
 class Context:
@@ -117,11 +125,7 @@ class Context:
                 try:
                     resolve_link(target, paths, path)
                 except MemoryError:
-                    content = re.sub(
-                        r"\[\[" + re.escape(target) + r"(?:\|[^\]]*)?\]\]",
-                        "[referência fora do escopo omitida]",
-                        content,
-                    )
+                    content = redact_wikilink(content, target)
             documents.append({"path": path, "content": content})
         return {
             "project_id": project_id,
