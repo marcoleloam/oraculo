@@ -943,11 +943,11 @@ async def test_legacy_stream_without_fresh_coherent_corroboration_stays_blocked(
     flow.host.call = host
     before = flow.snapshot(task)
     result = await flow.invoke("diagnose-delivery", task_id=task["id"])
-    assert (
-        result.get("phase") == "blocked"
-        or result["legacy_delivery_diagnosis"]["eligible"] is False
-    ), result
-    assert flow.snapshot(task)["cycle"] == before["cycle"]
+    # N-shared-diff-3: a failing diagnosis stays eligible=false and does not
+    # persist blocked, including when the child run is still active.
+    assert result["legacy_delivery_diagnosis"]["eligible"] is False, result
+    assert result["phase"] == before["task"]["phase"]
+    assert flow.snapshot(task) == before
     assert result["admission"]["state"] == "executing"
 
 

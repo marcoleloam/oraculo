@@ -111,6 +111,49 @@ async def test_cancel_survives_restart_and_pending_children(tmp_path):
     assert state.lease() is None
 
 
+def never_executed(thread, parent):
+    return {
+        "thread": {
+            "threadId": thread,
+            "activeRunId": None,
+            "latestRunId": None,
+            "status": "idle",
+            "pendingRequestCount": 0,
+            "branch": "work",
+            "projectId": "p",
+        },
+        "recentRuns": [],
+        "items": [],
+        "hasMore": False,
+        "nextPosition": None,
+        "parentThreadId": parent,
+    }
+
+
+async def test_b9_idle_child_that_never_ran_does_not_keep_the_lease_running(tmp_path):
+    """B9: latestRunId=None and no runs is terminal, not a permanent running lease."""
+    state, _, _ = prepare(tmp_path)
+    remote = Remote()
+    remote.snapshots["child"] = snapshot("child", "run", "completed")
+    remote.snapshots["grandchild"] = never_executed("grandchild", "child")
+    result = await Reconciler(state, remote).reconcile()
+    assert result["state"] == "uncertain", result
+    assert result["reason"] == "missing_execution_report"
+
+
+async def test_b9_never_executed_child_lets_cancellation_release_the_lease(tmp_path):
+    """B9: cancellation reaches stopped when the only child thread never ran."""
+    state, objective, _ = prepare(tmp_path)
+    state.cancel_objective(objective["id"])
+    remote = Remote()
+    remote.snapshots["child"] = snapshot("child", "run", "completed")
+    remote.snapshots["grandchild"] = never_executed("grandchild", "child")
+    result = await Reconciler(state, remote).reconcile()
+    assert result["state"] == "stopped", result
+    assert remote.interruptions == []
+    assert state.lease() is None
+
+
 async def test_disconnect_and_reconnect(tmp_path):
     state, _, grant = prepare(tmp_path)
     remote = Remote()

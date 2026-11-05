@@ -99,6 +99,29 @@ def native_terminal_run(chain):
     return max(chain, key=lambda run: (timestamp(run["completedAt"]), run["ordinal"]))
 
 
+def _submission_event(events, executed):
+    """Bind the executor submission from the run that actually executed.
+
+    An identical re-submission appends a later event. The oldest match is the
+    interrupted run and cannot certify the continuation.
+    """
+    if not events:
+        return None
+    if executed is None:
+        return events[-1]
+    started = timestamp(executed.get("startedAt"))
+    bound = []
+    for event in events:
+        binding = (event.get("proof") or {}).get("submission") or {}
+        at = event.get("at")
+        if binding.get("run_id") != executed["runId"]:
+            continue
+        if type(at) not in (float, int) or not math.isfinite(at) or at < started:
+            continue
+        bound.append(event)
+    return bound[-1] if bound else events[-1]
+
+
 def report_link(task, snapshot, report, *, actor=None):
     """Use immutable submission evidence, never refresh an old report's date."""
     chain = terminal_chain(snapshot)
@@ -125,7 +148,7 @@ def report_link(task, snapshot, report, *, actor=None):
         if e["phase"] == "validation_submitted"
         and e["proof"].get("report_sha256") == submitted_digest
     ]
-    event = events[0] if events else None
+    event = _submission_event(events, executed)
     if executed is not None and executed["runId"] != original:
         if task["transport_mode"] != "native_child":
             raise StateError("continuation_requires_native_child")

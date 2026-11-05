@@ -33,6 +33,7 @@ from oraculo.run_continuity import (
 from oraculo.settlement import Settlements
 from oraculo.state import StateError
 from oraculo.t3.client import T3Client
+from oraculo.t3.contracts import ContractError
 from oraculo.task_store import TaskStore
 
 # A stopped original run may be followed by completed continuations in the same
@@ -40,6 +41,42 @@ from oraculo.task_store import TaskStore
 STOPPED_RUN_STATUSES = frozenset({"cancelled", "interrupted"})
 CONTINUATION_RUN_STATUSES = STOPPED_RUN_STATUSES | {"completed"}
 CERTIFIED_WORK_STATUSES = frozenset({"succeeded", "failed", "stopped"})
+# Resume must not republish a task that already left the pre-publication gate.
+# pr_pending stays out so the first publication can still be retried.
+_RESUME_STABLE_PHASES = frozenset(
+    {
+        "pr_open",
+        "pr_reconciled",
+        "pr_waiting",
+        "pr_ready",
+        "merged",
+        "settled",
+        "awaiting_approval",
+        "plan_approved",
+        "validation_ready",
+        "pr_link_pending",
+        "pr_memory_pending",
+        "pr_checks_pending",
+        "merge_pending",
+        "final_memory_pending",
+        "settlement_pending",
+    }
+)
+# Phases where the pull request is no longer being opened. A later publish
+# only re-reads the receipt.
+_CLOSURE_OBSERVATION_PHASES = frozenset(
+    {
+        "pr_checks_pending",
+        "merge_pending",
+        "merged",
+        "pr_reconciled",
+        "pr_waiting",
+        "pr_ready",
+        "final_memory_pending",
+        "settlement_pending",
+        "settled",
+    }
+)
 
 LAUNCH_HINTS = {
     "invalid_independent_flag": (
@@ -81,6 +118,20 @@ class LaunchPreflightError(StateError):
     def __init__(self, reason: str, observed: dict | None = None):
         super().__init__(reason)
         self.observed = observed or {}
+
+
+def _diagnostic_code(exc: BaseException) -> str:
+    if isinstance(exc, (StateError, ContractError)):
+        return str(exc)
+    return type(exc).__name__
+
+
+def _review_diagnosis_failure(code: str) -> dict:
+    return dict(
+        reason=code,
+        certification="not_granted_by_diagnosis",
+        missing_evidence=[code],
+    )
 
 
 def git(
@@ -337,11 +388,27 @@ class ManagedTasks:
 
                     recovery = LegacyDeliveryRecovery(self)
                     if action == "diagnose-delivery":
+                        # A diagnosis is a read. Host and state errors stay in
+                        # the response and must not block the task.
+                        try:
+                            diagnosis = await recovery.diagnose(task, actor)
+                        except ReportValidationError:
+                            raise
+                        except (StateError, OSError) as exc:
+                            diagnosis = dict(
+                                eligible=False,
+                                missing_evidence=_diagnostic_code(exc),
+                                certification=False,
+                            )
+                        except ContractError as exc:
+                            diagnosis = dict(
+                                eligible=False,
+                                missing_evidence=str(exc),
+                                certification=False,
+                            )
                         return dict(
                             self.store.describe(task_id),
-                            legacy_delivery_diagnosis=await recovery.diagnose(
-                                task, actor
-                            ),
+                            legacy_delivery_diagnosis=diagnosis,
                         )
                     await recovery.accept(task, payload, actor)
                 elif action in {"diagnose-review", "adjudicate-review"}:
@@ -349,9 +416,18 @@ class ManagedTasks:
 
                     recovery = TaskRecovery(self)
                     if action == "diagnose-review":
+                        try:
+                            diagnosis = await recovery.diagnose_review(task)
+                        except ReportValidationError:
+                            raise
+                        except (StateError, OSError) as exc:
+                            code = _diagnostic_code(exc)
+                            diagnosis = _review_diagnosis_failure(code)
+                        except ContractError as exc:
+                            diagnosis = _review_diagnosis_failure(str(exc))
                         return dict(
                             self.store.describe(task_id),
-                            review_diagnosis=await recovery.diagnose_review(task),
+                            review_diagnosis=diagnosis,
                         )
                     await recovery.adjudicate_review(task, payload, actor)
                 elif action in {"complete-origin", "supersede"}:
@@ -666,17 +742,11 @@ class ManagedTasks:
                     task, task["supersession"]["intent"], actor
                 )
                 return
-            if task["phase"] in {
-                "pr_open",
-                "pr_reconciled",
-                "pr_waiting",
-                "pr_ready",
-                "merged",
-                "settled",
-                "awaiting_approval",
-                "plan_approved",
-                "validation_ready",
-            }:
+            if (
+                task["phase"] in _RESUME_STABLE_PHASES
+                or task.get("publication")
+                or task.get("merged")
+            ):
                 delivery = task.get("delivery_review") or {}
                 if delivery.get("mandatory_validations") or delivery.get(
                     "quality_reviews"
@@ -686,9 +756,7 @@ class ManagedTasks:
             report = task.get("submitted_report") or task.get("report")
             if report:
                 await self._finish(task_id, report, task["origin"])
-                publication = task.get("publication_request") or task.get(
-                    "publication_spec"
-                )
+                publication = self._publication_intent(task)
                 if (
                     publication
                     and not self.store.get(task_id).get("legacy_delivery_decision")
@@ -852,17 +920,29 @@ class ManagedTasks:
                 "implementation", fresh, explicit=route["target"]
             )
             current = workspace(plan["ws"]["path"])
+            config_hash = content_hash(self.config.model_dump(mode="json"))
+            advice_stale = bool(route.get("selected")) and not getattr(
+                self, "decisions"
+            ).usable(route.get("advice") or {})
             if (
                 not options
                 or current != plan["ws"]
-                or content_hash(self.config.model_dump(mode="json"))
-                != route["config_hash"]
-                or (
-                    route["selected"]
-                    and not getattr(self, "decisions").usable(route["advice"])
-                )
+                or config_hash != route["config_hash"]
+                or advice_stale
                 or self.admission.get_meta("runtime_maintenance")
             ):
+                # No launch was sent. Expiry or a config change must not pin
+                # this route; the next resume derives it again.
+                if not task.get("launch_attempted") and (
+                    config_hash != route["config_hash"] or advice_stale
+                ):
+                    self.store.update(
+                        task_id,
+                        task["phase"],
+                        {"routing": "stale_route_cleared"},
+                        decision_route=None,
+                        launch_arguments=None,
+                    )
                 raise StateError("managed_route_effect_revalidation_failed")
         # launch has NO idempotency key. Persist before sending; every later call
         # only reconciles list/read, even when an empty response looks retryable.
@@ -1054,8 +1134,6 @@ class ManagedTasks:
             for k in ("providerInstanceId", "model")
         ):
             raise StateError("managed_route_host_target_unconfirmed")
-        if self.admission is not None:
-            self.admission.bind_managed(task["id"], receipt)
         native = task["transport_mode"] == "native_child"
         thread_id = receipt.get("childThreadId") if native else receipt.get("threadId")
         if (
@@ -1065,7 +1143,10 @@ class ManagedTasks:
                 not native and receipt.get("projectId") != task["project"]["project_id"]
             )
         ):
+            # Leave the reservation reserved so cancel can still release it.
             raise StateError("task_launch_ack_incomplete")
+        if self.admission is not None:
+            self.admission.bind_managed(task["id"], receipt)
         child = dict(
             childThreadId=thread_id,
             childRunId=receipt.get("childRunId") if native else receipt.get("runId"),
@@ -1878,7 +1959,7 @@ class ManagedTasks:
         for field in ("report", "submitted_report"):
             if task.get(field) is not None and task[field] != report:
                 raise StateError("terminal_report_reused")
-        if not task["child"].get("childRunId"):
+        if not task["child"].get("childRunId") or not task.get("child_workspace"):
             await self._observe(task)
             task = self.store.get(task_id)
         # Even a negative result requires fresh terminal/current-run evidence.
@@ -2076,12 +2157,31 @@ class ManagedTasks:
         if self._certified(task):
             if self._reservation_held(task["id"]):
                 return "release"
-            if task["phase"] == "pr_pending" and (
-                task.get("publication_request") or task.get("publication_spec")
+            if (
+                task["phase"] == "pr_pending"
+                and not task.get("publication")
+                and self._publication_intent(task)
             ):
                 return "publish"
             return None
         return "observe"
+
+    @staticmethod
+    def _publication_intent(task: dict) -> dict | None:
+        """The recorded spec wins once publication has been attempted."""
+        if task.get("publication") or task.get("publication_attempted"):
+            recorded = task.get("publication_spec")
+            if recorded:
+                return recorded
+        return task.get("publication_request") or task.get("publication_spec")
+
+    @staticmethod
+    def _publication_is_closed(task: dict) -> bool:
+        return bool(task.get("publication")) and (
+            bool(task.get("merged"))
+            or bool(task.get("settled"))
+            or task.get("phase") in _CLOSURE_OBSERVATION_PHASES
+        )
 
     @staticmethod
     def _saved(cycle: dict) -> bool:
@@ -2091,6 +2191,34 @@ class ManagedTasks:
             and receipt.get("state") == "confirmed"
             and receipt.get("operation_id") == cycle["id"]
             and bool(receipt.get("commit"))
+        )
+
+    async def _reobserve_publication(self, task: dict, spec: dict):
+        """Refresh a recorded receipt. Do not regress, relink, or open memory."""
+        task_id = task["id"]
+        pr = self.publisher.ensure_pr(dict(spec, task_id=task_id, reconcile_only=True))
+        prior = task.get("publication") or {}
+        if prior.get("state") == "merged" and any(
+            prior.get(key) != pr.get(key)
+            for key in (
+                "host",
+                "repository",
+                "number",
+                "url",
+                "head_sha",
+                "base",
+                "branch",
+                "repository_id",
+                "project_id",
+                "merge_sha",
+            )
+        ):
+            raise StateError("publication_merge_receipt_changed")
+        self.store.update(
+            task_id,
+            task["phase"],
+            {"publication_reobserved": pr.get("url"), "state": pr.get("state")},
+            publication=pr,
         )
 
     async def _publish(self, task_id: str, spec: dict, actor: dict):
@@ -2128,6 +2256,9 @@ class ManagedTasks:
 
         credential_reference(spec.get("credential"))
         integration_binding(spec)
+        if self._publication_is_closed(task):
+            await self._reobserve_publication(task, spec)
+            return
         uncertain = bool(task.get("publication_attempted") or task.get("publication"))
         if not uncertain or task.get("legacy_delivery_decision"):
             await self._execution_gate(task)
@@ -2329,7 +2460,7 @@ class ManagedTasks:
             elif work == "publish":
                 await self._publish(
                     task_id,
-                    task.get("publication_request") or task.get("publication_spec"),
+                    self._publication_intent(task),
                     task["origin"],
                 )
             elif report:
@@ -2340,9 +2471,7 @@ class ManagedTasks:
                     and observed["hasPendingChildRuns"] is False
                 ):
                     await self._finish(task_id, report, task["origin"])
-                    publication = task.get("publication_request") or task.get(
-                        "publication_spec"
-                    )
+                    publication = self._publication_intent(self.store.get(task_id))
                     if publication:
                         await self._publish(task_id, publication, task["origin"])
             else:
