@@ -416,6 +416,11 @@ class AzureRepos:
         return row, receipt
 
     def _lookup(self, m, spec):
+        marker = (
+            "<!-- oraculo-task:"
+            + hashlib.sha256(spec["task_id"].encode()).hexdigest()
+            + " -->"
+        )
         number = explicit_pr(spec, m["remote_url"] + "/pullrequest/")
         if number is not None:
             return self._get(m, number)[1]
@@ -429,6 +434,21 @@ class AzureRepos:
             },
         )
         if len(rows) > 1:
+            # Same source/target can hold an abandoned PR and the one this
+            # task created. Keep only descriptions that carry this marker.
+            narrowed = []
+            for row in rows:
+                number = row.get("pullRequestId")
+                if type(number) is not int or number < 1:
+                    raise PublicationError("azure_response_invalid")
+                full, receipt = self._get(m, number)
+                description = full.get("description") or ""
+                if not isinstance(description, str):
+                    raise PublicationError("azure_response_invalid")
+                if marker in description:
+                    narrowed.append(receipt)
+            if len(narrowed) == 1:
+                return narrowed[0]
             raise PublicationError("publication_pr_ambiguous")
         if not rows:
             return None
@@ -437,11 +457,6 @@ class AzureRepos:
             raise PublicationError("azure_response_invalid")
         # List responses truncate description; retrieve the full record.
         row, receipt = self._get(m, number)
-        marker = (
-            "<!-- oraculo-task:"
-            + hashlib.sha256(spec["task_id"].encode()).hexdigest()
-            + " -->"
-        )
         description = row.get("description") or ""
         if not isinstance(description, str):
             raise PublicationError("azure_response_invalid")
@@ -548,7 +563,7 @@ class AzureRepos:
             raise PublicationError("publication_uncertain", emitted=True)
         return {**receipt, **binding}
 
-    def inspect(self, pr, policy, cwd):
+    def inspect(self, pr, policy, cwd, *, bind_local_checkout=True):
         if not isinstance(policy, dict) or not isinstance(pr, dict):
             raise PublicationError("pr_merge_policy_invalid")
         checks = policy.get("required_checks")
@@ -576,6 +591,13 @@ class AzureRepos:
             base=policy["base"],
             runner=self.runner,
         )
+        if not bind_local_checkout:
+            # Read-only CI binds the PR row. The checkout is often not that head.
+            if not isinstance(pr.get("branch"), str) or not isinstance(
+                pr.get("head_sha"), str
+            ):
+                raise PublicationError("pr_policy_binding_mismatch")
+            m = {**m, "branch": pr["branch"], "head_sha": pr["head_sha"]}
         if (
             policy.get("remote", m["remote"]) != m["remote"]
             or m["host"] != "azure"

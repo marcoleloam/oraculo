@@ -366,7 +366,12 @@ def test_github_policy_compatibility_ci_negatives(tmp_path, kind):
             error
         )
     else:
-        assert result is None or result["event"]["conclusion"] != "passed"
+        # N-ci-policy-1: a missing review is readiness, not a failed CI run.
+        if kind == "review":
+            assert result["event"]["conclusion"] == "passed"
+            assert "pr_review_pending" in result["evidence"]["lifecycle"]["blockers"]
+        else:
+            assert result is None or result["event"]["conclusion"] != "passed"
     assert not any(c[:3] == ["gh", "pr", "merge"] for c in host.calls)
 
 
@@ -422,6 +427,25 @@ class ManagedPolicyHost(PolicyHost):
             return value
 
         return json.dumps(translate(json.loads(raw)))
+
+
+class StatusContextHost(ManagedPolicyHost):
+    """Required checks exist only as commit statuses, not Actions check-runs."""
+
+    def __call__(self, argv, cwd):
+        raw = super().__call__(argv, cwd)
+        if argv[0] != "gh":
+            return raw
+        if argv[1:3] == ["pr", "view"]:
+            data = json.loads(raw)
+            data["statusCheckRollup"] = [
+                {"__typename": "StatusContext", "context": name, "state": "SUCCESS"}
+                for name in self.required
+            ]
+            return json.dumps(data)
+        if len(argv) > 2 and "/check-runs?" in str(argv[2]):
+            return json.dumps({"total_count": 0, "check_runs": []})
+        return raw
 
 
 @pytest.mark.parametrize("entrypoint", ["api", "cli"])
@@ -690,7 +714,17 @@ def test_github_policy_compatibility_historical_reviews_are_real(
 
     lifecycle.runner = transport
     result = lifecycle.observe_pr_ci(pr, policy, tmp_path)
-    assert (result["event"]["conclusion"] == "passed") is ready
+    # N-ci-policy-1: CI conclusion stays the check outcome. Review evidence
+    # remains on the lifecycle receipt (this used to fold review into conclusion).
+    assert result["event"]["conclusion"] == "passed"
+    blockers = result["evidence"]["lifecycle"]["blockers"]
+    if state == "CHANGES_REQUESTED":
+        assert "pr_changes_requested" in blockers
+    elif ready:
+        assert "pr_review_pending" not in blockers
+        assert "pr_changes_requested" not in blockers
+    else:
+        assert "pr_review_pending" in blockers
 
 
 @pytest.mark.parametrize(
@@ -1227,7 +1261,10 @@ def test_github_policy_compatibility_historical_approval_requires_repository_wri
             lifecycle.observe_pr_ci(pr, policy, tmp_path)
     else:
         proof = lifecycle.observe_pr_ci(pr, policy, tmp_path)
-        assert (proof["event"]["conclusion"] == "passed") is (permission == "write")
+        # N-ci-policy-1: permission changes review evidence, not CI conclusion.
+        assert proof["event"]["conclusion"] == "passed"
+        pending = "pr_review_pending" in proof["evidence"]["lifecycle"]["blockers"]
+        assert pending is (permission != "write")
     assert all(c[:3] != ["gh", "pr", "merge"] for c in host.calls)
 
 
@@ -1308,9 +1345,11 @@ async def test_github_policy_compatibility_review_readiness_does_not_rewrite_suc
         flow.service.managed_service.store.get(task["id"])["ci_rounds"]
     )
     assert saved[0]["work_status"] == "succeeded"
-    assert (
-        saved[0]["report"]["evidence"]["execution"]["event"]["conclusion"] == "failed"
-    )
+    # N-ci-policy-1: review readiness is not a CI failure. This used to pin
+    # conclusion == "failed" while the checks had already succeeded.
+    execution = saved[0]["report"]["evidence"]["execution"]
+    assert execution["event"]["conclusion"] == "passed"
+    assert "pr_review_pending" in execution["evidence"]["lifecycle"]["blockers"]
     host.review = "APPROVED"
     host.review_rows = [
         dict(
@@ -1345,3 +1384,26 @@ async def test_github_policy_compatibility_review_readiness_does_not_rewrite_suc
     assert result["phase"] == "settled", result
     assert flow.service.managed_service.store.get(task["id"])["ci_rounds"] == saved
     assert len([c for c in host.calls if c[:3] == ["gh", "pr", "merge"]]) == 1
+
+
+async def test_n_shared_diff_1_status_context_without_check_run_does_not_merge(
+    flow, monkeypatch
+):
+    """N-shared-diff-1: unbound GitHub CI must not pass the pre-merge gate."""
+    from test_ci_round_memory import setup as managed_setup
+
+    task, _, (_, policy, source) = await managed_setup(flow, monkeypatch)
+    host = StatusContextHost(source.head)
+    host.required = policy["required_checks"].copy()
+    policy.update(method="merge", required_review=False)
+    lifecycle = RepositoryPRLifecycle(host)
+    monkeypatch.setattr("oraculo.pr_lifecycle.RepositoryPRLifecycle", lambda: lifecycle)
+    result = await flow.invoke("merge", task_id=task["id"], policy=policy)
+    assert result["phase"] == "pr_waiting", result
+    assert not result["merged"] and not result.get("merge_attempted")
+    assert "ci_execution_not_passed" in result["pr_gate"]["blockers"]
+    bindings = result["ci_rounds"][0]["facts"]["check_bindings"]
+    assert bindings and all(
+        item["precision"] == "check_snapshot_without_run_attempt" for item in bindings
+    )
+    assert all(c[:3] != ["gh", "pr", "merge"] for c in host.calls)

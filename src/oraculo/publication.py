@@ -356,6 +356,8 @@ class GitHubPublisher:
                 raise PublicationError("publication_host_response_invalid") from None
             if matches:
                 candidates.append(row)
+        if explicit is not None and rows and not candidates:
+            raise PublicationError("publication_pr_identity_mismatch")
         marked = [r for r in candidates if marker in (r.get("body") or "")]
         if marked:
             candidates = marked
@@ -498,6 +500,11 @@ class GitHubPublisher:
             return {**existing, **source_binding, **integration}
         if spec.get("reconcile_only", False):
             raise PublicationError("publication_uncertain")
+        # GitHub rejects these deterministically. Fail before emission intent.
+        if len(spec["title"]) > 256:
+            raise PublicationError("publication_title_too_long")
+        if len(spec["body"] + "\n\n" + marker + "\n") > 65536:
+            raise PublicationError("publication_body_too_long")
         for branch, expected in (
             (metadata["branch"], metadata["head_sha"]),
             (metadata["base"], None),

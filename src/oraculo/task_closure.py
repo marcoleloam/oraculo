@@ -192,7 +192,18 @@ class TaskClosure:
             confirmed = await rounds.observe_no_ci(task_id, receipt)
         else:
             confirmed = await rounds.observe(task_id, receipt, execution)
-        execution_passed = (
+        # GitHub status contexts can look complete in the PR snapshot while
+        # observe_pr_ci finds no check-run. That is unproven, same as a miss
+        # after merge. Azure keeps snapshot precision: observe_pr_ci returns
+        # None there by contract and does not set host=github.
+        github_unbound = (
+            not no_ci
+            and bool(required)
+            and execution is None
+            and receipt.get("host") == "github"
+            and hasattr(self.lifecycle, "observe_pr_ci")
+        )
+        execution_passed = not github_unbound and (
             execution is None or execution["event"]["conclusion"] == "passed"
         )
         if (

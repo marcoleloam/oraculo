@@ -157,10 +157,26 @@ def validate_entry(engine, entry):
             raise ValueError()
         if entry["state"] == "answered":
             usage = entry["result"]["usage"]
+            output_tokens = usage["output_tokens"]
+            # The stored tariff prices output at zero. A real completion still
+            # reports output_tokens; that must not disagree with validate_response.
             if (
                 type(usage["input_tokens"]) is not int
                 or not 0 <= usage["input_tokens"] <= entry["token_bound"]
-                or usage["output_tokens"] != 0
+                or type(output_tokens) is not int
+                or output_tokens < 0
+            ):
+                raise ValueError()
+            details = usage.get("output_tokens_details")
+            if details is not None and (
+                not isinstance(details, dict)
+                or type(details.get("reasoning_tokens")) is not int
+                or not 0 <= details["reasoning_tokens"] <= output_tokens
+            ):
+                raise ValueError()
+            if "total_tokens" in usage and (
+                type(usage["total_tokens"]) is not int
+                or usage["total_tokens"] != usage["input_tokens"] + output_tokens
             ):
                 raise ValueError()
             if entry["charge"] != cost(usage["input_tokens"], tariff):
