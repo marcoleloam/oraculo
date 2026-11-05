@@ -1413,11 +1413,13 @@ class Service:
 
     async def _connection(self, reader, writer):
         request_id = "unknown"
+        kind = None
         try:
             async with asyncio.timeout(5):
                 raw = await reader.readline()
             envelope = parse_envelope(raw)
             request_id = envelope.request_id
+            kind = envelope.kind
             if envelope.kind == "managed.execute":
                 if self.managed_service is None:
                     from oraculo.managed_service import ManagedService
@@ -1454,8 +1456,18 @@ class Service:
             async with asyncio.timeout(5):
                 writer.write(canonical_json(response).encode() + b"\n")
                 await writer.drain()
-        except (OSError, TimeoutError):
-            pass
+        except (OSError, TimeoutError) as exc:
+            # The caller can retry a lost response. Keep the failure diagnosable.
+            self.log.warning(
+                canonical_json(
+                    {
+                        "event": "response_write_failed",
+                        "request_id": request_id,
+                        "kind": kind,
+                        "error_type": type(exc).__name__,
+                    }
+                )
+            )
 
     def prompt(self, name: str) -> str:
         path = resources_root() / "prompts" / f"{name}.md"
@@ -1531,6 +1543,39 @@ class Service:
             (job["id"],),
         )
 
+    def block_dispatch_candidate(self, job: dict, exc: BaseException) -> None:
+        """One candidate's local failure must not take the daemon loop down."""
+        reason = str(exc) or type(exc).__name__
+        with self.state.transaction():
+            current = self.state.get_job(job["id"])
+            if not current or current["state"] != "queued":
+                return
+            self.state.connection.execute(
+                "UPDATE jobs SET state='blocked' WHERE id=?",
+                (job["id"],),
+            )
+            self.state.set_meta(
+                f"blocker:{job['id']}",
+                {
+                    "reason": reason,
+                    "error_type": type(exc).__name__,
+                    "action": (
+                        "Fix the recorded project or source error, then retry "
+                        "or cancel the job"
+                    ),
+                },
+            )
+        self.log.warning(
+            canonical_json(
+                {
+                    "event": "dispatch_candidate_blocked",
+                    "job_id": job["id"],
+                    "error_type": type(exc).__name__,
+                    "reason": reason,
+                }
+            )
+        )
+
     async def dispatch(self, client: Any) -> None:
         if not self.state.capacity()["available"]:
             await self.inspect_exhausted_dispatches(client)
@@ -1551,7 +1596,11 @@ class Service:
             if not self.router.select(job["kind"], self.catalog):
                 self.health = "blocked_eligibility"
                 continue
-            project = self.project(objective["project_id"])
+            try:
+                project = self.project(objective["project_id"])
+            except (StateError, OSError) as exc:
+                self.block_dispatch_candidate(job, exc)
+                continue
             coordinator = await self.ensure_coordinator(client, project)
             if not coordinator:
                 return
@@ -1608,14 +1657,18 @@ class Service:
                     return
                 continue
             payload = json.loads(job["payload"])
-            context: dict = {}
-            if job["kind"] == "memory":
-                context = await self.memory_context(project, payload)
-            else:
-                cycle = await self.prepare_work_memory(job)
-                context = self.state.get_meta(
-                    f"work_memory_reference:{job['id']}:{cycle['identity']['attempt_number']}"
-                )
+            try:
+                context: dict = {}
+                if job["kind"] == "memory":
+                    context = await self.memory_context(project, payload)
+                else:
+                    cycle = await self.prepare_work_memory(job)
+                    context = self.state.get_meta(
+                        f"work_memory_reference:{job['id']}:{cycle['identity']['attempt_number']}"
+                    )
+            except (StateError, OSError) as exc:
+                self.block_dispatch_candidate(job, exc)
+                continue
             if not self.dispatch_current(job, attempt_count):
                 continue
             body = {
@@ -1972,25 +2025,39 @@ class Service:
             source = payload.get("source_path")
             if operation == "ingest" and source:
                 path = Path(source)
-                if (
-                    not path.resolve().is_relative_to(Path(project["path"]).resolve())
-                    or path.is_symlink()
-                ):
+                root = Path(project["path"]).resolve()
+                if not path.resolve().is_relative_to(root) or path.is_symlink():
                     raise StateError("source_outside_project")
-                raw = path.read_bytes()
-                if len(raw) > self.config.memory.max_proposal_bytes:
-                    raise StateError("source_too_large")
+                limit = self.config.memory.max_proposal_bytes
+
+                def read_bounded() -> bytes:
+                    # Re-check after the await so a swapped symlink cannot escape.
+                    if path.is_symlink() or not path.resolve().is_relative_to(root):
+                        raise StateError("source_outside_project")
+                    if path.stat().st_size > limit:
+                        raise StateError("source_too_large")
+                    with path.open("rb") as stream:
+                        bounded = stream.read(limit + 1)
+                    if len(bounded) > limit:
+                        raise StateError("source_too_large")
+                    return bounded
+
+                raw = await asyncio.to_thread(read_bounded)
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise StateError("source_not_utf8") from None
                 result["raw_path"] = await asyncio.to_thread(
                     self.publisher.snapshot,
                     project["id"],
-                    raw.decode("utf-8"),
+                    text,
                     {
                         "source_path": str(path),
                         "project_id": project["id"],
                         "captured_at": time.time(),
                     },
                 )
-                result["source_content"] = raw.decode("utf-8")
+                result["source_content"] = text
             if (
                 operation == "ingest"
                 and payload.get("execution_evidence")
@@ -2127,6 +2194,7 @@ class Service:
         from oraculo.managed_service import BACKGROUND_HOST_TIMEOUT
 
         facade.begin("background", uuid.uuid4().hex, action="reconcile")
+        facade._pin_ledger()
         loop = asyncio.get_running_loop()
 
         class HostProxy:

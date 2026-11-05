@@ -7,9 +7,11 @@ identity nor enforcement outside cooperative entrypoints.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import fcntl
 import json
 import os
+import threading
 import time
 import uuid
 
@@ -27,6 +29,80 @@ HOST_FRAME_TIMEOUT = 1200
 BACKGROUND_HOST_TIMEOUT = 60
 CALLER_QUEUE_TIMEOUT = 60
 MAX_QUEUED_CALLERS = 32
+
+
+class _LoopCursor:
+    """Cursor whose fetches run on the connection's owner thread."""
+
+    def __init__(self, real, hop):
+        self._real = real
+        self._hop = hop
+
+    def fetchone(self):
+        return self._hop(self._real.fetchone)
+
+    def fetchall(self):
+        return self._hop(self._real.fetchall)
+
+    def __iter__(self):
+        return iter(self._hop(lambda: list(self._real)))
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if not callable(attr):
+            return self._hop(lambda: getattr(self._real, name))
+
+        def wrapped(*args, **kwargs):
+            return self._hop(lambda: attr(*args, **kwargs))
+
+        return wrapped
+
+
+class _LoopConnection:
+    """Ledger connection pinned to the daemon thread.
+
+    Sync publisher and lifecycle callbacks run on the executor thread and still
+    read this ledger. SQLite refuses that unless the call is handed back here.
+    The daemon loop is awaiting that executor, so the handoff cannot deadlock.
+    """
+
+    _CURSOR_METHODS = frozenset({"execute", "executemany", "executescript", "cursor"})
+
+    def __init__(self, real, loop, owner):
+        self._real = real
+        self._loop = loop
+        self._owner = owner
+
+    def _hop(self, fn):
+        if threading.current_thread() is self._owner:
+            return fn()
+        future = concurrent.futures.Future()
+
+        def run():
+            try:
+                future.set_result(fn())
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        try:
+            self._loop.call_soon_threadsafe(run)
+        except RuntimeError:
+            future.cancel()
+            raise
+        return future.result()
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if not callable(attr):
+            return self._hop(lambda: getattr(self._real, name))
+
+        def wrapped(*args, **kwargs):
+            result = self._hop(lambda: attr(*args, **kwargs))
+            if name in self._CURSOR_METHODS:
+                return _LoopCursor(result, self._hop)
+            return result
+
+        return wrapped
 
 
 async def close_writer(writer):
@@ -62,13 +138,14 @@ class ManagedService:
                 if (
                     (task.get("launch_attempted") or task.get("child"))
                     and task.get("work_status")
-                    not in {"succeeded", "failed", "stopped"}
+                    not in {"succeeded", "failed", "stopped", "cancelled"}
                     and not service.state._one(
                         "SELECT id FROM managed_reservations WHERE id=?", (row[0],)
                     )
                 ):
                     untracked.append(row[0])
             service.state.set_meta("managed_legacy_untracked", untracked)
+            self._pin_ledger()
         except BaseException:
             os.close(self.fd)
             raise
@@ -78,6 +155,29 @@ class ManagedService:
         self.reader = None
         self.background_worker = None
         self.waiters = []
+
+    def _pin_ledger(self):
+        """Bind the facade ledger to the daemon thread once a loop exists.
+
+        Service startup can open the ledger before the loop is running. Sync
+        callbacks on the executor thread reach this same object later.
+        """
+        if isinstance(self.store.db, _LoopConnection):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        owner = threading.current_thread()
+        ledger = _LoopConnection(self.store.db, loop, owner)
+        self.store.db = ledger
+        if self.store.state is not None:
+            self.store.state.connection = ledger
+        # Sync callbacks also read admission (capacity, reservations) on this
+        # connection. Hand those calls back; do not share it across threads.
+        admission = self.service.state
+        if not isinstance(admission.connection, _LoopConnection):
+            admission.connection = _LoopConnection(admission.connection, loop, owner)
 
     def _wake_caller(self):
         if not self.busy and self.waiters:
@@ -232,6 +332,7 @@ class ManagedService:
 
         if envelope.payload.get("protocol_version") != PROTOCOL_VERSION:
             raise StateError("managed_protocol_incompatible")
+        self._pin_ledger()
         await self.acquire_caller()
         if reader.at_eof():
             self._wake_caller()
@@ -245,11 +346,21 @@ class ManagedService:
             reader=reader,
         )
         facade = self
+        main_loop = asyncio.get_running_loop()
 
         class Relay:
             failed = False
 
             async def call(self, name, arguments):
+                # command() runs on a worker loop. Socket IO stays on this one.
+                if asyncio.get_running_loop() is main_loop:
+                    return await self._on_main(name, arguments)
+                future = asyncio.run_coroutine_threadsafe(
+                    self._on_main(name, arguments), main_loop
+                )
+                return await asyncio.wrap_future(future)
+
+            async def _on_main(self, name, arguments):
                 if self.failed:
                     raise StateError("managed_host_channel_failed")
                 call_id = uuid.uuid4().hex
@@ -312,7 +423,11 @@ class ManagedService:
                 )
                 return ack["result"]
 
-        try:
+        def run_command():
+            # Same ledger and admission objects the daemon and in-process
+            # callbacks already hold. SQLite calls hop back to this loop;
+            # git, gh and the publisher stay on this worker so the loop can
+            # serve other clients. Do not close those shared connections.
             adapter = ManagedTasks(
                 self.service.config,
                 self.store,
@@ -324,14 +439,49 @@ class ManagedService:
             )
             adapter.config_path = self.service.config_path
             adapter.decisions = self.service.decisions
-            result = await adapter.command(
-                envelope.payload["action"], envelope.payload["payload"]
+            return asyncio.run(
+                adapter.command(
+                    envelope.payload["action"], envelope.payload["payload"]
+                )
             )
+
+        # Own the executor future for the whole call. A cancelled connection
+        # must not admit the next caller while this worker still holds SQLite.
+        worker = main_loop.run_in_executor(None, run_command)
+        try:
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # connection() closes the socket only after execute returns, and
+                # the worker's host read is a different task. Abort here so that
+                # read ends, then wait until the worker has left the ledger.
+                transport = writer.transport
+                if transport is not None:
+                    transport.abort()
+                try:
+                    await worker
+                except Exception:
+                    pass
+                raise
             return dict(
                 self.with_admission(result), source="service", protocol_version=1
             )
         finally:
-            self.end()
+            if worker.done():
+                if not worker.cancelled():
+                    worker.exception()
+                self.end()
+            else:
+
+                def _release(fut, loop=main_loop):
+                    if not fut.cancelled():
+                        fut.exception()
+                    try:
+                        loop.call_soon_threadsafe(self.end)
+                    except RuntimeError:
+                        pass
+
+                worker.add_done_callback(_release)
 
 
 async def command(config, action, payload, transport):

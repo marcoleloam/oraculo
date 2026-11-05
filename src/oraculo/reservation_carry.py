@@ -40,7 +40,7 @@ UNCERTAIN_REASONS = frozenset(
         "task_launch_ack_incomplete",
     }
 )
-TERMINAL_WORK = frozenset({"succeeded", "failed", "stopped"})
+TERMINAL_WORK = frozenset({"succeeded", "failed", "stopped", "cancelled"})
 
 
 def normalize(task_ids):
@@ -135,9 +135,16 @@ def _task_proof(store, row, terminal_proof=None):
         receipt = json.loads(row["receipt"] or "null") or {}
     except ValueError:
         receipt = {}
+    # bind_managed stores the raw host receipt. native_child uses
+    # childThreadId/childRunId; managed_thread uses threadId/runId.
+    # Absent transport stays on the native keys so older receipts still match.
+    native = (task.get("transport_mode") or "native_child") == "native_child"
+    thread_key, run_key = (
+        ("childThreadId", "childRunId") if native else ("threadId", "runId")
+    )
     if (
-        receipt.get("childThreadId") != child["childThreadId"]
-        or receipt.get("childRunId") != child["childRunId"]
+        receipt.get(thread_key) != child["childThreadId"]
+        or receipt.get(run_key) != child["childRunId"]
     ):
         raise StateError("carry_child_unproven")
     if task.get("work_status") != "pending":
