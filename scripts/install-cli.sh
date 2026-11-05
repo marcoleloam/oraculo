@@ -8,7 +8,7 @@ if [ "$#" -lt 1 ]; then
 fi
 bundle=$1
 shift
-exec "${ORACULO_PYTHON:-python3.12}" - "$bundle" "$@" <<'PY'
+exec "${ORACULO_PYTHON:-python3.12}" -I - "$bundle" "$@" <<'PY'
 import hashlib
 import json
 import pathlib

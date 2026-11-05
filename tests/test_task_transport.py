@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -124,6 +125,32 @@ async def test_stdio_nonobject_ack_is_explicit_mismatch(raw):
         await StdioHostTransport(io.StringIO(raw + "\n"), io.StringIO()).call(
             "tool", {}
         )
+
+
+@pytest.mark.parametrize("raw", ["{}", "[]", "null"])
+def test_e5_task_status_without_task_id_is_json_error(
+    service_config, tmp_path, raw, capsys
+):
+    """E5: status without task_id returns the JSON error envelope."""
+    _, config_path = service_config
+    payload = tmp_path / "payload.json"
+    payload.write_text(raw)
+    assert (
+        main(["--config", str(config_path), "task", "status", "--file", str(payload)])
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    body = json.loads(captured.err)
+    assert body == {"ok": False, "error": "ValueError", "message": "task_id_required"}
+
+
+def test_e7_doctor_command_is_handled_once():
+    """E7: doctor returns before the config-loaded branch, so it is not handled twice."""
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "oraculo" / "cli.py"
+    ).read_text()
+    assert source.count('args.command == "doctor"') == 1
 
 
 def test_cli_list_without_host_bridge(service_config, monkeypatch, capsys):

@@ -940,6 +940,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 if args.action in {"list", "status", "history"}:
+                    if args.action != "list" and not isinstance(
+                        payload.get("task_id") if isinstance(payload, dict) else None,
+                        str,
+                    ):
+                        raise ValueError("task_id_required")
                     try:
                         result = asyncio.run(
                             managed_command(config, args.action, payload, None)
@@ -1111,8 +1116,6 @@ def main(argv: list[str] | None = None) -> int:
                 with Singleton(config.state_dir):
                     asyncio.run(login(config.t3_mcp_url))
                 result = {"state": "authenticated"}
-            elif args.command == "doctor":
-                result = doctor(config)
             else:
                 if args.command == "request":
                     raw = args.file.read_text() if args.file else sys.stdin.read()
