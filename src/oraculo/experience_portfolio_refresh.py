@@ -77,6 +77,27 @@ def _unchanged(destination: Path, incoming: dict[str, str]) -> dict[str, str]:
     return preserved
 
 
+def _pin_generated_configuration(
+    stage: Path, files: dict[str, str], receipt: dict
+) -> None:
+    """Remember the generated digest, not the preserved user bytes.
+
+    The next refresh compares disk bytes with that generated digest. An edit
+    therefore stays preserved on every later refresh.
+    """
+
+    marker = stage / ".oraculo-export.json"
+    manifest = json.loads(marker.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("experience_invalid_export_manifest")
+    for path, content in files.items():
+        if _local_configuration(path) and path in manifest:
+            manifest[path] = digest(content)
+    marker.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    marker.chmod(0o600)
+    receipt["manifest_sha256"] = digest(canonical_json(manifest))
+
+
 def refresh_export(destination: Path, files: dict[str, str]) -> dict:
     """Stage a complete replacement; refuse unknown files or modified originals.
 
@@ -97,6 +118,7 @@ def refresh_export(destination: Path, files: dict[str, str]) -> dict:
     installed = False
     try:
         receipt = write_export(stage, files | configuration)
+        _pin_generated_configuration(stage, files, receipt)
         if _unchanged(destination, files) != configuration:
             raise ValueError("experience_export_locally_modified")
         backup = Path(

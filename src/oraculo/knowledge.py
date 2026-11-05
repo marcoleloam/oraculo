@@ -453,6 +453,22 @@ def knowledge_report(publisher, project_id: str) -> dict:
     }
 
 
+# Compiler contest and assessment clearing rewrite these fields in place.
+# A retained claim may change only them; text or evidence edits stay new.
+_NIGHTLY_RETAINED_FIELDS = frozenset({"support", "assessment"})
+
+
+def _nightly_claim_retained(claim: dict, previous: dict) -> bool:
+    if claim.get("id") != previous.get("id"):
+        return False
+    keys = set(claim) | set(previous)
+    return all(
+        claim.get(key) == previous.get(key)
+        for key in keys
+        if key not in _NIGHTLY_RETAINED_FIELDS
+    )
+
+
 def validate_nightly_proposal(publisher, project_id, proposal, selected):
     """New nightly evidence must belong to its frozen selection; old claims stay."""
     if (
@@ -485,11 +501,20 @@ def validate_nightly_proposal(publisher, project_id, proposal, selected):
         old_claims = parse_page(previous)[0].get("claims", []) if previous else []
         if not isinstance(old_claims, list):
             raise MemoryError("knowledge_routine_existing_claims_invalid")
+        old_by_id: dict[str, list[dict]] = {}
+        for old in old_claims:
+            if isinstance(old, dict) and isinstance(old.get("id"), str):
+                old_by_id.setdefault(old["id"], []).append(old)
         for claim in claims:
             if claim in old_claims:
                 continue
             if not isinstance(claim, dict):
                 raise MemoryError("knowledge_routine_requires_typed_claims")
+            if any(
+                _nightly_claim_retained(claim, old)
+                for old in old_by_id.get(claim.get("id"), [])
+            ):
+                continue
             evidence = claim.get("evidence", [])
             if not isinstance(evidence, list) or any(
                 not isinstance(span, dict) or span.get("path") not in frozen
