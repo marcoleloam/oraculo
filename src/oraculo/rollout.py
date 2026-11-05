@@ -11,6 +11,7 @@ from pydantic import Field
 
 from oraculo.config import StrictModel
 from oraculo.protocol import content_hash
+from oraculo.runtime import RuntimeError as RuntimeOperationError
 from oraculo.state import StateError
 
 
@@ -102,7 +103,7 @@ class RolloutVerifier:
                 receipt_hash=content_hash(samples),
                 expires_at=self.clock() + 120,
             )
-        except (OSError, ValueError, TimeoutError):
+        except (OSError, ValueError, TimeoutError, RuntimeOperationError):
             return dict(
                 state="unknown",
                 verifier="service-rollout-v1",

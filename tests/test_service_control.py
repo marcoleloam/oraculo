@@ -45,6 +45,54 @@ def result(stdout="", stderr="", code=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=code)
 
 
+@pytest.mark.parametrize("action", ["stop", "restart", "uninstall"])
+def test_e2_online_service_change_refuses_pending_runtime_journal(
+    controller, monkeypatch, action
+):
+    """E2: plain stop/restart/uninstall must not rewrite a journal over pending runtime maintenance."""
+    root = controller.root
+    rt.write_json(
+        root / "operation.json",
+        dict(operation_id="runtime-held", state="maintenance", token="held"),
+    )
+    service_journal = root / "service-operation.json"
+    rt.write_json(
+        service_journal,
+        dict(operation_id="previous-complete", token=None, state="complete"),
+    )
+    calls = []
+
+    def request(kind, payload):
+        calls.append(kind)
+        raise rt.RuntimeError("maintenance_already_active")
+
+    controller.status = lambda: {"state": "online", "pid": 123}
+    controller.request = request
+    monkeypatch.setattr(
+        sc.ServiceController, "from_args", staticmethod(lambda args: controller)
+    )
+    result = sc.dispatch(
+        SimpleNamespace(
+            root=root,
+            config=controller.config,
+            label=controller.label,
+            plist_dir=controller.plist.parent,
+            log_dir=controller.logs,
+            timeout=0.2,
+            dry_run=False,
+            service_action=action,
+            carry_reservations=None,
+            carry_authorization=None,
+            carry_terminal_proof=None,
+        )
+    )
+    assert result["error_code"] == "recovery_required", result
+    assert calls == []
+    assert (
+        json.loads(service_journal.read_text())["operation_id"] == "previous-complete"
+    )
+
+
 def test_linux_service_explicitly_unsupported(tmp_path):
     instance = ServiceController(tmp_path, tmp_path / "missing", platform="linux")
     assert instance.status()["state"] == "unsupported"

@@ -1071,6 +1071,12 @@ def dispatch(args):
                 return carry_stop(controller, operation, journal_path, carry, actor)
             before = controller.status()
             if before["state"] == "online":
+                if runtime_pending(controller.root):
+                    raise RuntimeError(
+                        "recovery_required",
+                        "Resume runtime activate or runtime rollback before service "
+                        f"{args.service_action}.",
+                    )
                 operation_id = (
                     str(uuid.uuid4())
                     if not operation or operation["state"] == "complete"

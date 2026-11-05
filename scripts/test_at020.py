@@ -15,7 +15,7 @@ CASES = [
     "tests/test_lifecycle.py::test_singleton_restart_preserves_state_and_socket_permissions",
     "tests/test_reconcile.py",
     "tests/test_reconcile_cancelled.py",
-    "tests/test_service.py::test_submit_dispatch_execute_reconcile_queues_memory",
+    "tests/test_service.py::test_submit_dispatch_execute_reconcile_publishes_cycle",
     "tests/test_service.py::test_memory_dispatch_replays_persisted_payload_after_restart",
     "tests/test_service.py::test_dispatch_retry_after_restart_is_bounded_and_preserves_payload",
     "tests/test_service.py::test_dispatch_does_not_retry_unproven_terminal_run",

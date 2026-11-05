@@ -454,6 +454,9 @@ class Service:
     def plist_bytes(self):
         return b"<plist>synthetic</plist>"
 
+    def owned_plist(self):
+        return {"Label": "synthetic", "OraculoManagedRoot": str(self.root)}
+
     def request(self, kind, payload):
         self.steps.append(kind)
         if kind != "maintenance.status":
