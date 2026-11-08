@@ -215,16 +215,14 @@ class HostResults:
                 if (
                     run["runId"] in ids
                     or run["ordinal"] in ordinals
-                    or not 1 <= run["ordinal"] <= thread["runCount"]
+                    or run["ordinal"] < 1
                 ):
                     raise StateError("native_bridge_result_incoherent")
                 ids.add(run["runId"])
                 ordinals.add(run["ordinal"])
-                if (
-                    run["runId"] == thread["latestRunId"]
-                    and run["ordinal"] != thread["runCount"]
-                ):
-                    raise StateError("native_bridge_result_incoherent")
+            # runCount counts records, not the largest allocated ordinal. The
+            # host can leave gaps after queued runs are reordered. Keep identity,
+            # uniqueness and cardinality checks without assuming dense ordinals.
             if len(ids) > thread["runCount"] or (
                 thread["latestRunId"] and thread["latestRunId"] not in ids
             ):

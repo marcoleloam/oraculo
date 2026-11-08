@@ -289,6 +289,33 @@ def test_paginated_catalog_missing_page_or_wrong_total_fails_closed():
         )
 
 
+@pytest.mark.parametrize("count,ordinal", [(1, 2), (20, 21)])
+def test_thread_accepts_sparse_ordinals(count, ordinal):
+    value = snapshot()
+    value["thread"]["runCount"] = count
+    value["recentRuns"][0]["ordinal"] = ordinal
+    assert HostResults().validate(
+        "t3_thread_read", {"threadId": "child"}, value
+    ) == value
+
+
+@pytest.mark.parametrize("defect", ["zero", "duplicate_ordinal", "missing_latest", "count"])
+def test_sparse_ordinals_do_not_relax_identity_or_cardinality(defect):
+    value = snapshot()
+    value["recentRuns"][0]["ordinal"] = 21
+    if defect == "zero":
+        value["recentRuns"][0]["ordinal"] = 0
+    elif defect == "duplicate_ordinal":
+        value["thread"]["runCount"] = 2
+        value["recentRuns"].append(dict(value["recentRuns"][0], runId="other"))
+    elif defect == "missing_latest":
+        value["thread"]["latestRunId"] = "missing"
+    else:
+        value["thread"]["runCount"] = 0
+    with pytest.raises(StateError, match="native_bridge_result_incoherent"):
+        HostResults().validate("t3_thread_read", {"threadId": "child"}, value)
+
+
 def test_status_cannot_claim_quiescence_after_active_thread_read():
     state = HostResults()
     read = snapshot()
