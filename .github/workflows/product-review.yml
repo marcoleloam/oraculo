@@ -10,7 +10,9 @@ jobs:
   product-review:
     name: Product review (exact HEAD)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # The complete serial scenario set took 36m29s before a 40m evaluation timeout.
+    # Leave room for the bounded evaluator and always-uploaded evidence.
+    timeout-minutes: 100
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UV_PYTHON_DOWNLOADS: never
