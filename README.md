@@ -105,3 +105,14 @@ não apenas da presença de um arquivo de skill.
 O núcleo combina recuperação com orçamento, afirmações e evidências tipadas, compilação incremental, auditoria de atualidade, captura explícita e rotinas opt-in. Consulte o [roadmap F0–F6](docs/ROADMAP_SECOND_BRAIN.md) e o [guia de uso](docs/SECOND_BRAIN_USO.md).
 
 A exportação unificada apresenta projetos, tarefas/subtarefas e biblioteca em Markdown e HTML offline. O Obsidian recebe cores por projeto, grafo filtrado e `Mapa dos projetos.canvas`; possíveis conexões têm justificativa e permanecem separadas das relações confirmadas. Atualizações preservam configurações locais e recusam sobrescrever conteúdo editado.
+
+### CI dos pull requests
+
+O gate automático é **Basic checks**: lint, contratos dos workflows e testes
+básicos de protocolo, configuração, CLI e políticas Azure. Ele não certifica a
+suíte completa nem a ativação do serviço.
+
+Para executar a suíte completa Linux/macOS, dispare manualmente o workflow `Full CI`. `Oraculo product review` e `Oraculo offline validation`
+também estão disponíveis por `workflow_dispatch`, sem execução automática por PR.
+Uma política explícita de outro projeto continua sendo respeitada; esta mudança
+não altera os gates de publicação do runtime.
