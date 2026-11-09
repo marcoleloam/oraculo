@@ -186,6 +186,23 @@ class CIRoundMemory:
     @staticmethod
     def policy_scope(policy):
         """Compare policy facts, excluding moving base and transport timestamps."""
+        if policy.get("source") == "authenticated_azure_policy_evaluations":
+            return {
+                k: policy[k]
+                for k in (
+                    "source",
+                    "repository",
+                    "repository_id",
+                    "project_id",
+                    "base",
+                    "head_sha",
+                    "project_policy_sha256",
+                    "required_checks",
+                    "required_review",
+                    "allow_no_checks",
+                    "policy_evaluations",
+                )
+            }
         remote = policy["remote_capability"]
         return dict(
             **{

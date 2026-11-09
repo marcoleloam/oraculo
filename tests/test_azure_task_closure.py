@@ -198,6 +198,77 @@ async def test_active_reconcile_waits_without_native_watch_and_never_merges(syst
     assert host.merges == counts["settle"] == 0
 
 
+async def test_empty_azure_policy_records_no_ci_audit_and_closes_once(system):
+    tasks, spec, host, counts = await integrated_setup(system, status="active")
+    task = tasks[0]
+    spec.pop("pr_id")
+    spec.pop("reconcile_only")
+    spec.pop("integration")
+    host.policies = []
+    host.statuses = []
+    original_report = copy.deepcopy(task["report"])
+    published = await publish(system, task, spec)
+    assert published["phase"] == "pr_open", published.get("blocked_reason")
+    explicit = dict(policy(spec), required_checks=[], allow_no_checks=True)
+    closed = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": explicit}
+    )
+    assert not closed.get("blocked_reason"), closed.get("blocked_reason")
+    assert closed["merged"] and closed["settled"], closed
+    assert closed["pr_gate"]["ci_outcome"] == "not_required_by_explicit_policy"
+    assert system.store.get(task["id"])["report"] == original_report
+    assert host.merges == counts["settle"] == 1
+    previous_rounds = copy.deepcopy(closed.get("ci_rounds", []))
+    replay = await system.engine.command("pr-check", {"task_id": task["id"]})
+    assert replay["settled"] and host.merges == counts["settle"] == 1, replay
+    assert [(r["id"], r["facts"], r["memory"]["id"]) for r in replay["ci_rounds"]] == [
+        (r["id"], r["facts"], r["memory"]["id"]) for r in previous_rounds
+    ]
+    facts = replay["ci_rounds"][0]["facts"]
+    assert facts["outcome"] == "not_required_by_explicit_policy"
+    assert facts["checks"] == facts["identity"]["observed_runs"] == []
+    # The first post-merge read enriches the final merge receipt. Repeating that
+    # same authenticated observation must reuse it and the policy-audit cycle.
+    memory_head = system.service.publisher.git.head()
+    again = await system.engine.command("pr-check", {"task_id": task["id"]})
+    assert again["settled"] and host.merges == counts["settle"] == 1, again
+    assert system.service.publisher.git.head() == memory_head
+
+
+async def test_azure_policy_appearing_during_memory_blocks_merge(system):
+    tasks, spec, host, _ = await integrated_setup(system, status="active")
+    task = tasks[0]
+    for key in ("pr_id", "reconcile_only", "integration"):
+        spec.pop(key)
+    host.policies = []
+    host.statuses = []
+    await publish(system, task, spec)
+    original = system.memory.finish
+
+    async def change_policy(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        host.policies = [
+            {
+                "configuration": {
+                    "isEnabled": True,
+                    "isBlocking": True,
+                    "settings": {"statusName": "required", "statusGenre": "ci"},
+                },
+                "status": "approved",
+            }
+        ]
+        return result
+
+    system.memory.finish = change_policy
+    explicit = dict(policy(spec), required_checks=[], allow_no_checks=True)
+    blocked = await system.engine.command(
+        "merge", {"task_id": task["id"], "policy": explicit}
+    )
+    assert blocked["blocked_reason"] == "ci_actual_host_policy_not_satisfied"
+    assert not blocked["merged"] and host.merges == 0
+    assert blocked["ci_rounds"][0]["memory"]["write_state"] == "saved"
+
+
 async def test_observed_merge_receipt_cannot_be_rebound_on_replay(system):
     tasks, spec, host, counts = await integrated_setup(system)
     task = tasks[0]

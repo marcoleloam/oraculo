@@ -24,6 +24,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from oraculo.protocol import content_hash
 from oraculo.publication import PublicationError, Runner, command_runner
 
 _SHA = re.compile(r"(?:[a-f0-9]{40}|[a-f0-9]{64})")
@@ -162,7 +163,10 @@ class RepositoryPRLifecycle:
                 )
             )
             _, current = adapter._get(m, pr["number"])
-            if current["state"] == "merged":
+            if current["state"] == "merged" and not (
+                policy.get("allow_no_checks") is True
+                and policy.get("required_checks") == []
+            ):
                 return {"source": "historical_merge_observed", "required_checks": None}
             policies = adapter._pages(
                 m,
@@ -189,8 +193,16 @@ class RepositoryPRLifecycle:
                         )
                     reviews = reviews or settings.get("minimumApproverCount", 0) > 0
             observed = dict(
+                repository=pr["repository"],
+                repository_id=m["repository_id"],
+                project_id=m["project_id"],
+                base=pr["base"],
+                head_sha=pr["head_sha"],
+                project_policy_sha256=content_hash(policy),
                 required_checks=checks,
                 required_review=reviews,
+                allow_no_checks=not policies,
+                policy_evaluations=copy.deepcopy(policies),
                 source="authenticated_azure_policy_evaluations",
             )
         else:
