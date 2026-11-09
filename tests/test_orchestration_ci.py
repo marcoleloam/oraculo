@@ -336,7 +336,7 @@ def test_inactive_ci_template_pins_actions_and_preserves_always_evidence():
         row["os"]: (row["runner"], row["timeout"])
         for row in job["strategy"]["matrix"]["include"]
     } == {
-        "ubuntu-latest": ("ubuntu-latest", "30"),
+        "ubuntu-latest": ("ubuntu-latest", "120"),
         "macos-latest": ("macos-26-intel", "120"),
     }
     assert any(

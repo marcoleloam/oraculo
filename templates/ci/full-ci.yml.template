@@ -27,7 +27,8 @@ jobs:
         include:
           - os: ubuntu-latest
             runner: ubuntu-latest
-            timeout: 30
+            # The complete serial CLI/Git suite exceeded 30 minutes on Linux too.
+            timeout: 120
           - os: macos-latest
             runner: macos-26-intel
             # Serial CLI/Git integration tests exceeded the old 30-minute job.
