@@ -73,7 +73,10 @@ def main():
             "-B",
             "-m",
             "pytest",
-            "-q",
+            "-vv",
+            "--durations=25",
+            "-o",
+            "faulthandler_timeout=120",
             *contract["tests"],
             "--junitxml=" + str(output / "scenarios.xml"),
         ]
@@ -88,7 +91,8 @@ def main():
                     "PYTHONPATH": str(ROOT / "src"),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 },
-                timeout=2400,
+                # Serial CLI/Git journeys exceeded the old 40-minute envelope.
+                timeout=5400,
             )
         receipt["command"] = argv
         receipt["exit_code"] = result.returncode

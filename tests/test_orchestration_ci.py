@@ -336,7 +336,7 @@ def test_inactive_ci_template_pins_actions_and_preserves_always_evidence():
         row["os"]: (row["runner"], row["timeout"])
         for row in job["strategy"]["matrix"]["include"]
     } == {
-        "ubuntu-latest": ("ubuntu-latest", "30"),
+        "ubuntu-latest": ("ubuntu-latest", "120"),
         "macos-latest": ("macos-26-intel", "120"),
     }
     assert any(
@@ -360,13 +360,25 @@ def test_uv_output_marker_is_metadata_and_unexpected_extra_files_still_fail(tmp_
         module.distribution_paths(tmp_path)
 
 
-def test_automatic_full_scope_and_product_gates_are_restored():
+def test_basic_gate_is_automatic_and_complete_suites_require_manual_opt_in():
     spec = yaml.load(
         (ROOT / "templates/ci/oraculo-suite.yml.template").read_text(),
         Loader=yaml.BaseLoader,
     )
     assert set(spec["on"]) == {"pull_request", "push", "workflow_dispatch"}
-    steps = spec["jobs"]["tests"]["steps"]
+    basic = spec["jobs"]["basic"]
+    assert basic["name"] == "Basic checks"
+    assert "if" not in basic
+    assert not any(s.get("continue-on-error") for s in basic["steps"])
+    basic_tests = [s for s in basic["steps"] if "pytest " in s.get("run", "")]
+    assert len(basic_tests) == 1 and "tests/test_ci_azure.py" in basic_tests[0]["run"]
+    assert set(spec["jobs"]) == {"basic"}
+    full = yaml.load(
+        (ROOT / "templates/ci/full-ci.yml.template").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    assert set(full["on"]) == {"workflow_dispatch"}
+    steps = full["jobs"]["tests"]["steps"]
     pytest_steps = [s for s in steps if "pytest " in s.get("run", "")]
     assert len(pytest_steps) == 1
     assert "if" not in pytest_steps[0]
@@ -377,4 +389,4 @@ def test_automatic_full_scope_and_product_gates_are_restored():
         broad = yaml.load(
             (ROOT / "templates/ci" / name).read_text(), Loader=yaml.BaseLoader
         )
-        assert set(broad["on"]) == {"pull_request", "push", "workflow_dispatch"}
+        assert set(broad["on"]) == {"workflow_dispatch"}

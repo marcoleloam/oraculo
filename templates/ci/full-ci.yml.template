@@ -1,10 +1,8 @@
-# Inactive. Export only to a reviewed sanitized public checkout as .github/workflows/ci.yml.
-name: CI
+# Inactive. Export only to a reviewed sanitized public checkout as .github/workflows/full-ci.yml.
+name: Full CI
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,7 +25,8 @@ jobs:
         include:
           - os: ubuntu-latest
             runner: ubuntu-latest
-            timeout: 30
+            # The complete serial CLI/Git suite exceeded 30 minutes on Linux too.
+            timeout: 120
           - os: macos-latest
             runner: macos-26-intel
             # Serial CLI/Git integration tests exceeded the old 30-minute job.

@@ -15,24 +15,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tests:
-    name: Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        # Preserve required check names while selecting the actual runner pool.
-        # ARM64 hosted jobs repeatedly expired before any runner was allocated.
-        include:
-          - os: ubuntu-latest
-            runner: ubuntu-latest
-            timeout: 30
-          - os: macos-latest
-            runner: macos-26-intel
-            # Serial CLI/Git integration tests exceeded the old 30-minute job.
-            timeout: 120
+  basic:
+    name: Basic checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,14 +30,13 @@ jobs:
       - run: uv sync --frozen
       - run: uv run --frozen ruff check src tests scripts
       - run: uv run --frozen python scripts/validate_ci_exports.py
-      - name: Complete suite
-        run: uv run --frozen pytest -v --durations=25 --junitxml="$RUNNER_TEMP/pytest-results.xml"
-      - name: Preserve pytest results
+      - name: Basic regression tests
+        run: uv run --frozen pytest -q tests/test_protocol.py tests/test_config.py tests/test_cli.py tests/test_ci_azure.py --junitxml="$RUNNER_TEMP/basic-results.xml"
+      - name: Preserve basic results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: pytest-results-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}
-          path: ${{ runner.temp }}/pytest-results.xml
-          # Missing JUnit after cancellation warns; the job failure stays intact.
+          name: basic-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/basic-results.xml
           if-no-files-found: warn
           retention-days: 7

@@ -4,13 +4,104 @@ from urllib.parse import urlsplit
 
 import pytest
 from test_azure_repos import azure as azure_fixture
+from test_azure_repos import existing, policy
 
 from oraculo.azure_repos import AzureRepos
 from oraculo.ci_events import CIBinding
+from oraculo.ci_round_memory import CIRoundMemory
 from oraculo.pr_lifecycle import RepositoryPRLifecycle
+from oraculo.publication import PublicationError
 from oraculo.state import StateError
 
 azure = azure_fixture
+
+
+def test_empty_azure_policy_discovery_allows_explicit_no_checks(azure):
+    root, spec, host, adapter = azure
+    host.policies = []
+    host.statuses = []
+    pr = existing(azure)
+    explicit = dict(policy(spec), required_checks=[], allow_no_checks=True)
+    lifecycle = RepositoryPRLifecycle(azure_factory=lambda _: adapter)
+    observed = lifecycle.validate_host_policy(pr, explicit, root)
+    assert observed["required_checks"] == []
+    assert observed["required_review"] is False
+    assert observed["allow_no_checks"] is True
+    assert observed["source"] == "authenticated_azure_policy_evaluations"
+    assert observed["repository"] == spec["repository"]
+    assert observed["head_sha"] == spec["head_sha"]
+    assert observed["policy_evaluations"] == []
+    assert lifecycle.inspect(pr, explicit, root)["ready"] is True
+    assert host.created == host.merges == 0
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"statusName": "unit", "statusGenre": "ci"},
+        {"buildDefinitionId": 7},
+        {"minimumApproverCount": 1},
+        {},
+    ],
+)
+def test_present_azure_policy_does_not_prove_no_checks(azure, settings):
+    root, spec, host, adapter = azure
+    host.policies = [
+        {
+            "configuration": {
+                "isEnabled": True,
+                "isBlocking": True,
+                "settings": settings,
+            },
+            "status": "approved",
+        }
+    ]
+    pr = existing(azure)
+    lifecycle = RepositoryPRLifecycle(azure_factory=lambda _: adapter)
+    explicit = dict(policy(spec), required_checks=[], allow_no_checks=True)
+    with pytest.raises(PublicationError, match="ci_actual_host_policy_not_satisfied"):
+        lifecycle.validate_host_policy(pr, explicit, root)
+    assert host.created == host.merges == 0
+
+
+def test_failed_azure_policy_discovery_cannot_look_like_empty_rules(azure):
+    root, spec, host, adapter = azure
+    pr = existing(azure)
+
+    def transport(method, url, body=None):
+        if "/policy/evaluations" in url:
+            raise TimeoutError("synthetic policy discovery failure")
+        return host(method, url, body)
+
+    lifecycle = RepositoryPRLifecycle(azure_factory=lambda _: AzureRepos(transport))
+    explicit = dict(policy(spec), required_checks=[], allow_no_checks=True)
+    with pytest.raises((PublicationError, TimeoutError)):
+        lifecycle.validate_host_policy(pr, explicit, root)
+    assert host.created == host.merges == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "repository",
+        "repository_id",
+        "project_id",
+        "base",
+        "head_sha",
+        "project_policy_sha256",
+    ],
+)
+def test_azure_no_ci_memory_scope_rejects_swapped_binding(azure, field):
+    root, spec, host, adapter = azure
+    host.policies = []
+    pr = existing(azure)
+    explicit = dict(policy(spec), required_checks=[], allow_no_checks=True)
+    observed = RepositoryPRLifecycle(
+        azure_factory=lambda _: adapter
+    ).validate_host_policy(pr, explicit, root)
+    CIRoundMemory.require_same_policy(observed, dict(observed))
+    with pytest.raises(StateError, match="ci_host_policy_changed_after_memory"):
+        CIRoundMemory.require_same_policy(observed, {**observed, field: "swapped"})
 
 
 @pytest.mark.parametrize(

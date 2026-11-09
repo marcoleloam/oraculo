@@ -25,8 +25,8 @@ CONTRACTS = (
         "oraculo-suite.yml.template",
         "ci.yml",
         "CI",
-        "tests",
-        "Tests (${{ matrix.os }})",
+        "basic",
+        "Basic checks",
         INACTIVE_HEADER,
     ),
     (
@@ -39,12 +39,12 @@ CONTRACTS = (
     ),
     (
         "full-ci.yml.template",
-        None,
-        "CI",
+        "full-ci.yml",
+        "Full CI",
         "tests",
         "Tests (${{ matrix.os }})",
         b"# Inactive. Export only to a reviewed sanitized public checkout as "
-        b".github/workflows/ci.yml.\n",
+        b".github/workflows/full-ci.yml.\n",
     ),
 )
 
