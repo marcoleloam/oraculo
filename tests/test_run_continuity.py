@@ -8,10 +8,112 @@ from test_managed_tasks import report
 from test_report_prevalidation import flow as flow_fixture
 
 from oraculo.protocol import content_hash
-from oraculo.run_continuity import terminal_chain
+from oraculo.run_continuity import report_link, terminal_chain, timestamp
 from oraculo.state import StateError
 
 flow = flow_fixture
+
+
+def test_cancelled_submission_then_status_only_run_requires_fresh_resubmission():
+    good = {"summary": "validated immutable implementation"}
+    digest = content_hash(good)
+
+    def run(n, status, start, end):
+        return dict(
+            runId=f"run-{n}",
+            ordinal=n,
+            status=status,
+            startedAt=f"2026-11-09T{start}Z",
+            completedAt=f"2026-11-09T{end}Z",
+        )
+
+    def event(n, at, run_id, thread_id="child", sha=digest):
+        return dict(
+            id=f"event-{n}",
+            phase="validation_submitted",
+            at=timestamp(f"2026-11-09T{at}Z"),
+            proof=dict(
+                report_sha256=sha, submission=dict(thread_id=thread_id, run_id=run_id)
+            ),
+        )
+
+    first = event(1, "23:20:05", "run-1")
+    task = dict(
+        child=dict(childRunId="run-1", childThreadId="child"),
+        transport_mode="native_child",
+        submitted_report=good,
+        events=[first],
+    )
+    snapshot = dict(
+        thread=dict(runCount=2, latestRunId="run-2", status="completed"),
+        recentRuns=[
+            run(1, "cancelled", "23:19:00", "23:20:40"),
+            run(2, "completed", "23:20:46", "23:21:06"),
+        ],
+    )
+    with pytest.raises(StateError, match="latest_run_report_unproven"):
+        report_link(task, snapshot, good)
+    snapshot["recentRuns"].append(run(3, "completed", "23:22:00", "23:22:40"))
+    snapshot["thread"].update(runCount=3, latestRunId="run-3")
+    with pytest.raises(StateError, match="latest_run_report_unproven"):
+        report_link(task, snapshot, good)
+    for bad in [
+        event(2, "23:22:05", "run-2"),
+        event(2, "23:22:05", "run-3", thread_id="other"),
+        event(2, "23:22:05", "run-3", sha="different"),
+        event(2, "23:21:55", "run-3"),
+    ]:
+        task["events"] = [first, bad]
+        with pytest.raises(StateError, match="latest_run_report_unproven"):
+            report_link(task, snapshot, good)
+    latest = event(3, "23:22:20", "run-3")
+    task["events"] = [first, latest, event(2, "23:22:05", "run-3")]
+    evidence = report_link(task, snapshot, good)
+    assert evidence["submission_event_id"] == latest["id"]
+    assert evidence["original_run_id"] == task["child"]["childRunId"] == "run-1"
+    assert evidence["report_sha256"] == digest
+    assert task["submitted_report"] == good
+
+
+@pytest.mark.parametrize(
+    "defect", [None, "failed", "rolled_back", "pending", "descendant", "native"]
+)
+async def test_same_report_resubmission_preserves_terminal_gates(flow, defect):
+    task = await flow.begin()
+    good = report(task)
+    flow.host.caller = task["child"]["childThreadId"]
+    first = await flow.invoke("finish", task_id=task["id"], report=good)
+    assert first["phase"] == "validation_submitted"
+    good, runs, thread, native = await submit_last(flow, task)
+    runs[0]["status"] = "cancelled"
+    if defect in ("failed", "rolled_back"):
+        runs[0]["status"] = defect
+    elif defect == "pending":
+        native["hasPendingChildRuns"] = True
+    elif defect == "native":
+        native["latestTerminalRunId"] = runs[1]["runId"]
+    elif defect == "descendant":
+        flow.host.threads["descendant"] = dict(
+            thread,
+            threadId="descendant",
+            parentThreadId=task["child"]["childThreadId"],
+            activeRunId="descendant-run",
+            latestRunId="descendant-run",
+            status="running",
+        )
+    result = await flow.invoke("resume", task_id=task["id"])
+    assert result["child"] == task["child"]
+    if defect:
+        assert result["phase"] == "blocked", result
+        assert flow.service.state.capacity()["occupied"] == 1
+        assert result["memory"]["write_state"] == "not_requested"
+    else:
+        assert result["phase"] == "pr_pending", result
+        stored = flow.service.managed_service.store.get(task["id"])
+        events = [e for e in stored["events"] if e["phase"] == "validation_submitted"]
+        assert stored["completion_evidence"]["submission_event_id"] == events[-1]["id"]
+        assert stored["report"] == good
+        assert flow.service.state.capacity()["occupied"] == 0
 
 
 def attach_chain(flow, task, *, active=False):
