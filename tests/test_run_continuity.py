@@ -492,3 +492,77 @@ async def test_report_from_original_run_cannot_close_later_terminal_runs(
     assert result["blocked_reason"] == "latest_run_report_unproven", result
     assert result["memory"]["write_state"] == "not_requested"
     assert flow.service.state.capacity()["occupied"] == 1
+
+
+@pytest.mark.parametrize("direction", ["added", "removed"])
+async def test_nullable_executed_model_metadata_preserves_certified_replay(
+    flow, monkeypatch, direction
+):
+    task = await flow.begin()
+    good, runs, _, _ = await submit_last(flow, task)
+    if direction == "removed":
+        for run in runs:
+            run["executedModel"] = None
+    first = await flow.invoke("resume", task_id=task["id"])
+    assert first["phase"] == "pr_pending", first
+    store = flow.service.managed_service.store
+    before = copy.deepcopy(store.get(task["id"]))
+    for run in runs:
+        if direction == "added":
+            run["executedModel"] = None
+        else:
+            run.pop("executedModel")
+    from test_ci_round_memory import publish
+
+    _, policy, transport = await publish(
+        flow, monkeypatch, task, good, "nullable-metadata-publication"
+    )
+    transport.conclusion = "success"
+    again = await flow.invoke("pr-check", task_id=task["id"], policy=policy)
+    assert again["phase"] == "pr_ready", again.get("blocked_reason")
+    after = store.get(task["id"])
+    for field in ("report", "memory", "completion_evidence", "child"):
+        assert after[field] == before[field]
+    assert flow.service.state.capacity()["occupied"] == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("executedModel", "different-executed-model"),
+        ("model", "different-requested-model"),
+        ("providerInstanceId", "different-provider"),
+        ("completedAt", "2026-10-21T18:03:31Z"),
+        ("newUnknownEvidence", None),
+    ],
+)
+async def test_real_execution_metadata_changes_still_block_certified_replay(
+    flow, monkeypatch, field, value
+):
+    task = await flow.begin()
+    good, runs, _, _ = await submit_last(flow, task)
+    first = await flow.invoke("resume", task_id=task["id"])
+    assert first["phase"] == "pr_pending", first
+    store = flow.service.managed_service.store
+    before = copy.deepcopy(store.get(task["id"]))
+    from test_ci_round_memory import publish
+
+    _, policy, transport = await publish(
+        flow, monkeypatch, task, good, "changed-metadata-publication"
+    )
+    transport.conclusion = "success"
+    original_call = flow.host.call
+
+    async def watched(name, args):
+        if name in {"watch_pull_request", "unwatch_pull_request"}:
+            return dict(url=args["url"], watching=name == "watch_pull_request")
+        return await original_call(name, args)
+
+    flow.host.call = watched
+    runs[-1][field] = value
+    blocked = await flow.invoke("merge", task_id=task["id"], policy=policy)
+    assert blocked["blocked_reason"] == "execution_changed_after_validation", blocked
+    assert not any(c[:3] == ["gh", "pr", "merge"] for c in transport.calls)
+    after = store.get(task["id"])
+    for key in ("report", "memory", "completion_evidence", "child"):
+        assert after[key] == before[key]
