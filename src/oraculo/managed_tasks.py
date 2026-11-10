@@ -28,6 +28,7 @@ from oraculo.run_continuity import (
     execution_run,
     native_terminal_run,
     report_link,
+    same_execution_history,
     terminal_chain,
 )
 from oraculo.settlement import Settlements
@@ -1749,7 +1750,10 @@ class ManagedTasks:
         ):
             raise StateError("thread_active_failed_or_pending_question")
         if audit:
-            if audit["runs"] != chain or audit["child"] != task["child"]:
+            if (
+                not same_execution_history(audit["runs"], chain)
+                or audit["child"] != task["child"]
+            ):
                 raise StateError("execution_changed_after_validation")
         elif execution_run(chain)["status"] != "completed":
             raise StateError("expected_run_not_completed")

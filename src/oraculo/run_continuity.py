@@ -99,6 +99,22 @@ def native_terminal_run(chain):
     return max(chain, key=lambda run: (timestamp(run["completedAt"]), run["ordinal"]))
 
 
+def same_execution_history(left, right):
+    """Only absent and null optional executedModel metadata are equivalent.
+
+    Preserve the stored and fresh receipts verbatim. A real executed model,
+    timestamps, identities, order or any unknown field still changes evidence.
+    """
+
+    def view(runs):
+        return [
+            {k: v for k, v in run.items() if k != "executedModel" or v is not None}
+            for run in runs
+        ]
+
+    return view(left) == view(right)
+
+
 def report_link(task, snapshot, report, *, actor=None):
     """Use immutable submission evidence, never refresh an old report's date."""
     chain = terminal_chain(snapshot)
@@ -113,7 +129,7 @@ def report_link(task, snapshot, report, *, actor=None):
         if (
             existing["report_sha256"] != digest
             or existing["latest_run_id"] != latest["runId"]
-            or existing["runs"] != chain
+            or not same_execution_history(existing["runs"], chain)
         ):
             raise StateError("execution_changed_after_validation")
         return existing
