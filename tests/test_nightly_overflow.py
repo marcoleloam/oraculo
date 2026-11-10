@@ -192,8 +192,8 @@ def test_nightly_publication_cycle_recovers_after_lost_receipt(tmp_path, monkeyp
     }
     original = pub.publish
 
-    def lost(proposal):
-        original(proposal)
+    def lost(proposal, **kwargs):
+        original(proposal, **kwargs)
         raise RuntimeError("lost receipt")
 
     monkeypatch.setattr(pub, "publish", lost)

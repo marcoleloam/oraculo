@@ -489,12 +489,33 @@ class MemoryCycles:
         Replay uses the same proposal and cycle. A crash between publication
         and ledger update is reconciled by publish_one through the journal.
         """
-        cycle = self.begin(
-            project_id,
+        cycle_key = (
             "nightly-publication:"
             + identity["attempt_id"]
             + ":"
-            + proposal["operation_id"],
+            + proposal["operation_id"]
+        )
+        cycle_id = "cycle-" + digest(_json([project_id, cycle_key]))
+        existing = self.state.connection.execute(
+            "SELECT id FROM memory_cycles WHERE id=?", (cycle_id,)
+        ).fetchone()
+
+        def prepare():
+            return self._nightly_intent(project_id, identity, proposal, cycle_key)
+
+        if existing:
+            prepare()
+            return self.publish_one(cycle_id)["write_receipt"]
+        # Register intent under the publisher lock after validation, immediately
+        # before its journal/write. A CAS refusal has no publication to reconcile.
+        return self._publish_nightly(
+            {"id": cycle_id, "publication_proposal": proposal}, before_write=prepare
+        )["write_receipt"]
+
+    def _nightly_intent(self, project_id, identity, proposal, cycle_key):
+        cycle = self.begin(
+            project_id,
+            cycle_key,
             "",
             identity,
             skip_read_reason="nightly_prepared_compilation",
@@ -511,11 +532,19 @@ class MemoryCycles:
                     write_state="pending",
                 )
                 self._save(item)
-        return self.publish_one(cycle["id"])["write_receipt"]
+        return item
 
-    def _publish_nightly(self, item):
+    def _publish_nightly(self, item, *, before_write=None):
+        intent_ready = before_write is None
+
+        def prepare():
+            nonlocal intent_ready
+            before_write()
+            intent_ready = True
+
         try:
-            receipt = self.publisher.publish(item["publication_proposal"])
+            kwargs = {"before_write": prepare} if before_write is not None else {}
+            receipt = self.publisher.publish(item["publication_proposal"], **kwargs)
             if (
                 receipt.get("state") != "confirmed"
                 or receipt.get("operation_id")
@@ -535,6 +564,8 @@ class MemoryCycles:
                 )
                 return self._save(item)
         except Exception as exc:
+            if not intent_ready:
+                raise
             with self.state.transaction():
                 item = self.get(item["id"])
                 item.update(

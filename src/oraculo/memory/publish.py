@@ -394,7 +394,9 @@ class Publisher:
             ).encode(),
         )
 
-    def publish(self, proposal: MemoryProposal | dict[str, Any]) -> dict[str, Any]:
+    def publish(
+        self, proposal: MemoryProposal | dict[str, Any], *, before_write=None
+    ) -> dict[str, Any]:
         proposal = MemoryProposal.model_validate(proposal)
         serialized = proposal.model_dump_json()
         if len(serialized.encode()) > 2 * 1024 * 1024:
@@ -408,6 +410,8 @@ class Publisher:
                 stored = json.loads(journal.read_bytes().decode("utf-8"))
                 if stored.get("payload_hash") != digest(serialized):
                     raise ConflictError("operation_id_reused")
+                if before_write is not None:
+                    before_write()
                 return stored["receipt"]
             batch_path = self.state_dir / "batches" / f"{proposal.batch_id}.json"
             if batch_path.exists():
@@ -418,13 +422,16 @@ class Publisher:
                 batch_path, json.dumps({"operation_id": proposal.operation_id}).encode()
             )
             self._check_integrity()
-            return self._publish(proposal, digest(serialized))
+            return self._publish(
+                proposal, digest(serialized), before_write=before_write
+            )
 
     def _publish(
         self,
         proposal: MemoryProposal,
         payload_hash: str,
         raw_sources: dict[str, bytes] | None = None,
+        before_write=None,
     ) -> dict[str, Any]:
         from .context import Context
 
@@ -557,6 +564,8 @@ class Publisher:
             previous
             + f"\n## [{today}] ingest | {proposal.batch_id}\n\nbatch_id: {proposal.batch_id}\noperation_id: {proposal.operation_id}\n"
         ).encode()
+        if before_write is not None:
+            before_write()
         return self._transaction(
             proposal.operation_id,
             updates,
