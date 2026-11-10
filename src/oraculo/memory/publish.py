@@ -3,13 +3,16 @@ from __future__ import annotations
 import base64
 import contextlib
 import fcntl
+import html
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import unquote
 
 from oraculo.config import resources_root
 
@@ -36,6 +39,18 @@ from .schema import (
 # Human-facing vault root. Obsidian and the operator edit these freely.
 # They are scaffolded when missing, and they are never integrity-gated.
 SCAFFOLD_FILES = frozenset({".gitignore", "AGENTS.md", "CLAUDE.md", "index.md"})
+
+
+def _review_reference(target: str) -> bool:
+    return "reviews/" in unquote(html.unescape(target)).replace("\\", "/").lower()
+
+
+def _review_navigation_targets(surface: str) -> list[str]:
+    targets = links(surface) + markdown_targets(surface.replace("![", "["))
+    targets += re.findall(r"(?m)^\s{0,3}\[[^\]\n]+\]:\s*<?([^\s>]+)", surface)
+    for tag in re.findall(r"<[^>]+>", surface):
+        targets += re.findall(r"""(?i)\b(?:href|src)\s*=\s*["']?([^"'\s>]+)""", tag)
+    return targets
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -200,9 +215,7 @@ class Publisher:
         head = self.git.head()
         if not head:
             raise MemoryError("memory_vault_not_initialized")
-        listed = self.git.run(
-            "ls-tree", "-r", "--name-only", head
-        ).stdout.splitlines()
+        listed = self.git.run("ls-tree", "-r", "--name-only", head).stdout.splitlines()
         hashes: dict[str, str] = {}
         for relative in listed:
             if relative in SCAFFOLD_FILES:
@@ -507,17 +520,22 @@ class Publisher:
                 continue
             text = content.decode()
             surface, _claims = _shield_claims(text)
-            for target in links(surface) + markdown_targets(surface):
-                if "reviews/" in target:
+            # Embeds are navigation too, but ordinary image assets remain outside
+            # canonical link resolution. Claim text/quotes stay shielded as data.
+            for target in _review_navigation_targets(surface):
+                if _review_reference(target):
                     raise MemoryError("review_reference_in_canonical")
+            for target in links(surface) + markdown_targets(surface):
                 resolve_link(target, known, path)
             meta, _ = parse_page(text)
             note = meta.get("source_note")
             if isinstance(note, str) and not note.startswith("[["):
-                if "reviews/" in note:
+                if _review_reference(note):
                     raise MemoryError("review_reference_in_canonical")
                 resolve_link(note, known, path)
         for citation in proposal.citations:
+            if _review_reference(citation):
+                raise MemoryError("review_reference_in_canonical")
             resolve_link(citation.removeprefix("[[").removesuffix("]]"), known)
         all_pages = {**pages, **{p: b.decode() for p, b in updates.items()}}
         own_pages = sorted(
