@@ -167,7 +167,7 @@ def test_failure_journal_and_rollback(setup, failure, selected):
     assert rt.current_release(root) == "old"
 
 
-def test_e2_unacquired_service_operation_does_not_correlate(setup):
+def test_e2_unacquired_service_operation_does_not_correlate(setup, monkeypatch):
     """E2: a plain service journal that never acquired maintenance is not a holder."""
     root, bin_dir, conf, controller = setup
     expected = rt.config_hash(conf)
@@ -197,6 +197,17 @@ def test_e2_unacquired_service_operation_does_not_correlate(setup):
     assert result["state"] == "active"
     assert result["operation_id"] == "runtime-held"
     assert rt.current_release(root) == "new"
+    retired = json.loads((root / "service-operation.json").read_text())
+    assert retired["state"] == "complete"
+    assert retired["operation_id"] == "plain-unacquired"
+    assert retired["retired_by_runtime_operation"] == "runtime-held"
+    from oraculo.service_control import start_operation
+
+    monkeypatch.setattr(controller, "start", lambda **kwargs: controller.status())
+    assert (
+        start_operation(controller, retired, root / "service-operation.json")["state"]
+        == "online"
+    )
 
 
 def test_e2_acquired_service_operation_still_requires_correlation(setup):

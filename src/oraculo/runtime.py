@@ -599,6 +599,11 @@ def activate(
     )
     from oraculo.service_control import unacquired
 
+    unacquired_service_operation = (
+        service_operation
+        if service_operation and unacquired(service_operation)
+        else None
+    )
     # A plain service attempt that never acquired maintenance is not a holder.
     # Treating it as the correlated operation blocks activate/rollback after a
     # refused stop and leaves only manual journal deletion as an exit.
@@ -767,6 +772,13 @@ def activate(
         if service_operation:
             service_operation["state"] = "complete"
             write_json(service_path, service_operation)
+        elif unacquired_service_operation:
+            # Retain the refused attempt for audit, but do not leave a pending
+            # service journal with no configuration binding after recovery.
+            unacquired_service_operation.update(
+                state="complete", retired_by_runtime_operation=operation
+            )
+            write_json(service_path, unacquired_service_operation)
     except Exception:
         step("recovery_required")
         raise
