@@ -171,7 +171,16 @@ class KnowledgeRoutines:
             if not path.startswith(corpus(project_id) + "/raw/") or path in consumed:
                 continue
             length = len(content.encode())
-            if length > 2 * 1024 * 1024 or size + length > 2 * 1024 * 1024:
+            if length > 2 * 1024 * 1024:
+                deferred.append(
+                    {
+                        "path": path,
+                        "sha256": digest(content),
+                        "code": "proposal_too_large",
+                    }
+                )
+                continue
+            if size + length > 2 * 1024 * 1024:
                 continue
             from .compiler import nightly_source_fits
 
