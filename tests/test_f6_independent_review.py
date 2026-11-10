@@ -15,9 +15,13 @@ def test_raw_over_selection_byte_limit_is_explicitly_deferred(tmp_path):
     selected, metrics = routines.pending_sources("alpha", 20)
     assert selected == []
     assert metrics["deferred_sources"] == [
-        {"path": raw, "sha256": digest("x" * (2 * 1024 * 1024 + 1)),
-         "code": "proposal_too_large"}
+        {
+            "path": raw,
+            "sha256": digest("x" * (2 * 1024 * 1024 + 1)),
+            "code": "proposal_too_large",
+        }
     ]
-    assert routines.pending_sources("alpha", 20)[1]["deferred_sources"] == metrics["deferred_sources"]
-
-
+    assert (
+        routines.pending_sources("alpha", 20)[1]["deferred_sources"]
+        == metrics["deferred_sources"]
+    )
