@@ -28,6 +28,7 @@ from oraculo.memory.schema import (
 MAX_SOURCES = 20
 MAX_PAGES = 20
 MAX_PROPOSAL_BYTES = 2 * 1024 * 1024
+DEFAULT_NIGHTLY_CONCEPT = "Compilação noturna incremental"
 PLACEHOLDER_DATE = "1970-01-01"
 CLAIM_FIELDS = (
     "id",
@@ -209,6 +210,22 @@ def compile_knowledge(
     )
     encoded = proposal.model_dump_json().encode()
     if len(proposal.changes) > MAX_PAGES or len(encoded) > MAX_PROPOSAL_BYTES:
+        if (
+            concept == DEFAULT_NIGHTLY_CONCEPT
+            and current["meta"].get("reviewed") is not True
+        ):
+            return _nightly_overflow(
+                publisher,
+                project_id,
+                selected,
+                version,
+                apply,
+                {
+                    "code": "proposal_too_large",
+                    "pages": len(proposal.changes),
+                    "bytes": len(encoded),
+                },
+            )
         return _result(
             "rejected",
             operation_id,
@@ -284,6 +301,103 @@ def compile_knowledge(
         page_id=current["page_id"],
         path=current["path"],
     )
+
+
+def nightly_shard_concept(manifest):
+    return (
+        DEFAULT_NIGHTLY_CONCEPT
+        + " / lote "
+        + digest(json.dumps(manifest, separators=(",", ":")))[:40]
+    )
+
+
+def nightly_source_fits(project_id, path, text):
+    """Pure admission check for a complete raw on an empty nightly shard."""
+    sha = digest(text)
+    source = {"path": path, "sha256": sha, "text": text, "raw": text.encode()}
+    manifest = [(path, sha)]
+    concept = nightly_shard_concept(manifest)
+    page_id = concept_page_id(project_id, concept)
+    claims, findings = _extract_all(project_id, concept, [source], [])
+    claims, contests = _mark_contests(claims)
+    proposal = _proposal(
+        None,
+        project_id=project_id,
+        concept=concept,
+        title=concept,
+        version="1",
+        operation_id=_operation_id(project_id, concept, "1", manifest),
+        page_id=page_id,
+        path=concept_page_path(project_id, page_id),
+        base=None,
+        claims=claims,
+        union=manifest,
+        prior={},
+        preserved="",
+        findings=findings + contests,
+    )
+    return len(proposal.model_dump_json().encode()) <= MAX_PROPOSAL_BYTES
+
+
+def _nightly_overflow(publisher, project_id, selected, version, apply, overflow):
+    """Roll over a full nightly page; never trim raw or rewrite its old claims.
+
+    A shard identity is derived from its complete immutable source manifest.
+    Shrinking a batch only defers whole sources. An individually oversized
+    source cannot prevent another selected source from progressing.
+    """
+    ordered = sorted(selected, key=lambda item: item["path"])
+    for start in range(len(ordered)):
+        count = len(ordered) - start
+        while count:
+            batch = ordered[start : start + count]
+            manifest = [(item["path"], item["sha256"]) for item in batch]
+            shard = nightly_shard_concept(manifest)
+            paths = [item["path"] for item in batch]
+            preview = compile_knowledge(
+                publisher,
+                project_id,
+                paths,
+                concept=shard,
+                version=version,
+                apply=False,
+            )
+            if preview["state"] != "rejected" or not any(
+                item.get("code") == "proposal_too_large" for item in preview["findings"]
+            ):
+                if apply and preview["state"] == "proposed":
+                    preview = compile_knowledge(
+                        publisher,
+                        project_id,
+                        paths,
+                        concept=shard,
+                        version=version,
+                        apply=True,
+                    )
+                preview["target_concept"] = shard
+                preview["compiled_sources"] = paths
+                preview["deferred_sources"] = [
+                    {
+                        "path": item["path"],
+                        "sha256": item["sha256"],
+                        "code": "proposal_too_large",
+                    }
+                    for item in ordered
+                    if item["path"] not in paths
+                ]
+                preview["findings"] = [
+                    overflow,
+                    {"code": "nightly_page_rollover"},
+                ] + preview["findings"]
+                return preview
+            count //= 2
+    result = _result("deferred", None, version, findings=[overflow])
+    result["compiled_sources"] = []
+    result["deferred_sources"] = [
+        {"path": item["path"], "sha256": item["sha256"], "code": "proposal_too_large"}
+        for item in ordered
+    ]
+    return result
 
 
 def render_knowledge_page(
@@ -1165,7 +1279,9 @@ def _mark_contests(
         superseded = []
         for claim in group:
             assessment = claim.get("assessment")
-            verdict = assessment.get("verdict") if isinstance(assessment, dict) else None
+            verdict = (
+                assessment.get("verdict") if isinstance(assessment, dict) else None
+            )
             if isinstance(assessment, dict) and verdict != "contested":
                 superseded.append(claim.get("id"))
                 claim["assessment"] = None

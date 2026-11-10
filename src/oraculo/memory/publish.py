@@ -508,13 +508,15 @@ class Publisher:
             text = content.decode()
             surface, _claims = _shield_claims(text)
             for target in links(surface) + markdown_targets(surface):
+                if "reviews/" in target:
+                    raise MemoryError("review_reference_in_canonical")
                 resolve_link(target, known, path)
             meta, _ = parse_page(text)
             note = meta.get("source_note")
             if isinstance(note, str) and not note.startswith("[["):
+                if "reviews/" in note:
+                    raise MemoryError("review_reference_in_canonical")
                 resolve_link(note, known, path)
-            if "reviews/" in content.decode():
-                raise MemoryError("review_reference_in_canonical")
         for citation in proposal.citations:
             resolve_link(citation.removeprefix("[[").removesuffix("]]"), known)
         all_pages = {**pages, **{p: b.decode() for p, b in updates.items()}}

@@ -156,10 +156,39 @@ congelado das fontes e o hash canônico do preview. `proposal_base_commit` nulo
 continua recusando página ou fonte divergente. Esse nulo não se substitui pelo
 commit do registry. Status `ready` autoriza o executor a repetir
 `brain compile` sem `--apply`, conferir os metadados e só então usar
-`memory propose` no grant. `blocked`, `review_required` e `noop` não publicam.
-Alias em conflito, página revisada, fonte inválida, limite e metadado
-preparado pelo chamador fecham em recusa. Conceitos antigos que não são o alvo
+`memory propose` no grant. `blocked`, `review_required`, `deferred` e `noop` não publicam.
+Alias em conflito, página revisada, fonte inválida e metadado
+preparado pelo chamador fecham em recusa. Conceitos explícitos continuam
+recusando propostas acima do limite. Conceitos antigos que não são o alvo
 não precisam estar no bundle. A construção do contexto não escreve o vault.
+
+A página do conceito padrão não cresce sem limite: quando a proposta ultrapassa
+2 MiB, o compilador preserva integralmente a página anterior e prepara um lote
+novo, com nome/ID derivados do manifesto ordenado de fontes e hashes. Tenta o
+lote completo e reduz por metades, sempre por fontes inteiras; uma fonte que
+não cabe sozinha não impede a tentativa das seguintes. `target_concept` é o
+conceito do lote, enquanto `concept`/`lookup.payload` conservam a rota original.
+`compiled_sources` declara o subconjunto proposto; `deferred_sources` declara
+caminhos, hashes e motivo dos adiamentos. O manifesto congelado continua
+vinculando toda a seleção. Nenhum adiamento é marcado como incorporado.
+A seleção noturna verifica se cada raw cabe integralmente em um lote vazio:
+fontes individualmente grandes ficam em `selection.deferred_sources`, sem
+ocupar as 20 vagas nem impedir fontes posteriores. Se só há adiamentos, a
+rotina retorna `deferred_sources` sem criar um ingest condenado ao mesmo limite.
+Essas fontes exigem revisão explícita; o produto não as trunca nem altera raw.
+Um compile explícito só com essas fontes retorna `deferred`, nunca `noop`.
+`not_promoted` conta campos de relatório preservados como dados (por exemplo,
+checks), não páginas recusadas; não é erro impeditivo. Em rejeição por tamanho,
+o código do recibo é `proposal_too_large`, mesmo com achados informativos antes.
+
+Publicação noturna via `memory.propose` registra intenção durável em ciclo
+próprio, ligado à tentativa, job, objetivo e thread/run. O ciclo só fica `saved`
+com recibo `confirmed` e commit do publicador. A proposta persistida permite
+reconciliar perda da resposta pelo journal sem gerar outro raw ou outra página
+source, evitando realimentar a fila noturna. Isso registra a publicação mecânica,
+não aceite do corpus ou certificação semântica. Não retropreenche ciclos antigos.
+Menções literais a `reviews/` em claims e suas evidências são dados; referências
+canônicas de navegação a reviews continuam recusadas pelo publicador.
 
 Cobertura de contexto, transporte concluído ou `no_changes` sobre zero
 documentos não são aceite de corpus. As execuções anteriores que abstiveram ou

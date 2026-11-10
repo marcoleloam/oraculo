@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
+from .compiler import DEFAULT_NIGHTLY_CONCEPT
 from .context import Context
 from .publish import Publisher
 from .retrieval import estimate_tokens, retrieve
@@ -523,7 +524,6 @@ def _policy(own: str, *, read_only: bool) -> dict[str, Any]:
 
 
 PREPARED_COMPILATION_SCHEMA = "f6-prepared-compilation-v1"
-DEFAULT_NIGHTLY_CONCEPT = "Compilação noturna incremental"
 _CALLER_PREPARED_KEYS = frozenset(
     {
         "prepared_compilation",
@@ -727,6 +727,10 @@ def _bind_preview(
         receipt["page_id"] = preview["page_id"]
     if isinstance(preview.get("path"), str):
         receipt["target_path"] = preview["path"]
+    receipt["target_concept"] = preview.get("target_concept", receipt["concept"])
+    receipt["deferred_sources"] = preview.get("deferred_sources", [])
+    compiled = preview.get("compiled_sources", ordered)
+    receipt["compiled_sources"] = compiled
     counts: dict[str, int] = {}
     for finding in preview.get("findings") or []:
         if isinstance(finding, dict) and isinstance(finding.get("code"), str):
@@ -741,6 +745,11 @@ def _bind_preview(
     if obj is None and isinstance(suggestion, dict):
         obj = suggestion
         kind = "suggestion"
+    if state == "deferred":
+        receipt["status"] = "deferred"
+        receipt["code"] = "proposal_too_large"
+        _lookup(receipt, ordered, obj, kind)
+        return None
     if state == "noop":
         receipt["status"] = "noop"
         receipt["code"] = "sources_already_incorporated"
@@ -758,7 +767,14 @@ def _bind_preview(
         return None
     if state != "proposed" or obj is None or kind != "proposal":
         receipt["status"] = "blocked"
-        receipt["code"] = next(iter(counts), None) or "compiler_" + str(state)
+        receipt["code"] = (
+            "proposal_too_large"
+            if "proposal_too_large" in counts
+            else next(
+                (code for code in reversed(counts) if code != "not_promoted"),
+                "compiler_" + str(state),
+            )
+        )
         _hash_preview(receipt, obj, kind)
         _lookup(receipt, ordered, obj, kind)
         return None
@@ -856,8 +872,11 @@ def _bind_sources(
     from oraculo.protocol import content_hash
 
     frozen = []
+    deferred_hashes = {
+        item["path"]: item["sha256"] for item in receipt.get("deferred_sources", [])
+    }
     for path in ordered:
-        expected = source_hashes.get(path)
+        expected = source_hashes.get(path, deferred_hashes.get(path))
         if not isinstance(expected, str) or not _hash_matches(
             publisher, path, expected
         ):
@@ -1115,6 +1134,7 @@ def _seal_receipt(receipt: dict[str, Any], payload: dict[str, Any]) -> dict[str,
         "noop": "report_no_changes",
         "review_required": "report_review_required",
         "blocked": "report_blocked",
+        "deferred": "report_deferred_sources",
     }.get(receipt["status"], "report_blocked")
     return receipt
 

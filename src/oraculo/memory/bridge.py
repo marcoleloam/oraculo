@@ -17,6 +17,7 @@ def public_cycle(cycle: dict) -> dict:
             "context",
             "report",
             "proposal",
+            "publication_proposal",
             "query",
             "evidence",
             "initial_identity",
@@ -34,7 +35,8 @@ def memory_display(cycle: dict) -> dict:
     saved = (
         cycle.get("write_state") == "saved"
         and write.get("state") == "confirmed"
-        and write.get("operation_id") == cycle["id"]
+        and write.get("operation_id")
+        == cycle.get("publication_operation_id", cycle["id"])
         and bool(write.get("commit"))
     )
     return {

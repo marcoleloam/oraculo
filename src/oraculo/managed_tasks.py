@@ -2193,7 +2193,8 @@ class ManagedTasks:
         return (
             cycle.get("write_state") == "saved"
             and receipt.get("state") == "confirmed"
-            and receipt.get("operation_id") == cycle["id"]
+            and receipt.get("operation_id")
+            == cycle.get("publication_operation_id", cycle["id"])
             and bool(receipt.get("commit"))
         )
 

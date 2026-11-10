@@ -1119,6 +1119,19 @@ class Service:
                 return receipt
             if proposal["project_id"] != envelope.project_id:
                 raise StateError("proposal_project_mismatch")
+            if job_payload.get("knowledge_routine") == "nightly":
+                return await self.memory_io(
+                    "publish_nightly",
+                    envelope.project_id,
+                    {
+                        "attempt_id": attempt["id"],
+                        "job_id": job["id"],
+                        "objective_id": job["objective_id"],
+                        "thread_id": attempt["thread_id"],
+                        "run_id": attempt["run_id"],
+                    },
+                    proposal,
+                )
             return await asyncio.to_thread(self.publisher.publish, proposal)
 
     async def memory_io(self, method: str, *args, **kwargs):
