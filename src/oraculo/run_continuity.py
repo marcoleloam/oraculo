@@ -126,6 +126,21 @@ def report_link(task, snapshot, report, *, actor=None):
         and e["proof"].get("report_sha256") == submitted_digest
     ]
     event = events[0] if events else None
+    # A child may resubmit the same immutable report during a later run. Use
+    # the newest submission explicitly bound to that execution, never borrow
+    # the timestamp of an unrelated run or rewrite the original child binding.
+    if executed is not None:
+        bound = [
+            e
+            for e in events
+            if (e["proof"].get("submission") or {}).get("thread_id")
+            == task["child"]["childThreadId"]
+            and (e["proof"].get("submission") or {}).get("run_id") == executed["runId"]
+            and type(e.get("at")) in (float, int)
+            and math.isfinite(e["at"])
+        ]
+        if bound:
+            event = max(bound, key=lambda e: e["at"])
     if executed is not None and executed["runId"] != original:
         if task["transport_mode"] != "native_child":
             raise StateError("continuation_requires_native_child")
