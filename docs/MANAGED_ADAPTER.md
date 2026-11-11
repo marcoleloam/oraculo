@@ -190,10 +190,14 @@ host list has no parent filter, so there are two proofs:
 Both proofs are project-scoped and not atomic. The status filter additionally
 trusts the host's status index and timestamps: it names no successful
 descendant, and it cannot notice a thread whose row says `completed` or `idle`
-while it holds a run. A repeated row across pages means the list shifted and
-fails closed. For a native child the host's own `task_status` (`workState`,
+while it holds a run. A repeated row across pages, or a `total` that changes
+between pages or differs from the rows read, means the list shifted: the gate
+then reads the whole catalog instead of deciding from the filtered list. For a
+native child closed by its origin the host's own `task_status` (`workState`,
 `hasPendingChildRuns`, `hasPendingQuestion`, latest terminal run) is checked in
-every gate as well.
+every gate as well. The daemon closure of a native child cannot read
+`task_status`, so it never uses the status filter: it reads the catalog and
+every descendant, like a top-level child.
 
 After the memory write, the same proof is read again before the reservation
 is released: the child, the descendant proof (catalog or filtered list, as

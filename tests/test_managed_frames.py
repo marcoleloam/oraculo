@@ -262,7 +262,28 @@ async def test_shifted_page_fails_closed(counted):
         return result
 
     client.call = shifting
-    with pytest.raises(ContractError, match="Duplicate settlement thread identity"):
+    with pytest.raises(ContractError, match="Settlement filtered list shifted"):
+        await client.unclear_descendants("origin", "alpha", None, None)
+
+
+async def test_changed_total_between_pages_is_a_shift(counted):
+    """A row that leaves the filtered list moves later rows up: one is never
+    read. The host's total gives it away."""
+    from oraculo.t3.client import SettlementListShifted, T3Client
+
+    for number in range(8):
+        descendant(counted.host, "origin", "running", name=f"busy-{number}")
+    client = T3Client("http://127.0.0.1/mcp")
+    original = counted.host.call
+
+    async def shrinking(name, args):
+        result = await original(name, args)
+        if name == "t3_thread_list":
+            result["total"] = 7 if args.get("cursor") else 8
+        return result
+
+    client.call = shrinking
+    with pytest.raises(SettlementListShifted):
         await client.unclear_descendants("origin", "alpha", None, None)
 
 

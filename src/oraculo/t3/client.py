@@ -54,6 +54,10 @@ _ANCESTOR_READS = 100
 _CHAIN_DEPTH = 64
 
 
+class SettlementListShifted(ContractError):
+    """The filtered list changed between pages; a row may have been skipped."""
+
+
 def _instant(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -431,6 +435,7 @@ class T3Client:
         cursor = None
         seen_cursors: set[int] = set()
         ordered, previous, closed, pages = floor is not None, None, False, 0
+        total, listed = None, 0
         for _ in range(_UNCLEAR_PAGES):
             payload = await self.call(
                 "t3_thread_list",
@@ -449,11 +454,18 @@ class T3Client:
                 raise ContractError("Invalid T3 settlement thread list") from exc
             if page.projectId != project_id:
                 raise ContractError("Settlement list project mismatch")
+            # The cursor is an offset into a list that live threads reorder
+            # and leave. A changed total, or a row seen twice, means a row may
+            # have been skipped between pages: the caller reads the catalog.
+            count = payload.get("total")
+            if type(count) is int:
+                if total is not None and count != total:
+                    raise SettlementListShifted("Settlement filtered list shifted")
+                total = count
+            listed += len(page.threads)
             for row, raw in zip(page.threads, payload["threads"], strict=True):
-                # A row seen twice means the list shifted between pages and
-                # another row may have been skipped. Fail closed.
                 if row.threadId in seen_ids:
-                    raise ContractError("Duplicate settlement thread identity")
+                    raise SettlementListShifted("Settlement filtered list shifted")
                 seen_ids.add(row.threadId)
                 updated = _instant(raw.get("updatedAt"))
                 if updated is None or (previous is not None and updated > previous):
@@ -474,7 +486,11 @@ class T3Client:
                     kind = "live"
                 rows[row.threadId], kinds[row.threadId] = row, kind
             cursor = page.nextCursor
-            if cursor is None or (closed and ordered):
+            if cursor is None:
+                if total is not None and listed != total:
+                    raise SettlementListShifted("Settlement filtered list shifted")
+                break
+            if closed and ordered:
                 break
             if cursor in seen_cursors:
                 raise ContractError("Repeated settlement thread list cursor")
@@ -544,13 +560,20 @@ class T3Client:
             target = root or await self.settlement_target(thread_id)
             if target["thread"]["threadId"] != thread_id:
                 raise ContractError("Settlement read identity mismatch")
-            found = await self.unclear_descendants(
-                thread_id,
-                target["thread"]["projectId"],
-                target["thread"]["parentThreadId"],
-                target["thread"].get("createdAt"),
-            )
-            if not (found["target_live"] or found["live"] or found["unsuccessful"]):
+            try:
+                found = await self.unclear_descendants(
+                    thread_id,
+                    target["thread"]["projectId"],
+                    target["thread"]["parentThreadId"],
+                    target["thread"].get("createdAt"),
+                )
+            except SettlementListShifted:
+                # Busy project: the small pages moved under the read. The
+                # catalog below is the proof; nothing is decided from here.
+                found = None
+            if found is not None and not (
+                found["target_live"] or found["live"] or found["unsuccessful"]
+            ):
                 return {
                     "thread": target["thread"],
                     "recentRuns": target["recentRuns"],

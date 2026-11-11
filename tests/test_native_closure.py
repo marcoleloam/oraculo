@@ -513,3 +513,80 @@ def test_cli_accepts_the_batch_flags():
     )
     assert args.all_submitted and args.project == "alpha" and args.file is None
     assert isinstance(ScopeBusy("op"), StateError)
+
+
+_LIST_ROW = (
+    "threadId",
+    "projectId",
+    "title",
+    "status",
+    "latestRunId",
+    "parentThreadId",
+    "itemCount",
+    "createdAt",
+    "updatedAt",
+    "settled",
+)
+
+
+class StatusOnlyList:
+    """List rows as the real host gives them: the status filter is honoured
+    and a row carries no activeRunId or pendingRequestCount."""
+
+    def __init__(self, inner):
+        self.inner, self.calls, self.lists = inner, [], []
+
+    async def call(self, name, arguments):
+        self.calls.append(name)
+        result = await self.inner.call(name, arguments)
+        if name == "t3_thread_list":
+            self.lists.append(dict(arguments))
+            wanted = arguments.get("statuses")
+            result["threads"] = [
+                {k: r[k] for k in _LIST_ROW if k in r}
+                for r in result["threads"]
+                if not wanted or r["status"] in wanted
+            ]
+        return result
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        dict(status="completed"),
+        dict(status="completed", activeRunId=None, pendingRequestCount=1),
+        dict(status="idle", activeRunId=None),
+    ],
+)
+async def test_daemon_closure_reads_the_catalog_not_the_status_filter(world, row):
+    """Without task_status the daemon must read every descendant itself: a
+    descendant whose row looks ended while it still holds work blocks closure."""
+    service, host, _ = world
+    daemon = StatusOnlyList(DaemonClient(host))
+    task_id, child = await submitted(service, host, "catalog", pending=True)
+    host.threads["reviewer-" + child].update(row)
+    await tick(service, daemon)
+    task = stored(service, task_id)
+    assert task["work_status"] != "succeeded"
+    assert held(service, task_id)
+    assert daemon.lists and not any("statuses" in a for a in daemon.lists)
+
+
+async def test_daemon_attempt_that_binds_the_checkout_keeps_the_submission(world):
+    """A failed attempt that first had to bind the child checkout leaves the
+    task selectable: the next attempt and the batch resume still find it."""
+    service, host, daemon = world
+    task_id, child = await submitted(service, host, "unbound-ws", complete=False)
+    store = service.managed_service.store
+    store.update(
+        task_id,
+        store.get(task_id)["phase"],
+        {"test": "checkout not bound at start"},
+        child_workspace=None,
+    )
+    await tick(service, daemon)
+    assert stored(service, task_id)["phase"] == "validation_submitted"
+    host.complete(child)
+    store.state.set_meta(native_closure.META_PREFIX + task_id, None)
+    await tick(service, daemon)
+    assert stored(service, task_id)["work_status"] == "succeeded"

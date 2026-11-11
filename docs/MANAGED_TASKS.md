@@ -948,7 +948,9 @@ reserva. Duas diferenças:
 
 - a leitura `task_status` é a única prova omitida. `completion_evidence.closure`
   grava `mode = daemon_reconciled_without_native_task_status`, e a auditoria
-  `managed.release` grava o mesmo modo;
+  `managed.release` grava o mesmo modo. Sem ela, a prova de descendentes é
+  sempre o catálogo completo do projeto, com a leitura de cada descendente; a
+  listagem filtrada por status fica restrita ao caminho da origem;
 - o relatório precisa ter sido submetido pelo próprio filho, no run que executou
   por último. Relatório escrito pela origem ou submissão legada sem vínculo é
   recusado (`daemon_closure_submission_unbound`).

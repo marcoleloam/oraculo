@@ -1486,7 +1486,12 @@ class ManagedTasks:
         git(path, "merge-base", "--is-ancestor", task["base_sha"], "HEAD")
         self.store.update(
             task["id"],
-            self._phase(task["id"], "workspace_ready"),
+            # The daemon binds the checkout of a child that already submitted;
+            # the submission stays the task's phase, so a later attempt and
+            # the batch resume still select it.
+            task["phase"]
+            if self.native_status_unavailable
+            else self._phase(task["id"], "workspace_ready"),
             {
                 "title": task["request"].get("title", "Project task"),
                 "project_id": task["project"]["project_id"],
@@ -1998,6 +2003,11 @@ class ManagedTasks:
         proof, so it keeps the catalog too.
         """
         if task.get("transport_mode") != "native_child":
+            return True
+        if self.native_status_unavailable:
+            # Daemon closure has no ``task_status`` either: it reads every
+            # descendant, as a top-level child does. Its client is the
+            # daemon's own, so the catalog costs no relayed frame.
             return True
         if any(
             task.get(key)
