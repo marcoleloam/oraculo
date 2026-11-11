@@ -108,6 +108,7 @@ BLOCKERS = {
     "invalid_base_ref": "A base informada não identifica um commit existente neste repositório.",
     "validated_commit_or_clean_workspace_required": "O commit e o ambiente precisam ser revalidados antes de concluir.",
     "managed_adapter_busy_retry_same_key": "O serviço está atendendo outra operação; a origem deve retomar a mesma intenção.",
+    "managed_scope_busy": "Esta tarefa ou intenção já tem uma operação em andamento; retome a mesma chave.",
 }
 
 

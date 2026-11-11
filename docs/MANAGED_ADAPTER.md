@@ -1,18 +1,33 @@
 # Managed adapter occupancy and interrupted clients
 
-`managed_adapter_busy_retry_same_key` means another local managed operation owns
-the single writer. It does not identify a stuck flag, a capacity shortage, a
-particular project, or a continuously blocked interval. Both caller-bound
-commands and background reconciliation use this exclusion.
+Operations on different tasks run at the same time. The daemon serializes only
+one scope: `task_id` for an action that names an existing task, and
+`(origin thread, key)` for `start` after the caller-bound identity read.
+A second caller of that same scope receives `managed_scope_busy` at once, with
+the in-progress `operation_id` and `scope`, and `retryable=true`. It does not
+wait inside the daemon and it is not the generic busy error.
 
-Caller-bound mutations now enter a FIFO queue while another operation owns the
-writer. Up to 32 callers can wait, for at most 60 seconds each. `queued_callers`
-in the adapter diagnostic reports the current waiting count. Background
-reconciliation yields to waiting callers. Timeout or a full queue preserves the
-same `managed_adapter_busy_retry_same_key` error and creates no new task or host
-effect; retry the original intent. Disconnecting or cancelling a waiter never
-clears the active writer. Independent executors continue running concurrently;
-only their ledger mutations are serialized.
+`managed_adapter_busy_retry_same_key` remains only for a real resource limit:
+more than 32 admitted caller operations, or the offline ledger lock while the
+daemon is alive. It does not identify a stuck flag, a capacity shortage, or a
+particular project. The CLI retries a retryable task error a few times with the
+same key and prints the final error as a JSON receipt on stdout.
+
+The scope stays occupied for the whole operation, including while that
+operation waits for a host ACK, memory, git, or publication. Other scopes keep
+running, including that local work. SQLite writes use one `BEGIN IMMEDIATE`
+transaction on a connection opened for that operation (WAL, `busy_timeout`
+30s) and do not stay open across those waits. A rollback cannot discard
+another operation's writes. The daemon loop does not run the operation:
+managed work uses a dedicated pool, so memory and read requests keep being
+accepted. Background reconciliation takes the same per-task scope, skips a
+task whose scope is busy, and does not block callers of other tasks.
+Cancelling one caller releases only that caller's scope.
+
+The daemon holds `managed-tasks.lock` for its lifetime. Offline cancel and
+legacy recovery still use a non-blocking flock against that lock. The daemon
+does not flock once per command. `queued_callers` stays 0; there is no
+cross-task waiter queue. `operations` lists every in-flight operation.
 
 ## Inspect before recovery
 
@@ -21,11 +36,13 @@ Run `oraculo --config CONFIG status` and retain the full JSON receipt and time.
 `task status` and `task list` also include `adapter` in their service response.
 Older daemons omit these fields; installing only a new CLI cannot add them.
 
-- `state=active`, `mode=caller`: an actual connection handler owns the operation.
+- `state=active`, `mode=caller`: an actual connection handler owns that operation.
   `operation_id` identifies this socket request; `task_id`, when supplied by the
-  action, identifies the durable task. These are different identities.
-- `mode=background`: the executor future owns the operation until its actual
-  thread exits. Cancelling its asyncio waiter does not release ownership.
+  action, identifies the durable task. `scope` is `task` or `intent`. These are
+  different identities. `operations` lists every operation, not only the oldest
+  one copied to the top level.
+- `mode=background`: that task's reconciliation holds its scope until the
+  worker finishes the task. Cancelling the asyncio waiter does not release it.
 - `phase=host_ack` or `host_call`: `tool`, `host_request_id` (caller only),
   `timeout_seconds` and `phase_age_seconds` describe the current wait. No tool
   arguments, prompts, titles or memory contents appear in this diagnostic.
@@ -40,17 +57,20 @@ Older daemons omit these fields; installing only a new CLI cannot add them.
 - `state=idle`: the adapter is available. This does not release reservations or
   prove that uncertain external work never ran.
 
-The busy socket error remains compatible and includes `error.adapter` and
-`retryable=true`. The CLI's error text stays stable; use the read-only status
-command for details. These diagnostics are ephemeral observations, not durable
-host proofs or authorization to release admission.
+The resource-limit error remains `managed_adapter_busy_retry_same_key` with
+`error.adapter` and `retryable=true`. Same-scope contention is
+`managed_scope_busy` and carries `operation_id`. `service.jsonl` records
+`managed_operation_started`, `managed_operation_finished` (with `wait_seconds`
+and `duration_seconds`) and `managed_operation_rejected`. These diagnostics are
+ephemeral observations, not durable host proofs or authorization to release
+admission. No ledger schema migration is required.
 
 ## Interrupted transport behavior
 
 The default manual bridge waits 600 seconds for each ACK. The daemon allows
 900 seconds including frame backpressure; the caller allows 1200 seconds for
 the next service frame. An alive slow manual responder keeps ownership. Ordinary
-socket memory requests retain their existing five-second bound. Background host
+socket memory requests wait up to 125 seconds (`memory.cycle.*`). Background host
 calls have a separate 60-second bound, with no manual bridge involved; a timeout
 stops further host traffic for that batch and leaves durable returns pending.
 
@@ -62,10 +82,35 @@ lifecycle rules. Closing a client or killing its owned bridge process does not
 cancel remote work or establish absence of effects. There is no automatic task
 relaunch in this transport layer.
 
-Cancellation of a background waiter retains ownership until its real worker
-exits. Shutdown also waits for that worker before closing the store. Host calls
-are bounded, but synchronous Git/filesystem code still must finish or reach its
-own timeout; the adapter deliberately does not clear a live worker's ownership.
+`memory.cycle.*` uses a 125 second socket budget, the same class as rollout and
+report verification, not the 5 second budget of ordinary envelopes. If that
+budget expires, the task command fails with `memory_cycle_timeout` and
+`retryable=true`. The CLI retries the same key. The task is not stored as
+`blocked`; a reservation already taken stays so the retry can continue.
+
+## Host proofs inside one operation
+
+`start` and `resume` reuse a host result when the same operation asks for the
+same proof again. `t3_project_list` and `t3_thread_read` with the same
+arguments are one frame, not two. The cache lives only for that operation.
+
+These gates always read the host again, because they need a fresh observation:
+
+- Project binding (`_scope`, `managed_project_binding_changed`): `t3_project_list`.
+- Native retry of the parent (`native_retry_parent_binding_changed`): that thread's `t3_thread_read`.
+- Live child observation (`_observe`) and report prevalidation (commit matches HEAD): the child thread.
+- Uncertain launch reconciliation: the matched child thread, after the catalog read.
+
+These calls are never served from the cache: `orchestrator_capabilities` when
+revalidating a route, terminal settlement snapshots, thread catalogs, cancel's
+candidate catalog, `task_status`, and effect calls (`delegate_task`,
+`t3_thread_launch`, pull-request link and unwatch, `t3_thread_send`).
+
+Cancellation of a background waiter retains that task's scope until its real
+worker exits. Shutdown also waits for that worker before closing the store. Host
+calls are bounded, but synchronous Git/filesystem code still must finish or
+reach its own timeout; the adapter deliberately does not clear a live worker's
+scope, and doing so would not release any other task.
 
 ## Supported continuation
 

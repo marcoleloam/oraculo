@@ -691,8 +691,25 @@ TTY. Tanto frames de host quanto JSON final usam escrita exata. Limites: saída
 stdio 16 MiB, ACK stdio 4 MiB, envelope/socket 1 MiB. Fragmentos não são chamadas.
 A ponte stdio espera cada ACK por até 600 s (`ORACULO_BRIDGE_ACK_TIMEOUT`
 em segundos altera o limite); o relay do daemon espera 900 s por ACK e o adapter
-1200 s pelo próximo frame. Enquanto um frame está aberto, o daemon serializa as
-demais operações geridas; responda sem pausas mesmo assim.
+1200 s pelo próximo frame. Operações de tarefas ou intenções diferentes seguem
+em paralelo. Só o mesmo escopo é serializado: `task_id` numa tarefa existente e
+`(thread de origem, key)` no `start`. Um segundo chamador do mesmo escopo recebe
+`managed_scope_busy` com o `operation_id` em curso. A trava global
+`managed_adapter_busy_retry_same_key` fica para esgotamento real (mais de 32
+operações chamadoras, ou o lock offline enquanto o daemon vive). A CLI repete
+sozinha, poucas vezes, a mesma key quando a resposta é `retryable`, e o erro
+final sai em stdout como JSON. `memory.cycle.*` espera até 125 s. Se estourar,
+o erro é `memory_cycle_timeout`, também `retryable`, e a tarefa não fica
+`blocked`: a reserva já feita permanece para a mesma key. O loop do daemon
+continua aceitando memória e leituras enquanto a operação gerida corre num
+pool próprio. No mesmo `start` ou `resume`, `t3_project_list` e
+`t3_thread_read` com os mesmos argumentos viram um quadro só. A releitura
+fica nos gates de frescor: binding do projeto, binding do pai numa retentativa
+nativa, observação do filho, pré-validação do commit e reconciliação de
+lançamento. Revalidação de rota, settlement, catálogo, `task_status` e efeitos
+(delegate, launch, link de PR) não reaproveitam quadro. Responda aos ACKs sem
+pausas mesmo assim.
+
 Falha após emissão deixa resultado incerto: retome a mesma tarefa/chave/intenção;
 não lance outro filho porque a impressão final falhou. Até migrar uma instalação
 antiga, stdout em arquivo privado e stdin em PTY continua um workaround observado.
