@@ -191,6 +191,10 @@ def workspace(path: str | Path) -> dict:
 
 
 class ManagedTasks:
+    # True only while the daemon closes a native child: it has no parent
+    # identity, so the parent-scoped task_status read is not available.
+    native_status_unavailable = False
+
     def __init__(
         self,
         config,
@@ -291,6 +295,10 @@ class ManagedTasks:
             except BlockingIOError:
                 raise StateError("managed_adapter_busy_retry_same_key") from None
             actor, caps = await self._identity()
+            if action == "resume-submitted":
+                from oraculo.native_closure import resume_submitted
+
+                return await resume_submitted(self, payload, actor, caps)
             if self.scopes is not None:
                 from oraculo.managed_service import operation_scope
 
@@ -731,14 +739,14 @@ class ManagedTasks:
             raise LaunchPreflightError("native_child_base_not_head", observed)
         return dict(plan, native=True)
 
-    async def _scope(self, task: dict):
+    async def _scope(self, task: dict, *, fresh: bool = True):
         project = task["project"]
         if not self.config.project_in_scope(project["project_path"]):
             raise StateError("managed_project_scope_revoked")
         current = resolve_project(
             self.config,
             cwd=project["project_path"],
-            projects=await self._projects(fresh=True),
+            projects=await self._projects(fresh=fresh),
             explicit=project["project_id"],
         )
         if any(
@@ -1253,6 +1261,11 @@ class ManagedTasks:
             child_workspace=ws,
         )
         if task["transport_mode"] == "native_child":
+            if self.native_status_unavailable:
+                # Only the parent can bind an original run that was never read.
+                if not child.get("childRunId"):
+                    raise StateError("native_original_run_unbound")
+                return dict(status=None, workState="unknown", hasPendingChildRuns=None)
             observed = await self.host.call("task_status", {"taskId": child["taskId"]})
             if (
                 observed.get("taskId") != child["taskId"]
@@ -1781,6 +1794,14 @@ class ManagedTasks:
             task, snapshot, workspace_required=workspace_required
         )
         if task["transport_mode"] == "native_child":
+            if self.native_status_unavailable:
+                # Daemon closure: every snapshot proof above was required; only
+                # the parent-scoped read is skipped, and the receipt says so.
+                if observations is not None:
+                    from oraculo.native_closure import CLOSURE_RECEIPT
+
+                    observations["closure"] = dict(CLOSURE_RECEIPT)
+                return snapshot
             observed = await self.host.call(
                 "task_status", {"taskId": task["child"]["taskId"]}
             )
@@ -2021,6 +2042,11 @@ class ManagedTasks:
         )
         observed = self._terminal_observation(snapshot, observations)
         evidence = report_link(task, snapshot, report, actor=actor)
+        closure = observations.get("closure")
+        if closure:
+            from oraculo.native_closure import require_bound_submission
+
+            require_bound_submission(task, evidence, snapshot)
         if observed.get("status") not in {
             "completed",
             "failed",
@@ -2048,6 +2074,12 @@ class ManagedTasks:
             ws = self._report_workspace(task, snapshot["thread"])
             if ws["dirty"] or report.get("commit") != ws["head"]:
                 raise StateError("validated_commit_or_clean_workspace_required")
+        if closure or "closure" in evidence:
+            # The receipt names the path that certifies now, not an earlier
+            # attempt that stopped before memory was confirmed.
+            evidence = {k: v for k, v in evidence.items() if k != "closure"}
+            if closure:
+                evidence["closure"] = closure
         status = (
             "succeeded"
             if succeeded
@@ -2151,6 +2183,11 @@ class ManagedTasks:
             status=snapshot["thread"]["status"],
             workState="result_available",
             hasPendingChildRuns=False,
+            **(
+                {"closure": observations["closure"]["mode"]}
+                if observations.get("closure")
+                else {}
+            ),
         )
 
     @staticmethod
@@ -2191,12 +2228,18 @@ class ManagedTasks:
     def background_work(self, task: dict) -> str | None:
         """What daemon reconciliation may still do; None means nothing.
 
-        Native children are parent-driven; PR checks, watches and merge are
-        event-driven. Certified results only release a leftover reservation or
-        perform a requested publication still pending.
+        Native launch, observation and publication are parent-driven; a native
+        child with a submitted report may be closed here (native_closure). PR
+        checks, watches and merge are event-driven. Certified results only
+        release a leftover reservation or perform a requested publication
+        still pending.
         """
         if task.get("work_status") == "cancelled" or task.get("supersession"):
             return None
+        if task.get("transport_mode") == "native_child":
+            from oraculo.native_closure import daemon_work
+
+            return daemon_work(self, task)
         if task.get("transport_mode") != "managed_thread":
             return None
         if not task.get("child"):
@@ -2484,8 +2527,10 @@ class ManagedTasks:
 
         Each task is its own proof cache. A fresh gate still re-reads the host.
 
-        No launch/delegate here. Native task_status is parent-scoped, so a daemon
-        queues one idempotent resume notice to that parent instead of impersonating it.
+        No launch/delegate here. Native task_status is parent-scoped: the daemon
+        never calls it or impersonates the parent. A native child that already
+        submitted its report is closed with every other proof, and that is
+        recorded in the completion evidence (native_closure.daemon_close).
         Certified results are never re-observed or re-certified: an exact replay
         writes no event and sends nothing.
         """
@@ -2503,6 +2548,13 @@ class ManagedTasks:
                 )
         work = self.background_work(task)
         if work in {None, "launch"}:
+            await self.flush_returns(task_id)
+            return
+        if task.get("transport_mode") == "native_child":
+            from oraculo.native_closure import daemon_close
+
+            # A missing proof leaves the task as it is and is retried later.
+            await daemon_close(self, task_id)
             await self.flush_returns(task_id)
             return
         try:

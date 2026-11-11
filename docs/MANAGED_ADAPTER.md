@@ -24,6 +24,22 @@ accepted. Background reconciliation takes the same per-task scope, skips a
 task whose scope is busy, and does not block callers of other tasks.
 Cancelling one caller releases only that caller's scope.
 
+Background reconciliation also closes a native child whose executor already
+submitted its report, so the origin does not need a second bridge. The daemon
+has no parent identity: it never calls `task_status`, and the completion
+evidence records `daemon_reconciled_without_native_task_status`. Every other
+proof is the one the caller-bound path uses, and that path still requires
+`task_status`. A missing proof leaves the task where it was, is retried with
+backoff, and produces one notice to the origin. The switch is
+`managed_native_daemon_closure` (default `true`). See
+`docs/MANAGED_TASKS.md`, "Fechamento de filho nativo pelo daemon".
+
+`task resume --all-submitted [--project ID]` is one operation without a task
+scope of its own. It claims each selected task's scope in turn, releasing the
+previous one, and reports a task whose scope is busy as `skipped_busy` instead
+of waiting. Identity and the project catalog are read once for the operation;
+no thread read is shared between tasks.
+
 The daemon holds `managed-tasks.lock` for its lifetime. Offline cancel and
 legacy recovery still use a non-blocking flock against that lock. The daemon
 does not flock once per command. `queued_callers` stays 0; there is no
@@ -123,6 +139,8 @@ scope, and doing so would not release any other task.
    `task resume --file PAYLOAD` where PAYLOAD is `{"task_id":"ORIGINAL_ID"}`.
    If no task receipt was returned, retry the exact original start intent/key.
    This is an explicit reconciliation request, not permission for a new task.
+   When several submitted tasks are waiting, `task resume --all-submitted`
+   closes them in one bridge session and returns one outcome per task.
    Native delegation reuses its persisted host key; uncertain independent
    launches reconcile their existing effects and must not be relaunched.
 4. Confirm the same ID and reservation, host binding, canonical memory and pending

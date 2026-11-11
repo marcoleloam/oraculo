@@ -249,6 +249,18 @@ def parser() -> argparse.ArgumentParser:
     )
     task.add_argument("--file", type=Path, help="JSON payload; stdin when omitted")
     task.add_argument(
+        "--all-submitted",
+        action="store_true",
+        help=(
+            "resume only: close every task of the calling origin that already "
+            "has a submitted report, in one bridge session; takes no payload"
+        ),
+    )
+    task.add_argument(
+        "--project",
+        help="With --all-submitted: only tasks of this T3 project ID",
+    )
+    task.add_argument(
         "--stdio-host",
         action="store_true",
         help="Bridge native T3 calls through interactive JSON request/ack",
@@ -988,12 +1000,23 @@ def main(argv: list[str] | None = None) -> int:
                 from oraculo.task_store import TaskStore
                 from oraculo.task_transport import CommandTransport, StdioHostTransport
 
-                if args.stdio_host and (not args.file or args.transport_command):
+                batch = args.all_submitted
+                if batch and (args.action != "resume" or args.file):
+                    raise ValueError(
+                        "--all-submitted applies to task resume and takes no --file"
+                    )
+                if args.project and not batch:
+                    raise ValueError("--project requires --all-submitted")
+                if args.stdio_host and (
+                    (not args.file and not batch) or args.transport_command
+                ):
                     raise ValueError(
                         "--stdio-host requires --file and excludes --transport-command"
                     )
                 payload = (
-                    {}
+                    ({"project": args.project} if args.project else {})
+                    if batch
+                    else {}
                     if args.action == "list"
                     else json.loads(
                         args.file.read_text() if args.file else sys.stdin.read()
@@ -1153,6 +1176,12 @@ def main(argv: list[str] | None = None) -> int:
                     is not True
                 ):
                     raise StateError("origin_recovery_service_upgrade_required")
+                if (
+                    batch
+                    and capabilities.get("data", {}).get("batch_resume_submitted")
+                    is not True
+                ):
+                    raise StateError("batch_resume_service_upgrade_required")
                 command = (
                     json.loads(args.transport_command.read_text())
                     if args.transport_command
@@ -1167,11 +1196,17 @@ def main(argv: list[str] | None = None) -> int:
                     result = asyncio.run(
                         run_managed_attempts(
                             lambda: managed_command(
-                                config, args.action, payload, transport
+                                config,
+                                "resume-submitted" if batch else args.action,
+                                payload,
+                                transport,
                             )
                         )
                     )
                     print_json(result)
+                    if batch:
+                        # Per-task outcomes are the receipt; 0 means all closed.
+                        return 0 if result.get("complete") else 1
                     return 1 if result.get("phase") == "blocked" else 0
                 except StateError as exc:
                     # Preflight upgrade errors stay on stderr. This receipt is

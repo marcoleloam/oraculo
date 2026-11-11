@@ -111,6 +111,13 @@ checks original run, descendants, checkout and validation before completion.
 `validation_submitted` is only submission. Memory after work needs a correlated
 confirmed write receipt and commit; pending or sent is insufficient.
 
+After a native child submits, the service closes the task by itself and sends
+one final notice; the evidence then records
+`daemon_reconciled_without_native_task_status`. If a notice says automatic
+closure is pending, or several submitted tasks wait, the origin runs
+`oraculo task resume --all-submitted [--project ID]` (no `--file`): one bridge
+session, one outcome per task. Publication of a native task stays with the origin.
+
 A planning-only task must already declare `"deliverable_kind": "plan"` in the
 `task start` request; finish cannot reclassify an implementation task. Its
 report then adds `deliverable_kind: "plan"` and `approval_state: "pending"`,
