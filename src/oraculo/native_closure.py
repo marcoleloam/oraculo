@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 
+from oraculo import blocked_recovery
 from oraculo.run_continuity import execution_run, terminal_chain
 from oraculo.state import StateError
 
@@ -309,7 +310,11 @@ async def resume_submitted(engine, payload: dict, actor: dict, caps: dict) -> di
             results.append(_entry(task, "skipped_changed"))
             continue
         attempted += 1
-        # Only the project catalog crosses tasks. No thread read is shared.
+        # Each task is its own operation: its own record of effects, so a
+        # bridge lost during this task's reads is judged without the effects
+        # of the tasks closed before it. Only the project catalog crosses
+        # tasks. No thread read is shared.
+        engine._begin_operation()
         engine._proofs = dict(catalog)
         reason = None
         try:
@@ -327,6 +332,29 @@ async def resume_submitted(engine, payload: dict, actor: dict, caps: dict) -> di
                 # Same rule as a single resume: keep the reservation, block nothing.
                 results.append(_entry(store.get(task_id), "retryable", reason=reason))
                 continue
+            if engine._interrupted_before_effect(exc):
+                # Only reads were issued for this task: it keeps its phase,
+                # exactly as a single resume would leave it.
+                store.record_diagnostic(
+                    task_id,
+                    {
+                        "kind": "host_channel_interrupted_before_effect",
+                        "action": "resume-submitted",
+                        "reason": reason,
+                        "tool": engine._operation.failed_tool,
+                        "phase": store.get(task_id)["phase"],
+                    },
+                )
+                stopped = reason
+                results.append(
+                    _entry(
+                        store.get(task_id),
+                        "interrupted",
+                        reason=reason,
+                        recovery=blocked_recovery.recovery("resume", task_id, reason),
+                    )
+                )
+                continue
             store.update(
                 task_id,
                 "blocked",
@@ -339,13 +367,15 @@ async def resume_submitted(engine, payload: dict, actor: dict, caps: dict) -> di
                     ),
                 },
                 blocked_reason=reason,
+                recovery=blocked_recovery.recovery("resume", task_id, reason),
             )
             if reason in INTERRUPTIONS:
                 # The bridge is gone: later tasks would only inherit its error.
                 stopped = reason
                 results.append(_entry(store.get(task_id), "interrupted", reason=reason))
                 continue
-        await engine.flush_returns(task_id)
+        if engine._operation.failure is None:
+            await engine.flush_returns(task_id)
         current = store.get(task_id)
         if current["phase"] == "blocked":
             outcome = (

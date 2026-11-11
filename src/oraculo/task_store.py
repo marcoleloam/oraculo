@@ -63,6 +63,11 @@ class TaskStore:
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(task_returns)")}
         if "delivery" not in columns:
             self.db.execute("ALTER TABLE task_returns ADD COLUMN delivery TEXT")
+        if "attempt" not in columns:
+            # 'prepared': frozen, never handed to the host. 'attempted': the
+            # send was issued and may have arrived. NULL on a frozen row is a
+            # delivery from before this column and counts as attempted.
+            self.db.execute("ALTER TABLE task_returns ADD COLUMN attempt TEXT")
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(5)")
 
     @property
@@ -181,6 +186,9 @@ class TaskStore:
             task["phase"] = phase
             if phase != "blocked":
                 task["blocked_reason"] = None
+            if phase != "blocked" or "recovery" not in changes:
+                # The next command belongs to one block only.
+                task.pop("recovery", None)
             event = dict(phase=phase, proof=proof)
             signature = content_hash(event)
             if before != canonical_json(task) or not any(
@@ -220,6 +228,25 @@ class TaskStore:
             )
             return task
 
+    def record_diagnostic(self, task_id: str, record: dict, *, _atomic_body=False):
+        """Keep a local note on the task. No event, no revision, no notice.
+
+        Used when an operation ended without changing the task, so that the
+        interruption stays visible in status without waking the origin.
+        """
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.record_diagnostic(task_id, record, _atomic_body=True)
+            )
+        with self.state.transaction():
+            task = self.get(task_id)
+            rows = [*task.get("diagnostics", []), dict(record, at=time.time())]
+            task["diagnostics"] = rows[-20:]
+            self.db.execute(
+                "UPDATE managed_tasks SET payload=? WHERE id=?",
+                (canonical_json(task), task_id),
+            )
+
     def pending_returns(self, task_id: str) -> list[dict]:
         # Old read-only ledgers have no notification migration yet.
         migrated = self._notifications_available()
@@ -249,10 +276,19 @@ class TaskStore:
         Both formats share one semantic rule: a fresh batch is represented by
         its newest event only when the meaning (phase, blocker, result, action
         or approval) differs from the last host-confirmed notification;
-        otherwise it is suppressed and wakes nobody. Frozen deliveries are
-        barriers: always replay their original bytes/key. No receipt is written
+        otherwise it is suppressed and wakes nobody. No receipt is written
         here; coverage is local provenance, not a host ACK. The caller sends
         this bounded batch, so sends cannot feed their own loop.
+
+        A frozen delivery whose send was issued (or one frozen before the
+        ``attempt`` column existed) may have reached the origin. It is a
+        barrier: it replays its original bytes and key, in order. A delivery
+        that was frozen but never handed to the host reached nobody, so it
+        joins the fresh batch: when a newer event exists it is superseded
+        (kept as history, covered by the newer notice), and when it is still
+        the newest it is frozen again from the current state. The origin
+        therefore receives the newest state of the task once, and never a
+        block that a later operation already resolved before any send.
         """
         from oraculo.presentation import notification_signature, task_view
 
@@ -277,6 +313,20 @@ class TaskStore:
                     # Prefer the newest event: the one summary of a completed
                     # batch should not masquerade as an obsolete transition.
                     representative = fresh[-1]
+                    # A delivery frozen earlier and never sent keeps its bytes
+                    # while it still describes the current revision.
+                    cached = self.db.execute(
+                        "SELECT delivery FROM task_returns WHERE id=?",
+                        (representative["id"],),
+                    ).fetchone()[0]
+                    stale = cached and json.loads(cached).get(
+                        "snapshot_revision"
+                    ) != task.get("snapshot_revision", 0)
+                    self.db.execute(
+                        "UPDATE task_returns SET attempt='prepared',"
+                        "delivery=CASE WHEN ? THEN NULL ELSE delivery END WHERE id=?",
+                        (1 if stale else 0, representative["id"]),
+                    )
                     self.delivery(representative)
                     self._notification(
                         representative,
@@ -284,6 +334,7 @@ class TaskStore:
                         current_signature,
                         representative["id"],
                         "intent",
+                        True,
                     )
                     target, confirmed = (current_signature, representative["id"]), False
                 for item in fresh:
@@ -294,15 +345,17 @@ class TaskStore:
                             current_signature,
                             target[1],
                             "suppressed" if confirmed else "coalesced",
+                            True,
                         )
                 fresh.clear()
 
             for event in pending:
                 row = self.db.execute(
-                    "SELECT delivery FROM task_returns WHERE id=?", (event["id"],)
+                    "SELECT delivery,attempt FROM task_returns WHERE id=?",
+                    (event["id"],),
                 ).fetchone()
                 frozen = json.loads(row[0]) if row[0] else None
-                if frozen is not None:
+                if frozen is not None and row[1] != "prepared":
                     prepare_fresh()
                     # Even a pre-upgrade frozen duplicate must replay unchanged.
                     signature = self._delivery_signature(frozen)
@@ -348,9 +401,31 @@ class TaskStore:
         )
         return (signature, row[0]) if signature else None
 
-    def _notification(self, event, origin, signature, representative, disposition):
+    def begin_return_attempt(self, event_id: str, *, _atomic_body=False):
+        """Record, before the send, that this delivery is leaving the ledger."""
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.begin_return_attempt(event_id, _atomic_body=True)
+            )
+        with self.state.transaction():
+            self.db.execute(
+                "UPDATE task_returns SET attempt='attempted' WHERE id=?", (event_id,)
+            )
+
+    def _notification(
+        self, event, origin, signature, representative, disposition, replace=False
+    ):
+        # replace is only for deliveries that were never handed to the host;
+        # a decision about a possibly delivered notice is never rewritten.
+        conflict = (
+            "ON CONFLICT(return_id) DO UPDATE SET signature=excluded.signature,"
+            "representative_id=excluded.representative_id,"
+            "disposition=excluded.disposition,decided_at=excluded.decided_at"
+            if replace
+            else "ON CONFLICT(return_id) DO NOTHING"
+        )
         self.db.execute(
-            "INSERT OR IGNORE INTO task_notifications VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO task_notifications VALUES(?,?,?,?,?,?,?) " + conflict,
             (
                 event["id"],
                 event["payload"]["task_id"],
@@ -461,12 +536,36 @@ class TaskStore:
 
     def context_artifact(self, context: dict) -> dict:
         raw = canonical_json(context).encode()
+        path, digest = self._private_artifact(raw, ".json")
+        return {
+            "path": str(path),
+            "sha256": digest,
+            "bytes": len(raw),
+            "scope": "selected_project_and_sanitized_shared",
+        }
+
+    def request_artifact(self, text: str) -> dict:
+        """The task request as a private file, so a launch carries a reference.
+
+        The bytes are the request text in UTF-8, nothing else: the reader can
+        check the SHA-256 and the size with any tool.
+        """
+        raw = text.encode()
+        path, digest = self._private_artifact(raw, ".request.txt")
+        return {
+            "path": str(path),
+            "sha256": digest,
+            "bytes": len(raw),
+            "encoding": "utf-8",
+        }
+
+    def _private_artifact(self, raw: bytes, suffix: str):
         digest = hashlib.sha256(raw).hexdigest()
         root = self.state.path.parent / "managed-contexts"
         root.mkdir(mode=0o700, exist_ok=True)
         if root.is_symlink():
             raise StateError("managed_context_directory_invalid")
-        path = root / (digest + ".json")
+        path = root / (digest + suffix)
         try:
             fd = os.open(
                 path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
@@ -479,12 +578,7 @@ class TaskStore:
                 stream.write(raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-        return {
-            "path": str(path),
-            "sha256": digest,
-            "bytes": len(raw),
-            "scope": "selected_project_and_sanitized_shared",
-        }
+        return path, digest
 
     def history(self, task_id: str, offset: int = 0) -> dict:
         if type(offset) is not int or offset < 0:
@@ -507,9 +601,15 @@ class TaskStore:
         result = []
         for event in events:
             ident = task_id + ":" + event["id"]
-            row = self.db.execute(
-                "SELECT receipt FROM task_returns WHERE id=?", (ident,)
-            ).fetchone()
+            try:
+                row = self.db.execute(
+                    "SELECT receipt,delivery FROM task_returns WHERE id=?", (ident,)
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # A read-only ledger from before deliveries were frozen.
+                row = self.db.execute(
+                    "SELECT receipt,NULL FROM task_returns WHERE id=?", (ident,)
+                ).fetchone()
             notification = (
                 self.db.execute(
                     "SELECT * FROM task_notifications WHERE return_id=?", (ident,)
@@ -538,6 +638,8 @@ class TaskStore:
                     if representative and representative[0]
                     else "covered_by_pending"
                 )
+                # Frozen for sending once, then replaced before any send.
+                record["superseded"] = bool(row and row[1])
             result.append(record)
         return result
 
@@ -776,6 +878,12 @@ class TaskStore:
                 rollout_verification=dict(
                     rollout, state="unknown", reason="verification_expired"
                 ),
+            )
+        if task.get("phase") == "blocked" and not task.get("recovery"):
+            from oraculo.blocked_recovery import recovery
+
+            task = dict(
+                task, recovery=recovery(None, task_id, task.get("blocked_reason"))
             )
         return {
             k: v

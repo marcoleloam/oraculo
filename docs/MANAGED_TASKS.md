@@ -390,6 +390,13 @@ O ciclo 006 consulta **antes** do lançamento. Conteúdo indisponível bloqueia;
 consulta vazia confirmada permite prosseguir. O contexto integral fica em um
 artefato privado de hash SHA-256, fora do repositório, evitando truncamento em
 prompts. O executor recebe referência, digest e instrução de leitura integral.
+O pedido segue a mesma regra: o texto vai para `managed-contexts/` como
+`<sha256>.request.txt` (modo 0600, somente os bytes UTF-8 do texto) e o
+lançamento leva `request_artifact` (`path`, `sha256`, `bytes`) em vez do texto.
+A primeira regra do brief manda ler o arquivo inteiro e conferir o hash antes
+de qualquer outra coisa. Os argumentos de lançamento são gravados uma vez e
+reenviados byte a byte; tarefas lançadas por versão anterior mantêm o pedido
+inline.
 O recibo atesta transporte da memória, não prova cognitiva de que o modelo a usou.
 O contexto contém somente o corpus do projeto e shared já sanitizado pelo
 publicador canônico. Nenhum método deste adapter escreve diretamente no vault.
@@ -428,6 +435,22 @@ de liberar a reserva. Veja [política, ACKs e runbook](RUN_CONTINUITY_AND_ACKS.m
 `finish` confirma SHA do
 checkout limpo, mantém trabalho separado da gravação e só libera PR após recibo
 canônico `confirmed`/commit. Falhas de memória ficam visíveis e são retomáveis.
+
+A prova de descendentes de um filho nativo sem descendentes conhecidos não
+lista mais o projeto inteiro: pede ao host só as conversas com status diferente
+de `completed` e `idle`, das mais novas até a criação do filho, e segue a cadeia
+de pais de cada uma. Qualquer descendente vivo ou encerrado sem sucesso faz o
+gate voltar ao catálogo completo e bloquear como antes. Depois da memória, a
+mesma prova é lida de novo (filho, lista filtrada e `task_status`). Limites, o que cada
+prova garante e a contagem de quadros estão em
+[MANAGED_ADAPTER.md](MANAGED_ADAPTER.md#host-proofs-inside-one-operation).
+
+Toda resposta `blocked` traz `recovery` com o próximo comando (`command`,
+`payload` com o `task_id` e `instruction`). Falha do canal do host enquanto a
+operação só fez leituras não bloqueia a tarefa: o comando falha com
+`retryable=true` e `recovery` mandando repetir o mesmo comando; a fase não muda
+e fica só uma nota local em `diagnostics`. Veja
+[Interrupted before any effect](MANAGED_ADAPTER.md#interrupted-before-any-effect).
 
 ### Validação antes da submissão
 
@@ -1080,11 +1103,21 @@ Compatibilidade e implantação:
   modo que eventos de ciclos repetidos já gravados por um daemon antigo não
   acordam a origem depois da atualização. Entregas antigas sem apresentação
   congelada não têm significado conhecido e não suprimem nada.
-- Entregas já congeladas, legíveis ou JSON, são barreiras imutáveis: não se muda
-  mensagem/chave nem se suprime uma emissão possivelmente já enviada. Um backlog
-  congelado antes da atualização ainda pode mostrar repetições. Não é possível
-  removê-las sem quebrar reconciliação; T3 não oferece edição de mensagem ou um
-  canal invisível verificado.
+- Uma entrega congelada cujo envio foi iniciado é barreira imutável: não se muda
+  mensagem/chave nem se suprime uma emissão possivelmente já enviada. A coluna
+  aditiva `task_returns.attempt` distingue os casos: `prepared` (congelada,
+  nunca entregue ao host) e `attempted` (o envio saiu; o recibo pode ter se
+  perdido). Entrega congelada antes dessa coluna tem `attempt` nulo e é tratada
+  como possivelmente enviada. Um backlog congelado antes da atualização ainda
+  pode mostrar repetições. Não é possível removê-las sem quebrar reconciliação;
+  T3 não oferece edição de mensagem ou um canal invisível verificado.
+- Uma entrega `prepared` não chegou a ninguém e volta ao lote novo. Se existe
+  evento mais recente, ela é superada: fica no histórico como `coalesced` ou
+  `suppressed`, com `superseded=true` em `task history`, e a origem recebe só o
+  estado mais novo. Se o significado atual é igual ao último aviso confirmado,
+  nada é enviado. Assim, um bloqueio resolvido por uma operação posterior antes
+  de qualquer envio nunca é avisado. O flush acontece uma vez, depois do estado
+  final da operação, e não é tentado em um canal que já falhou.
 - O daemon atualizado cria tabela/índice de forma aditiva e marca schema5 no
   ledger gerenciado; não reescreve tarefas, eventos, recibos ou deliveries
   antigos. O estado principal permanece schema4. Leituras offline novas aceitam

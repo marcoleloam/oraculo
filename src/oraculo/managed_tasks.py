@@ -14,6 +14,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from oraculo import blocked_recovery
 from oraculo.deliverables import (
     KINDS,
     certified_phase,
@@ -34,7 +35,7 @@ from oraculo.run_continuity import (
 )
 from oraculo.settlement import Settlements
 from oraculo.state import StateError
-from oraculo.t3.client import T3Client
+from oraculo.t3.client import T3Client, TransportError
 from oraculo.t3.contracts import ContractError
 from oraculo.task_store import TaskStore
 
@@ -108,6 +109,91 @@ LAUNCH_HINTS = {
         "sent. Cancel this task and start again natively or with independent=true."
     ),
 }
+
+
+# Host calls that change nothing. Every other tool is treated as an effect.
+READ_HOST_TOOLS = frozenset(
+    {
+        "orchestrator_capabilities",
+        "t3_project_list",
+        "t3_thread_list",
+        "t3_thread_read",
+        "t3_thread_wait",
+        "task_status",
+        "list_thread_pull_requests",
+    }
+)
+_CHANNEL_CODES = frozenset({"host_response_uncertain", "managed_host_channel_failed"})
+
+
+def host_channel_failure(exc: BaseException) -> bool:
+    """The channel to the host failed; the host itself did not answer."""
+    if isinstance(exc, StateError):
+        code = str(exc)
+        return code in _CHANNEL_CODES or code.startswith("managed_host_ack_")
+    return isinstance(exc, (OSError, TimeoutError, EOFError, TransportError))
+
+
+class _Operation:
+    """What one adapter operation has sent out so far."""
+
+    def __init__(self):
+        self.effects = []
+        self.failure = None
+        self.failed_tool = None
+
+
+class _TrackedHost:
+    """Records effect calls before they are sent, and channel failures."""
+
+    def __init__(self, engine, host):
+        self._engine, self._host = engine, host
+
+    async def call(self, name, arguments):
+        operation = self._engine._operation
+        if name not in READ_HOST_TOOLS:
+            operation.effects.append(name)
+        try:
+            return await self._host.call(name, arguments)
+        except Exception as exc:
+            if host_channel_failure(exc):
+                operation.failure, operation.failed_tool = exc, name
+            raise
+
+    def __getattr__(self, name):
+        return getattr(self._host, name)
+
+
+class _TrackedMemory:
+    """A memory finish is an effect; every other call passes through."""
+
+    def __init__(self, engine, memory):
+        self._engine, self._memory = engine, memory
+
+    async def finish(self, *args, **kwargs):
+        self._engine._operation.effects.append("memory.finish")
+        return await self._memory.finish(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._memory, name)
+
+
+class _EffectProxy:
+    """Publication and merge adapters: any call may have acted remotely."""
+
+    def __init__(self, engine, target, label):
+        self._engine, self._target, self._label = engine, target, label
+
+    def __getattr__(self, name):
+        value = getattr(self._target, name)
+        if not callable(value):
+            return value
+
+        def call(*args, **kwargs):
+            self._engine._operation.effects.append(self._label + "." + name)
+            return value(*args, **kwargs)
+
+        return call
 
 
 class ReportValidationError(StateError):
@@ -208,21 +294,82 @@ class ManagedTasks:
         scopes=None,
     ):
         self.config, self.store = config, store
+        self._operation = _Operation()
         self.host, self.memory, self.publisher = host, memory, publisher
         self.lifecycle = lifecycle
         self.admission = admission
         self.scopes = scopes
         self._proofs = {}
 
+    # The collaborators are wrapped so that every caller, including the
+    # recovery and closure modules, is counted by the same operation record.
+    @property
+    def host(self):
+        return self._host
+
+    @host.setter
+    def host(self, value):
+        self._host = _TrackedHost(self, value)
+
+    @property
+    def memory(self):
+        return self._memory
+
+    @memory.setter
+    def memory(self, value):
+        self._memory = None if value is None else _TrackedMemory(self, value)
+
+    @property
+    def publisher(self):
+        return self._publisher
+
+    @publisher.setter
+    def publisher(self, value):
+        self._publisher = (
+            None if value is None else _EffectProxy(self, value, "publication")
+        )
+
+    @property
+    def lifecycle(self):
+        return self._lifecycle
+
+    @lifecycle.setter
+    def lifecycle(self, value):
+        self._lifecycle = (
+            None if value is None else _EffectProxy(self, value, "lifecycle")
+        )
+
+    def _begin_operation(self):
+        """One operation: one proof cache and one record of what was sent."""
+        self._proofs = {}
+        self._operation = _Operation()
+
+    def _interrupted_before_effect(self, exc: BaseException) -> bool:
+        """The host channel failed while this operation had only read.
+
+        Nothing was sent that could have changed the host, memory or a
+        repository, so the task keeps its phase and the caller repeats the
+        same command. After an effect call the same failure is uncertainty
+        about that effect and still blocks.
+        """
+        operation = self._operation
+        return (
+            operation.failure is not None
+            and not operation.effects
+            and (exc is operation.failure or host_channel_failure(exc))
+        )
+
     async def _host_proof(self, name: str, arguments: dict, *, fresh: bool = False):
         """Reuse one host result when this operation asks for the same proof.
 
         A fresh call always hits the host, then becomes the cached proof.
-        Freshness gates are: project binding in ``_scope``; the parent thread
-        when a native retry checks ``native_retry_parent_binding_changed``;
-        the child thread in ``_observe`` and report prevalidation; the child
-        thread while reconciling an uncertain launch. Route revalidation
-        (``orchestrator_capabilities``), terminal settlement, thread catalogs,
+        The caller identity (``orchestrator_capabilities`` and the caller's
+        own thread) and the project catalog are read once per operation and
+        reused by every later check of that operation; they are never kept
+        for the next one. Freshness gates are: the child thread in
+        ``_observe`` and report prevalidation; the child thread while
+        reconciling an uncertain launch. Route revalidation (its own
+        ``orchestrator_capabilities``), terminal settlement, thread lists,
         ``task_status`` and effect calls (delegate, launch, PR link) do not
         use this cache.
         """
@@ -234,7 +381,7 @@ class ManagedTasks:
         return copy.deepcopy(result)
 
     async def _identity(self) -> tuple[dict, dict]:
-        caps = await self.host.call("orchestrator_capabilities", {})
+        caps = await self._host_proof("orchestrator_capabilities", {})
         thread_id = caps.get("parentThreadId")
         if not thread_id:
             raise StateError("caller_bound_parent_required")
@@ -283,7 +430,24 @@ class ManagedTasks:
     async def command(self, action: str, payload: dict) -> dict:
         # One operation, one proof cache. A reused engine must not keep the
         # previous command's host reads.
-        self._proofs = {}
+        self._begin_operation()
+        try:
+            return await self._command(action, payload)
+        except Exception as exc:
+            if self._interrupted_before_effect(exc):
+                # Retryable for the caller, never repeated automatically: a
+                # hand-relayed bridge must not receive frames it did not ask for.
+                exc.retryable = True
+                exc.auto_retry = False
+                exc.interrupted = True
+                exc.recovery = blocked_recovery.repeat(
+                    action,
+                    payload if isinstance(payload, dict) else {},
+                    _diagnostic_code(exc),
+                )
+            raise
+
+    async def _command(self, action: str, payload: dict) -> dict:
         # Offline callers take the ledger lock. The live daemon already holds
         # that lock and serializes only this operation's scope.
         lock_path = self.store.state.path.with_suffix(".lock")
@@ -353,7 +517,9 @@ class ManagedTasks:
                         plan = await self._launch_plan(payload, actor, caps)
                     except LaunchPreflightError as exc:
                         return self._launch_rejection(None, exc)
-                    except (StateError, ValueError, KeyError):
+                    except (StateError, ValueError, KeyError) as exc:
+                        if self._interrupted_before_effect(exc):
+                            raise  # nothing exists yet; the caller starts again
                         plan = None
                 task = self.store.create(actor, payload["key"], payload)
             else:
@@ -452,7 +618,7 @@ class ManagedTasks:
                                 certification=False,
                             )
                         return dict(
-                            self.store.describe(task_id),
+                            self._described(action, task_id),
                             legacy_delivery_diagnosis=diagnosis,
                         )
                     await recovery.accept(task, payload, actor)
@@ -471,7 +637,7 @@ class ManagedTasks:
                         except ContractError as exc:
                             diagnosis = _review_diagnosis_failure(str(exc))
                         return dict(
-                            self.store.describe(task_id),
+                            self._described(action, task_id),
                             review_diagnosis=diagnosis,
                         )
                     await recovery.adjudicate_review(task, payload, actor)
@@ -583,6 +749,20 @@ class ManagedTasks:
                         exc, "reason", getattr(exc, "code", type(exc).__name__)
                     )
                 )
+                if self._interrupted_before_effect(exc):
+                    # Only reads were issued. The task keeps its phase; the
+                    # record below is local and notifies nobody.
+                    self.store.record_diagnostic(
+                        task_id,
+                        {
+                            "kind": "host_channel_interrupted_before_effect",
+                            "action": action,
+                            "reason": code[:200],
+                            "tool": self._operation.failed_tool,
+                            "phase": self.store.get(task_id)["phase"],
+                        },
+                    )
+                    raise
                 self.store.update(
                     task_id,
                     "blocked",
@@ -595,11 +775,28 @@ class ManagedTasks:
                         ),
                     },
                     blocked_reason=code[:200],
+                    recovery=blocked_recovery.recovery(action, task_id, code[:200]),
                 )
-            await self.flush_returns(task_id)
-            return self.store.describe(task_id)
+            # One flush, after the operation's final state. A channel that
+            # already failed delivers nothing; the outbox stays unprepared so
+            # the next operation sends only the newest state.
+            if self._operation.failure is None:
+                await self.flush_returns(task_id)
+            return self._described(action, task_id)
         finally:
             os.close(fd)
+
+    def _described(self, action, task_id):
+        result = self.store.describe(task_id)
+        if result.get("phase") == "blocked" and not self.store.get(task_id).get(
+            "recovery"
+        ):
+            # A block written elsewhere (closure, recovery, background) names
+            # no command of its own; this operation's action is the best one.
+            result["recovery"] = blocked_recovery.recovery(
+                action, task_id, result.get("blocked_reason")
+            )
+        return result
 
     def _report_rejection(self, task_id, reason):
         # A response, not a persisted task transition or origin notification.
@@ -623,6 +820,13 @@ class ManagedTasks:
                 "reason": reason,
                 "hint": hint,
             },
+            recovery={
+                "command": "oraculo task finish",
+                "payload": {"task_id": task_id},
+                "instruction": hint
+                + " Nothing was persisted; send the corrected report with the "
+                "same task_id. Do not start a new task.",
+            },
         )
 
     def _launch_rejection(self, task_id, exc: LaunchPreflightError):
@@ -638,6 +842,13 @@ class ManagedTasks:
             "observed": exc.observed,
             "host_effects": "none",
         }
+        recovery = {
+            "command": "oraculo task start",
+            "payload": {"task_id": task_id} if task_id else {},
+            "instruction": rejection["hint"]
+            + " No task state or host effect was created; correct the request "
+            "and start again with the same key.",
+        }
         if task_id is None:
             return dict(
                 state="launch_rejected",
@@ -645,12 +856,14 @@ class ManagedTasks:
                 phase="blocked",
                 blocked_reason=reason,
                 rejection=rejection,
+                recovery=recovery,
             )
         return dict(
             self.store.describe(task_id),
             phase="blocked",
             blocked_reason=reason,
             rejection=rejection,
+            recovery=recovery,
         )
 
     async def _launch_plan(
@@ -739,13 +952,14 @@ class ManagedTasks:
             raise LaunchPreflightError("native_child_base_not_head", observed)
         return dict(plan, native=True)
 
-    async def _scope(self, task: dict, *, fresh: bool = True):
+    async def _scope(self, task: dict, *, fresh: bool = False):
         project = task["project"]
         if not self.config.project_in_scope(project["project_path"]):
             raise StateError("managed_project_scope_revoked")
         current = resolve_project(
             self.config,
             cwd=project["project_path"],
+            # The catalog this operation already read, or its first read.
             projects=await self._projects(fresh=fresh),
             explicit=project["project_id"],
         )
@@ -855,7 +1069,8 @@ class ManagedTasks:
             )
         if task.get("launch_attempted"):
             if task["transport_mode"] == "native_child":
-                caller = await self._thread(actor["thread_id"], fresh=True)
+                # The identity read of this same operation.
+                caller = await self._thread(actor["thread_id"])
                 source_path = (
                     caller.get("worktreePath") or task["project"]["project_path"]
                 )
@@ -899,11 +1114,14 @@ class ManagedTasks:
         if not task.get("launch_arguments"):
             mode = "native_child" if native else "managed_thread"
             reference = self.store.context_artifact(task["context"])
+            # The request travels by reference. The launch frame stays small
+            # whatever the size of the brief; the child reads the private file.
+            request_reference = self.store.request_artifact(req["text"])
             brief = {
                 "marker": "ORACULO_MANAGED_TASK_V1",
                 "task_id": task_id,
                 "title": req.get("title", "Project task"),
-                "request": req["text"],
+                "request_artifact": request_reference,
                 "project_id": project["project_id"],
                 "base_sha": base_sha,
                 "origin": task["origin"],
@@ -915,6 +1133,7 @@ class ManagedTasks:
                     else None,
                 },
                 "rules": [
+                    "The request is not inline. Before anything else read the whole file at request_artifact.path and verify its SHA256 and byte size against request_artifact; if it is missing or differs, stop and report that through the adapter.",
                     "This is a managed task. Use the supplied origin identity; native parentage applies only in native_child transport.",
                     "Before edits verify host-bound isolated workspace, requested branch, base SHA, and the SHA256 of the supplied private memory artifact. Read the whole artifact.",
                     "Implement and validate; preserve unrelated changes. Never push private history or commit unselected files.",
@@ -1041,7 +1260,9 @@ class ManagedTasks:
         if task.get("launch_attempted") and arguments.get("title"):
             project_id = task["project"]["project_id"]
             if task.get("transport_mode") == "native_child":
-                rows = await self._thread_rows(project_id)
+                rows = await self._thread_rows(
+                    project_id, title_contains=arguments["title"]
+                )
                 matches = len(
                     [
                         r
@@ -1051,7 +1272,9 @@ class ManagedTasks:
                     ]
                 )
             else:
-                rows = await self._thread_rows(project_id)
+                rows = await self._thread_rows(
+                    project_id, title_contains=arguments["title"]
+                )
                 matches = len(
                     [
                         r
@@ -1081,7 +1304,15 @@ class ManagedTasks:
             launch_attempted=False,
         )
 
-    async def _thread_rows(self, project_id: str) -> list[dict]:
+    async def _thread_rows(
+        self, project_id: str, *, title_contains: str | None = None
+    ) -> list[dict]:
+        """Project threads, subagents included.
+
+        Launch reconciliation looks for one title, so it asks the host for
+        that title only. The host filter is a substring match: callers still
+        compare the exact title and parent on the returned rows.
+        """
         rows, cursor, seen = [], None, set()
         for _ in range(10):
             page = await self.host.call(
@@ -1090,6 +1321,7 @@ class ManagedTasks:
                     projectId=project_id,
                     includeSubagents=True,
                     limit=100,
+                    **({"titleContains": title_contains} if title_contains else {}),
                     **({"cursor": cursor} if cursor is not None else {}),
                 ),
             )
@@ -1117,7 +1349,9 @@ class ManagedTasks:
         """
         arguments = task["launch_arguments"]
         origin = task["origin"]["thread_id"]
-        rows = await self._thread_rows(task["project"]["project_id"])
+        rows = await self._thread_rows(
+            task["project"]["project_id"], title_contains=arguments.get("title")
+        )
         bound = {
             r[0]
             for r in self.store.db.execute(
@@ -1158,7 +1392,10 @@ class ManagedTasks:
 
     async def _reconcile_launch(self, task: dict):
         await self._scope(task)
-        rows = await self._thread_rows(task["project"]["project_id"])
+        rows = await self._thread_rows(
+            task["project"]["project_id"],
+            title_contains=task["launch_arguments"]["title"],
+        )
         matches = [
             r
             for r in rows
@@ -1332,9 +1569,6 @@ class ManagedTasks:
             raise StateError("original_task_run_not_observed")
         terminal = {"completed", "failed", "cancelled", "interrupted"}
         status = matched[0]["status"]
-        rows = await self._thread_rows(task["project"]["project_id"])
-        children = {r["threadId"]: r for r in rows}
-        descendants, seen = [child["childThreadId"]], set()
         current = snapshot["thread"]
         pending = (
             bool(current.get("activeRunId"))
@@ -1342,20 +1576,15 @@ class ManagedTasks:
             or current.get("pendingRequestCount", 0) != 0
             or any(r.get("status") not in terminal for r in runs)
         )
-        while descendants:
-            current = descendants.pop()
-            if current in seen:
-                raise StateError("cyclic_task_descendants")
-            seen.add(current)
-            for row in children.values():
-                if row.get("parentThreadId") == current:
-                    pending = (
-                        pending
-                        or row.get("status") not in terminal | {"idle"}
-                        or bool(row.get("activeRunId"))
-                        or row.get("pendingRequestCount", 0) != 0
-                    )
-                    descendants.append(row["threadId"])
+        # An observation, not the closing gate: only threads the host reports
+        # as live are listed, and each is traced back to this child.
+        found = await self._client().unclear_descendants(
+            child["childThreadId"],
+            task["project"]["project_id"],
+            current.get("parentThreadId"),
+            current.get("createdAt"),
+        )
+        pending = pending or found["target_live"] or bool(found["live"])
         observed = dict(
             status=status,
             original_run_id=child["childRunId"],
@@ -1485,15 +1714,17 @@ class ManagedTasks:
         except (TypeError, ValueError, UnicodeError):
             raise ReportValidationError("invalid_validation_report") from None
 
-    async def _prevalidate_report(self, task, report):
+    async def _prevalidate_report(self, task, report, *, thread=None):
+        """``thread`` is a read of the child made by this same operation."""
         result = self._validate_report(task, report)
         if not task.get("child"):
             raise ReportValidationError("child_not_launched")
         if not result[1]:
             try:
-                thread = await self._thread(
-                    task["child"]["childThreadId"], fresh=True
-                )
+                if thread is None:
+                    thread = await self._thread(
+                        task["child"]["childThreadId"], fresh=True
+                    )
                 ws = self._report_workspace(task, thread)
                 if ws["dirty"] or report["commit"] != ws["head"]:
                     raise StateError("validated_commit_or_clean_workspace_required")
@@ -1750,6 +1981,54 @@ class ManagedTasks:
             and all(r["status"] in CONTINUATION_RUN_STATUSES for r in chain)
         )
 
+    def _client(self) -> T3Client:
+        client = T3Client("http://127.0.0.1/mcp")
+        client.call = self.host.call
+        return client
+
+    def _catalog_required(self, task) -> bool:
+        """Whether this gate needs every descendant, ended ones included.
+
+        The targeted proof shows that no descendant is live or ended without
+        success; it names no descendant. Identities and run chains are needed
+        as soon as one may matter: a task the child itself started through
+        this ledger (reviews and functional tests are such tasks), or a
+        recorded review, delivery, completion or supersession decision. A
+        top-level child has no host ``task_status`` to back the targeted
+        proof, so it keeps the catalog too.
+        """
+        if task.get("transport_mode") != "native_child":
+            return True
+        if any(
+            task.get(key)
+            for key in (
+                "review_adjudication",
+                "legacy_delivery_decision",
+                "origin_completion",
+                "supersession",
+            )
+        ):
+            return True
+        # Every success records a delivery review; only one that names a
+        # descendant binds this gate to descendant evidence.
+        delivery = task.get("delivery_review") or {}
+        if any(
+            delivery.get(key)
+            for key in (
+                "quality_reviews",
+                "mandatory_validations",
+                "scope_validations",
+                "unknown_descendant_roles",
+            )
+        ):
+            return True
+        return bool(
+            self.store.db.execute(
+                "SELECT 1 FROM managed_tasks WHERE origin=? AND id<>? LIMIT 1",
+                (task["child"]["childThreadId"], task["id"]),
+            ).fetchone()
+        )
+
     async def _terminal_gate(
         self,
         task,
@@ -1758,14 +2037,33 @@ class ManagedTasks:
         observations=None,
         workspace_required=True,
         pending_reason=None,
+        targeted=False,
+        root=None,
     ):
-        """Preserve original binding and prove every run/descendant terminal."""
-        client = T3Client("http://127.0.0.1/mcp")
-        client.call = self.host.call
+        """Preserve original binding and prove every run/descendant terminal.
+
+        Default: the whole project catalog, as recovery and closure callers
+        expect. ``targeted`` lets the normal finish, release and publication
+        path of a native child use the status-filtered proof instead (see
+        ``_catalog_required`` and ``T3Client.unclear_descendants``); the host's
+        own ``task_status`` is checked below either way. Both proofs are
+        project-scoped and not atomic.
+
+        ``root`` is this operation's fresh read of the child, made for report
+        prevalidation; the gate that follows it uses that read instead of
+        reading the child twice. The re-proof after the memory write passes no
+        ``root``: it reads the child, the filtered list and ``task_status``
+        again.
+        """
+        client = self._client()
+        thread_id = task["child"]["childThreadId"]
+        targeted = targeted and not self._catalog_required(task)
         snapshot = await client.settlement_snapshot(
-            task["child"]["childThreadId"],
+            thread_id,
             terminal_only=True,
             complete_runs=True,
+            live_only=targeted,
+            root=root if targeted else None,
         )
         if pending_reason:
             from oraculo.t3.contracts import TERMINAL_STATUSES
@@ -1906,12 +2204,22 @@ class ManagedTasks:
             raise StateError("expected_run_not_completed")
 
     async def _execution_gate(
-        self, task, report=None, actor=None, observations=None, *, snapshot=None
+        self,
+        task,
+        report=None,
+        actor=None,
+        observations=None,
+        *,
+        snapshot=None,
+        targeted=False,
     ):
         """Success may follow a proven continuation; the original is immutable."""
         if snapshot is None:
             snapshot = await self._terminal_gate(
-                task, successful=True, observations=observations
+                task,
+                successful=True,
+                observations=observations,
+                targeted=targeted,
             )
         else:
             from oraculo.review_adjudication import ReviewAdjudication
@@ -2014,7 +2322,7 @@ class ManagedTasks:
                 raise StateError("work_not_successful")
             delivery = task.get("delivery_review") or {}
             if delivery.get("mandatory_validations") or delivery.get("quality_reviews"):
-                await self._execution_gate(task)
+                await self._execution_gate(task, targeted=True)
                 if task["phase"] == "blocked" and not task.get("publication"):
                     self.store.update(
                         task_id,
@@ -2025,13 +2333,23 @@ class ManagedTasks:
                         },
                     )
             return
-        kind, failed = await self._prevalidate_report(task, report)
+        # One fresh read of the child serves both report prevalidation and
+        # the terminal gate that follows it.
+        root = None
+        if not self._catalog_required(task):
+            root = await self._client().settlement_target(
+                task["child"]["childThreadId"]
+            )
+        kind, failed = await self._prevalidate_report(
+            task, report, thread=root["thread"] if root else None
+        )
         for field in ("report", "submitted_report"):
             if task.get(field) is not None and task[field] != report:
                 raise StateError("terminal_report_reused")
         if not task["child"].get("childRunId") or not task.get("child_workspace"):
             await self._observe(task)
             task = self.store.get(task_id)
+            root = None  # observed after that read; the gate reads again
         # Even a negative result requires fresh terminal/current-run evidence.
         observations = {}
         snapshot = await self._terminal_gate(
@@ -2039,6 +2357,8 @@ class ManagedTasks:
             observations=observations,
             workspace_required=workspace_required,
             pending_reason="children_still_running",
+            targeted=True,
+            root=root,
         )
         observed = self._terminal_observation(snapshot, observations)
         evidence = report_link(task, snapshot, report, actor=actor)
@@ -2128,12 +2448,15 @@ class ManagedTasks:
         if not self._saved(cycle):
             raise StateError("memory_write_unconfirmed")
         # Memory can yield while a new run, descendant or checkout change begins.
-        # Re-read the same proof before capacity release, including confirmed replay.
+        # Re-read the same proof before capacity release, including confirmed
+        # replay. A targeted gate repeats its small filtered list.
         current = self.store.get(task_id)
         final_observations = {}
         if succeeded:
             _, _, fresh = await self._execution_gate(
-                current, observations=final_observations
+                current,
+                observations=final_observations,
+                targeted=True,
             )
             ws = self._report_workspace(current, fresh["thread"])
             if ws["dirty"] or report.get("commit") != ws["head"]:
@@ -2143,6 +2466,7 @@ class ManagedTasks:
                 current,
                 observations=final_observations,
                 workspace_required=workspace_required,
+                targeted=True,
             )
         report_link(current, fresh, report)
         if self.admission is not None:
@@ -2162,7 +2486,9 @@ class ManagedTasks:
         observations = {}
         current = self.store.get(task["id"])
         if task["work_status"] == "succeeded":
-            _, _, fresh = await self._execution_gate(current, observations=observations)
+            _, _, fresh = await self._execution_gate(
+                current, observations=observations, targeted=True
+            )
             ws = self._report_workspace(current, fresh["thread"])
             if ws["dirty"] or report.get("commit") != ws["head"]:
                 raise StateError("validated_commit_or_clean_workspace_required")
@@ -2171,6 +2497,7 @@ class ManagedTasks:
                 current,
                 observations=observations,
                 workspace_required=workspace_required,
+                targeted=True,
             )
         report_link(current, fresh, report)
         self.admission.release_managed(
@@ -2354,7 +2681,7 @@ class ManagedTasks:
             return
         uncertain = bool(task.get("publication_attempted") or task.get("publication"))
         if not uncertain or task.get("legacy_delivery_decision"):
-            await self._execution_gate(task)
+            await self._execution_gate(task, targeted=True)
         self.store.update(
             task_id,
             "pr_pending",
@@ -2419,7 +2746,7 @@ class ManagedTasks:
         # Lost responses may be reconciled read-only even after execution changed.
         # Preserve the observed receipt, but never certify publication as ready
         # using stale execution evidence. No retry above can re-emit the PR.
-        await self._execution_gate(task)
+        await self._execution_gate(task, targeted=True)
         if task.get("settled") and prior == pr and pr.get("state") == "merged":
             # A repeated observation cannot reopen the business phase. This is
             # not a new settlement or a fresh certification of rollout.
@@ -2499,7 +2826,7 @@ class ManagedTasks:
             raise StateError("pr_memory_write_unconfirmed")
         # Linking and memory writes yield to other work. Retain the PR receipt,
         # but do not mark it ready with edited review evidence or new execution.
-        await self._execution_gate(self.store.get(task_id))
+        await self._execution_gate(self.store.get(task_id), targeted=True)
         if pr["state"] == "merged" and spec.get("reconcile_only") is True:
             self.store.update(
                 task_id,
@@ -2534,7 +2861,7 @@ class ManagedTasks:
         Certified results are never re-observed or re-certified: an exact replay
         writes no event and sends nothing.
         """
-        self._proofs = {}
+        self._begin_operation()
         task = self.store.get(task_id)
         if self.background_work(task) == "launch":
             try:
@@ -2602,6 +2929,9 @@ class ManagedTasks:
         task = self.store.get(task_id)
         for event in self.store.prepare_returns(task_id):
             try:
+                # From here the notice may reach the origin even if the
+                # receipt is lost. It then replays unchanged, never dropped.
+                self.store.begin_return_attempt(event["id"])
                 receipt = await self.host.call(
                     "t3_thread_send",
                     dict(

@@ -238,8 +238,14 @@ async def test_n_decisions_3_expired_route_is_cleared_for_the_next_resume(system
     system.host.call = host
     from test_managed_tasks import start
 
-    first = await start(system)
-    assert first["blocked_reason"] == "TimeoutError", first
+    # The route revalidation is a read before any effect: the lost ACK does
+    # not block, the task keeps its prepared launch and the caller repeats.
+    with pytest.raises(TimeoutError) as interrupted:
+        await start(system)
+    assert interrupted.value.recovery["command"] == "oraculo task start"
+    (row,) = system.store.db.execute("SELECT id FROM managed_tasks").fetchall()
+    first = system.store.get(row[0])
+    assert first["phase"] == "launch_pending" and not first.get("blocked_reason")
     stored = system.store.get(first["id"])
     assert stored.get("decision_route")
     assert stored.get("launch_arguments")

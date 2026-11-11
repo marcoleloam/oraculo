@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import AsyncExitStack
+from datetime import datetime
 from typing import Any
 
 import httpx2
@@ -35,6 +36,30 @@ class TransportError(T3Error):
 
 class MutationUncertain(TransportError):
     pass
+
+
+# A thread in one of these statuses holds, or is about to hold, execution.
+LIVE_THREAD_STATUSES = ("preparing", "queued", "starting", "running", "waiting")
+# Ended, and not with success.
+UNSUCCESSFUL_THREAD_STATUSES = ("interrupted", "failed", "cancelled", "rolled_back")
+# Every status the host knows except ``completed`` and ``idle``. The host
+# reports ``idle`` for a thread that never ran, which the catalog rule already
+# treats as clear. The filter cannot negate: a status this list does not name
+# is not discovered.
+UNCLEAR_THREAD_STATUSES = LIVE_THREAD_STATUSES + UNSUCCESSFUL_THREAD_STATUSES
+# Rows per page of the filtered list: about 1.4 KB each on a real host.
+_UNCLEAR_PAGE = 6
+_UNCLEAR_PAGES = 200
+_ANCESTOR_READS = 100
+_CHAIN_DEPTH = 64
+
+
+def _instant(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 READ_TOOLS = frozenset(
@@ -361,18 +386,188 @@ class T3Client:
             raise ContractError("Settlement read identity mismatch")
         return snapshot
 
+    async def settlement_target(self, thread_id: str) -> dict[str, Any]:
+        """One fresh, validated read of the target: its state and run chain."""
+        snapshot = await self._settlement_read(thread_id)
+        return {
+            "thread": snapshot.thread.model_dump(mode="json"),
+            "recentRuns": [run.model_dump(mode="json") for run in snapshot.recentRuns],
+        }
+
+    async def unclear_descendants(
+        self,
+        thread_id: str,
+        project_id: str,
+        parent_thread_id: str | None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Descendants of ``thread_id`` that are live or ended without success.
+
+        Instead of the whole project catalog, the host is asked only for
+        threads (subagents included) whose status is neither ``completed``
+        nor ``idle``, newest first, in small pages. A descendant is created
+        after its ancestor, so a row last updated before the target was
+        created cannot be one; once such a row appears in a list that is
+        ordered newest first, the remaining pages are not read. Without a
+        usable creation time or order, every page of the filtered list is
+        read.
+
+        Each remaining row is traced through its parents up to a top-level
+        thread, the target, or the target's own parent (an ancestor cannot be
+        a descendant). A parent the list does not show costs one small read.
+
+        What this proves: at the time of the reads, no thread of the project
+        that the host reports as live, interrupted, failed, cancelled or
+        rolled back descends from the target. Like the catalog proof it is
+        project-scoped and not atomic. Unlike it, it trusts the host's status
+        filter and timestamps, and it does not look at completed or idle
+        threads at all: it names no successful descendant and cannot notice
+        one whose row says ``completed`` while a run is active.
+        """
+        floor = _instant(created_at)
+        rows: dict[str, Any] = {}
+        kinds: dict[str, str] = {}
+        seen_ids: set[str] = set()
+        cursor = None
+        seen_cursors: set[int] = set()
+        ordered, previous, closed, pages = floor is not None, None, False, 0
+        for _ in range(_UNCLEAR_PAGES):
+            payload = await self.call(
+                "t3_thread_list",
+                {
+                    "projectId": project_id,
+                    "includeSubagents": True,
+                    "statuses": list(UNCLEAR_THREAD_STATUSES),
+                    "limit": _UNCLEAR_PAGE,
+                    **({"cursor": cursor} if cursor is not None else {}),
+                },
+            )
+            pages += 1
+            try:
+                page = SettlementListPage.model_validate(payload)
+            except ValidationError as exc:
+                raise ContractError("Invalid T3 settlement thread list") from exc
+            if page.projectId != project_id:
+                raise ContractError("Settlement list project mismatch")
+            for row, raw in zip(page.threads, payload["threads"], strict=True):
+                # A row seen twice means the list shifted between pages and
+                # another row may have been skipped. Fail closed.
+                if row.threadId in seen_ids:
+                    raise ContractError("Duplicate settlement thread identity")
+                seen_ids.add(row.threadId)
+                updated = _instant(raw.get("updatedAt"))
+                if updated is None or (previous is not None and updated > previous):
+                    ordered = False
+                previous = updated if updated is not None else previous
+                if floor is not None and updated is not None and updated < floor:
+                    closed = True
+                    continue
+                # A host that ignores the filter returns every thread. Judge
+                # each row by its own fields; an unknown status is not clear.
+                if raw.get("activeRunId") or raw.get("pendingRequestCount"):
+                    kind = "live"
+                elif row.status in UNSUCCESSFUL_THREAD_STATUSES:
+                    kind = "unsuccessful"
+                elif row.status in ("completed", "idle"):
+                    continue
+                else:
+                    kind = "live"
+                rows[row.threadId], kinds[row.threadId] = row, kind
+            cursor = page.nextCursor
+            if cursor is None or (closed and ordered):
+                break
+            if cursor in seen_cursors:
+                raise ContractError("Repeated settlement thread list cursor")
+            seen_cursors.add(cursor)
+        else:
+            raise ContractError("Settlement project page limit exceeded")
+        parents: dict[str, str | None] = {
+            row.threadId: row.parentThreadId for row in rows.values()
+        }
+        parents[thread_id] = parent_thread_id
+        reads = 0
+        found: dict[str, list[str]] = {"live": [], "unsuccessful": []}
+        for row in rows.values():
+            if row.threadId == thread_id:
+                continue
+            current, seen = row.parentThreadId, {row.threadId}
+            while current is not None and current not in (thread_id, parent_thread_id):
+                if current in seen or len(seen) > _CHAIN_DEPTH:
+                    raise ContractError("Cyclic settlement parent links")
+                seen.add(current)
+                if current not in parents:
+                    reads += 1
+                    if reads > _ANCESTOR_READS:
+                        raise ContractError("Settlement descendant limit exceeded")
+                    ancestor = await self._settlement_read(current)
+                    if ancestor.thread.projectId != project_id:
+                        raise ContractError("Settlement descendant project mismatch")
+                    parents[current] = ancestor.thread.parentThreadId
+                current = parents[current]
+            if current is not None and current == thread_id:
+                found[kinds[row.threadId]].append(row.threadId)
+        return {
+            "target_live": kinds.get(thread_id) == "live",
+            "live": sorted(found["live"]),
+            "unsuccessful": sorted(found["unsuccessful"]),
+            "rows": len(rows),
+            "pages": pages,
+            "ancestor_reads": reads,
+            "window": "since_target_creation" if closed and ordered else "all_listed",
+        }
+
     async def settlement_snapshot(
         self,
         thread_id: str,
         *,
         terminal_only: bool = False,
         complete_runs: bool = False,
+        live_only: bool = False,
+        root: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Read bounded descendant evidence, without watching or polling.
 
         The public list API is project-scoped. This proves only descendants
         visible in that project and is not an atomic lock against new work.
+
+        ``live_only`` replaces the whole project catalog by the filtered list
+        of ``unclear_descendants``. When no live or unsuccessful descendant
+        is found, the snapshot carries no descendant rows: successful
+        descendants are not named. A caller that needs their identities or
+        run chains (a review, a delivery decision) must ask for the catalog.
+        Any live or unsuccessful descendant, or a live target, falls back to
+        the catalog. ``root`` is a ``settlement_target`` read of this target
+        made by the caller in the same operation.
         """
+        if live_only:
+            # ``root`` comes from settlement_target, already validated there.
+            target = root or await self.settlement_target(thread_id)
+            if target["thread"]["threadId"] != thread_id:
+                raise ContractError("Settlement read identity mismatch")
+            found = await self.unclear_descendants(
+                thread_id,
+                target["thread"]["projectId"],
+                target["thread"]["parentThreadId"],
+                target["thread"].get("createdAt"),
+            )
+            if not (found["target_live"] or found["live"] or found["unsuccessful"]):
+                return {
+                    "thread": target["thread"],
+                    "recentRuns": target["recentRuns"],
+                    "hasPendingChildRuns": False,
+                    "childrenObserved": True,
+                    "childrenScope": "project_unclear_statuses",
+                    "childrenProof": "status_filter",
+                    "childrenProofWindow": found["window"],
+                    "unclearThreadsObserved": found["rows"],
+                    "observedChildCount": 0,
+                    "childrenSuccessful": True,
+                    "childrenTerminal": True,
+                    "descendants": [],
+                }
+            # A descendant is live or ended without success. Only the complete
+            # catalog can describe it; the target is read again below, exactly
+            # as without this mode.
         root = await self._settlement_read(thread_id)
         project_id = root.thread.projectId
         rows: dict[str, Any] = {}

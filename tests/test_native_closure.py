@@ -494,8 +494,15 @@ async def test_batch_resume_stops_when_the_bridge_is_lost(world):
     assert by_id[first]["outcome"] == "interrupted"
     assert by_id[second]["outcome"] == "not_attempted"
     assert stored(service, second)["phase"] == "validation_submitted"
-    # The interrupted task had no effect recorded: the next batch takes it again.
-    assert native_closure.pre_effect_interruption(stored(service, first))
+    # Only reads were issued: the interrupted task keeps its phase, records a
+    # local diagnostic and carries the command to repeat. The next batch takes it.
+    interrupted = stored(service, first)
+    assert interrupted["phase"] == "validation_submitted"
+    assert interrupted.get("blocked_reason") is None
+    assert interrupted["diagnostics"][-1]["kind"] == (
+        "host_channel_interrupted_before_effect"
+    )
+    assert by_id[first]["recovery"]["command"] == "oraculo task resume"
     retry = await command(service.config, "resume-submitted", {}, host)
     assert [i["outcome"] for i in retry["tasks"]] == ["closed", "closed"]
 
