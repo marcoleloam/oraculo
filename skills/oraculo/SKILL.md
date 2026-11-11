@@ -14,7 +14,7 @@ outside that approval. Keep the originating conversation responsible for follow-
 Choose the flow before calling a tool:
 
 - **New substantive request:** check the current request's existing binding with
-  `oraculo task list` / `task status`. Resolve actual cwd/project; retain one stable
+  `oraculo task list --key KEY` / `task status`. Resolve actual cwd/project; retain one stable
   message key. Read [task flows](references/task-flows.md), then call `task start`
   once. A failed print or uncertain external effect requires reconciliation of
   that same ID/key, not a new child. A delegated executor uses its assigned ID;

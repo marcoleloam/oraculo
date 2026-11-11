@@ -32,6 +32,10 @@ cross-task waiter queue. `operations` lists every in-flight operation.
 ## Inspect before recovery
 
 Run `oraculo --config CONFIG status` and retain the full JSON receipt and time.
+By default it keeps the newest 50 plans, settlements, memory cycles, objectives
+and jobs (`--limit N`, max 500) and reports `totals` and `truncated`; `--full`
+returns every record. `runtime`, `managed_adapter`, health, capacity and
+executors are never truncated.
 `data.runtime` identifies the daemon; `data.managed_adapter` reports the owner.
 `task status` and `task list` also include `adapter` in their service response.
 Older daemons omit these fields; installing only a new CLI cannot add them.
