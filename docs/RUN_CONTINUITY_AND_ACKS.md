@@ -144,6 +144,45 @@ visible summary or stale tool-call result. The helper refuses a result file
 whose mtime predates the frame. Keep files and receipts private. Failure leaves
 the current operation uncertain; inspect status and retry the same intent.
 
+### Claude Code: `bridge relay`
+
+Claude Code records every tool call and its result in the session JSONL. With no
+ACP transport, `bridge relay` builds the ACK from that record, so no model has
+to save or copy the result:
+
+```sh
+oraculo bridge relay --frame /private/current-frame.json \
+  --session-log auto [--tool-results-dir DIR] [--wait SECONDS]
+```
+
+It prints the same line as `bridge ack`. Selection rules:
+
+- The tool name is the frame's tool, bare or as `mcp__t3-code__<tool>`. Calls on
+  the generic `mcp__t3__` server are not caller-bound and never match.
+- The call's `input` equals the frame's `arguments` under canonical JSON.
+- The call is dated at or after `issued_at`. The log repeats entries, sometimes
+  without `timestamp`: records are merged by tool_use id and the earliest dated
+  record of the call decides. A call with no dated record is refused; a dated
+  result does not date its call.
+- With several fresh calls, the earliest one is used and stderr says so. With
+  none, the exit is non-zero with `relay_result_not_found` and no ACK.
+- A result the harness replaced by a "saved to" notice is read from
+  `<session-log without .jsonl>/tool-results/` (or `--tool-results-dir`). Only
+  the file name of the notice is used, the file must not be a symlink, and an
+  mtime before the frame is refused (`native_bridge_stale_result_file`).
+- Transcripts under `<session-log without .jsonl>/**/*.jsonl` are scanned too,
+  because a subagent may have made the call.
+- Two different results recorded for one call are refused
+  (`relay_result_ambiguous`). An errored call is not a result.
+
+The bytes passed to `make_ack` are the tool's text as recorded, or the saved
+file as written. Several content blocks are passed as `{"content": blocks}`,
+which `bridge ack --from-file` already accepts. All `make_ack` checks apply:
+frame age, size, minimum fields and identity. `--session-log auto` uses
+`CLAUDE_CODE_SESSION_ID` and the working directory under
+`~/.claude/projects` (or `CLAUDE_CONFIG_DIR`), and fails when that is not one
+file. The relay does no host call and opens no service, vault or database.
+
 Hashes, schema and consistency detect corruption and certain edits/reuse, not
 all self-consistent fabrication by the local operator. A copied result with
 rewritten metadata can evade them. This is not host attestation. Actual direct

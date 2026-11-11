@@ -27,6 +27,29 @@ file contains `{"task_id":"returned-id"}`; `list` requires no payload. If the
 request is already bound, inspect it before doing anything else. Same key with
 different content is a conflict, not permission to choose another key.
 
+`task list` prints one summary per task, newest first: `id`, `title`,
+`project_id`, `phase`, `work_status`, `blocked_reason`, `admission`,
+`child_thread_id`, `updated_at`, `origin_thread_id`, `key`; plus `total` and
+`next_cursor`. Narrow it instead of reading everything:
+
+```sh
+oraculo task list --key stable-original-message-key --origin-thread ORIGIN_THREAD_ID
+oraculo task list --project PROJECT_ID --state blocked --since 24h
+oraculo task list --limit 20 --cursor NEXT_CURSOR
+```
+
+- `--key` (optionally with `--origin-thread`) finds the task already bound to a
+  request. Use it before `task start`; an empty `tasks` means no binding.
+- `--state` matches the `phase` or the `work_status`. `--since` takes an ISO time
+  or a duration (`90m`, `24h`, `7d`) and compares the last update.
+- `--limit` defaults to 50 (max 500). Pass `next_cursor` as `--cursor` for the
+  next page, with the same filters; `null` means the last page.
+- `--full` returns the full description of each task of the page. Prefer
+  `task status` for one task.
+
+`oraculo status` keeps the newest 50 records of each growing collection
+(`--limit N`) and reports `totals` and `truncated`; `--full` removes the bound.
+
 Use `cancel` with `{"task_id": ...}` only from the origin, for a task that never
 bound a child (lost launch response, unresolved reconciliation). The adapter
 rechecks the host catalog first; a visible candidate thread refuses the cancel

@@ -294,6 +294,39 @@ oraculo --config /path/to/config.toml task status --file task.json
 oraculo --config /path/to/config.toml task resume --file task.json
 ```
 
+`task list` responde com um resumo por tarefa, da mais nova para a mais antiga:
+`id`, `title`, `project_id`, `phase`, `work_status`, `blocked_reason`,
+`admission`, `child_thread_id`, `updated_at`, `origin_thread_id` e `key`, além de
+`total` (tarefas que atendem ao filtro) e `next_cursor`.
+
+| Opção | Efeito |
+| --- | --- |
+| `--project ID` | Só as tarefas do projeto. Sem projeto resolvido, vale o projeto da origem. |
+| `--state VALOR` | `phase` ou `work_status` igual ao valor. |
+| `--since QUANDO` | Atualizadas a partir de um horário ISO ou de uma duração (`90m`, `24h`, `7d`). |
+| `--limit N` | Tarefas por página. Padrão 50, máximo 500. |
+| `--cursor C` | Página seguinte: o `next_cursor` da resposta anterior, com os mesmos filtros. |
+| `--key CHAVE` | Tarefa ligada a uma chave de pedido. `--origin-thread ID` restringe à conversa de origem. |
+| `--full` | Descrição completa de cada tarefa da página. |
+
+O filtro e a paginação são feitos em SQL na leitura do daemon (ou do ledger
+offline). Só as tarefas da página são descritas, e o resumo não carrega
+relatório, contexto nem eventos. Uma página `--full` também termina ao atingir
+4 MiB; o `next_cursor` continua dali. Em `admission`, o serviço informa o estado
+atual da reserva (`admission_source=service`) e mantém o do lançamento em
+`admission_at_launch`; o ledger offline só tem o do lançamento
+(`admission_source=launch_record`).
+
+A leitura `managed.read` com `payload` vazio mantém o contrato antigo, sem
+paginação, usado pelo painel. Uma CLI nova diante de um daemon antigo aplica
+filtro e resumo no cliente e marca `paging=client_side_legacy_daemon`; nesse caso
+`--key` responde `task_list_key_requires_service_upgrade`.
+
+Se uma saída ainda passar do limite, o erro cita as opções que a reduzem
+(`--limit`, `--project`, `--state`, `--since`, `--key`, retirar `--full`).
+`--project`, `--state` e as demais opções de lista são recusadas nas outras
+ações com `task_list_flags_require_list`.
+
 `request.json` (diretórios, nomes e identidades abaixo são exemplos):
 
 ```json

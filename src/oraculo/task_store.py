@@ -598,6 +598,148 @@ class TaskStore:
             )
             return record
 
+    # `task list` pages. The summary is extracted by SQLite, so a page never
+    # loads the reports, context or events of tasks outside it.
+    LIST_LIMIT_DEFAULT = 50
+    LIST_LIMIT_MAX = 500
+    # Canonical JSON budget of one `--full` page; the CLI prints it indented.
+    LIST_FULL_BYTES = 4 * 1024 * 1024
+    _LIST_PROJECT = (
+        "coalesce(json_extract(payload,'$.project.project_id'),"
+        "json_extract(payload,'$.origin.project_id'))"
+    )
+    _LIST_SUMMARY = (
+        "json_object('title',json_extract(payload,'$.request.title'),"
+        f"'project_id',{_LIST_PROJECT},"
+        "'phase',json_extract(payload,'$.phase'),"
+        "'work_status',json_extract(payload,'$.work_status'),"
+        "'blocked_reason',json_extract(payload,'$.blocked_reason'),"
+        "'admission',json_extract(payload,'$.admission.state'),"
+        "'child_thread_id',json_extract(payload,'$.child.childThreadId'),"
+        "'observed_at',json_extract(payload,'$.observed_at'))"
+    )
+
+    @staticmethod
+    def list_query(payload) -> dict:
+        """Validated `task list` filters. An empty payload is the legacy full list."""
+        if not isinstance(payload, dict):
+            raise StateError("task_list_query_invalid")
+        query = {}
+        for name in ("project", "state", "cursor", "key", "origin_thread"):
+            value = payload.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value or len(value) > 2000:
+                raise StateError(f"task_list_{name}_invalid")
+            query[name] = value
+        since = payload.get("since")
+        if since is not None:
+            if type(since) not in (int, float) or not 0 <= since < 1e12:
+                raise StateError("task_list_since_invalid")
+            query["since"] = float(since)
+        limit = payload.get("limit", TaskStore.LIST_LIMIT_DEFAULT)
+        if type(limit) is not int or not 1 <= limit <= TaskStore.LIST_LIMIT_MAX:
+            raise StateError("task_list_limit_invalid")
+        query["limit"] = limit
+        view = payload.get("view", "summary")
+        if view not in {"summary", "full"}:
+            raise StateError("task_list_view_invalid")
+        query["view"] = view
+        if "cursor" in query and not query["cursor"].isdecimal():
+            raise StateError("task_list_cursor_invalid")
+        return query
+
+    def list_page(self, payload, *, full=None) -> dict:
+        """One filtered page, newest first. `full` describes a row for `--full`."""
+        query = self.list_query(payload)
+        where, values = [], []
+        if "project" in query:
+            where.append(f"{self._LIST_PROJECT}=?")
+            values.append(query["project"])
+        if "state" in query:
+            where.append(
+                "(json_extract(payload,'$.phase')=? OR "
+                "json_extract(payload,'$.work_status')=?)"
+            )
+            values += [query["state"]] * 2
+        if "since" in query:
+            where.append("json_extract(payload,'$.observed_at')>=?")
+            values.append(query["since"])
+        if "key" in query:
+            where.append("dedupe=?")
+            values.append(query["key"])
+        if "origin_thread" in query:
+            where.append("origin=?")
+            values.append(query["origin_thread"])
+        condition = " AND ".join(where) or "1"
+        total = self.db.execute(
+            f"SELECT count(*) FROM managed_tasks WHERE {condition}", values
+        ).fetchone()[0]
+        paged, page_values = condition, list(values)
+        if "cursor" in query:
+            paged += " AND rowid<?"
+            page_values.append(int(query["cursor"]))
+        rows = self.db.execute(
+            f"SELECT rowid,id,origin,dedupe,{self._LIST_SUMMARY} FROM managed_tasks "
+            f"WHERE {paged} ORDER BY rowid DESC LIMIT ?",
+            page_values + [query["limit"] + 1],
+        ).fetchall()
+        more = len(rows) > query["limit"]
+        rows = rows[: query["limit"]]
+        tasks, last, used = [], None, 0
+        for row in rows:
+            if full is None or query["view"] == "summary":
+                item = self._list_summary(row)
+            else:
+                item = full(row[1])
+                used += len(canonical_json(item).encode())
+                if tasks and used > self.LIST_FULL_BYTES:
+                    more = True
+                    break
+            tasks.append(item)
+            last = row[0]
+        return dict(
+            tasks=tasks,
+            total=total,
+            next_cursor=str(last) if more and last is not None else None,
+            limit=query["limit"],
+            view=query["view"] if full is not None else "summary",
+        )
+
+    @staticmethod
+    def _list_summary(row) -> dict:
+        def short(value, size):
+            if value is None or isinstance(value, (int, float)):
+                return value
+            if not isinstance(value, str):
+                value = canonical_json(value)
+            return value if len(value) <= size else value[: size - 1] + "…"
+
+        fields = json.loads(row[4])
+        observed = fields.pop("observed_at")
+        updated = None
+        if type(observed) in (int, float):
+            try:
+                updated = (
+                    time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(observed)) + "Z"
+                )
+            except (OverflowError, OSError, ValueError):
+                pass
+        return dict(
+            id=row[1],
+            title=short(fields["title"], 240),
+            project_id=short(fields["project_id"], 200),
+            phase=short(fields["phase"], 80),
+            work_status=short(fields["work_status"], 80),
+            blocked_reason=short(fields["blocked_reason"], 200),
+            admission=short(fields["admission"], 80),
+            admission_source="launch_record",
+            child_thread_id=short(fields["child_thread_id"], 400),
+            updated_at=updated,
+            origin_thread_id=short(row[2], 400),
+            key=short(row[3], 200),
+        )
+
     def describe(self, task_id: str) -> dict:
         from oraculo.presentation import task_view
 

@@ -162,6 +162,10 @@ def test_cli_list_without_host_bridge(service_config, monkeypatch, capsys):
     assert main(["--config", str(config_path), "task", "list"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "tasks": [],
+        "total": 0,
+        "next_cursor": None,
+        "limit": 50,
+        "view": "summary",
         "source": "local_ledger",
     }
 

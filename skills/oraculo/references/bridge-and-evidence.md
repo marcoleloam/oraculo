@@ -3,6 +3,7 @@
 The managed adapter uses a caller-bound host bridge. If the host exports
 `T3_ACP_MCP_NODE`, use the supported ACP transport. Otherwise use an available,
 documented bridge command or native host tools via `--stdio-host --file payload.json`.
+In Claude Code without ACP, answer the frames with `oraculo bridge relay` (below).
 Never make the daemon impersonate the parent or synthesize a host response.
 
 A harness may expose two T3 servers with the same tool names: a per-thread
@@ -33,6 +34,54 @@ existing operation's reconciliation, not reusing an ACK or creating a task.
 Prefer the supported caller-bound ACP transport when available, which relays
 actual output directly without model transcription. Do not invent an ACP binary,
 credentials or a daemon session impersonating the caller.
+
+## Claude Code without ACP: `bridge relay`
+
+In Claude Code with no `T3_ACP_MCP_NODE`, `bridge relay` is the official path. It
+reads the tool's literal output from the session log the harness already writes,
+so the model never copies, saves or re-types a result. A closure can need more
+than fifteen frames, some above 100 KB; do not relay those by hand.
+
+Keep stdin open through a FIFO and send stdout to a private regular file:
+
+```sh
+mkfifo /private/run/in.fifo
+( exec 3<> /private/run/in.fifo   # keeps the FIFO open between ACKs
+  oraculo --config CONFIG task finish --file /private/run/payload.json \
+    --stdio-host < /private/run/in.fifo > /private/run/out.txt 2> /private/run/err.txt
+  echo $? > /private/run/exit.txt ) &
+```
+
+Start it once, in the background, as one command. The same pattern serves
+`start`, `resume`, `progress` and the other bridged actions.
+
+For each new complete `ORACULO_HOST_CALL_V1` line in `out.txt`, in this order:
+
+1. Save that exact line to a frame file.
+2. Call the named tool **now**, on the caller-bound `mcp__t3-code__` server, with
+   exactly the frame's `arguments`. A call made before the frame appeared, or on
+   the generic `mcp__t3__` server, is never accepted.
+3. Run the relay and append its line to the FIFO:
+
+```sh
+oraculo bridge relay --frame /private/run/frame-N.json \
+  --session-log auto >> /private/run/in.fifo
+```
+
+`--session-log auto` resolves the log from `CLAUDE_CODE_SESSION_ID` and the
+working directory; pass the `.jsonl` path when that is ambiguous. The helper
+matches the tool and the exact arguments, requires the call to be dated at or
+after the frame's `issued_at`, and uses the earliest such call (it says so on
+stderr when there are several). Calls made by a subagent of the session are
+found. A result the harness truncated is read from the session's
+`tool-results/` directory (`--tool-results-dir` overrides it). It waits up to
+`--wait` seconds (default 10) for the harness to record the call.
+
+It prints the same line as `bridge ack` and nothing else on stdout. On
+`relay_result_not_found` there is no ACK: call the tool again and repeat the
+relay for the same frame. Never answer with a result from an earlier frame, even
+when tool and arguments are identical; every frame needs its own fresh call.
+When `exit.txt` appears the operation ended; read `out.txt` for the receipt.
 
 The stdio bridge trusts the local operator; it is not cryptographic attestation.
 Schema, hashes and consistency catch omissions, corruption and detectable reuse;
