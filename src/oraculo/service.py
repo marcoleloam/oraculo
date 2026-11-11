@@ -1474,6 +1474,11 @@ class Service:
                 response["error"]["retryable"] = True
                 if self.managed_service is not None:
                     response["error"]["adapter"] = self.managed_service.diagnostic()
+            if isinstance(getattr(exc, "recovery", None), dict):
+                # Interrupted before any host effect: the task is unchanged
+                # and the caller repeats the same command itself.
+                response["error"]["recovery"] = exc.recovery
+                response["error"]["interrupted"] = True
         try:
             async with asyncio.timeout(5):
                 writer.write(canonical_json(response).encode() + b"\n")

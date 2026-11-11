@@ -810,6 +810,11 @@ async def command(config, action, payload, transport):
                         exc.scope = error.get("scope")
                     if "adapter" in error:
                         exc.adapter = error.get("adapter")
+                    if isinstance(error.get("recovery"), dict):
+                        # The caller repeats this one; no automatic replay.
+                        exc.recovery = error["recovery"]
+                        exc.interrupted = True
+                        exc.auto_retry = False
                     raise exc
                 return frame["data"]
             if frame.get("operation_id") != operation:

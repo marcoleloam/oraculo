@@ -65,6 +65,8 @@ def task_error_receipt(exc: BaseException) -> dict:
         error["scope"] = exc.scope
     if getattr(exc, "adapter", None) is not None:
         error["adapter"] = exc.adapter
+    if getattr(exc, "recovery", None) is not None:
+        error["recovery"] = exc.recovery
     return {"ok": False, "error": error}
 
 
@@ -81,6 +83,8 @@ async def run_managed_attempts(invoke):
         except StateError as exc:
             if (
                 not _retryable_task_error(exc)
+                # An interrupted host channel is repeated by the caller.
+                or getattr(exc, "auto_retry", True) is False
                 or attempt + 1 == MANAGED_RETRY_ATTEMPTS
             ):
                 raise
