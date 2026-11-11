@@ -243,8 +243,51 @@ async def test_real_adapter_rejects_stale_bindings_unknown_policy_and_incomplete
         or result["data"]["disposition"] != "accepted"
         or result["data"]["event"]["conclusion"] != "passed"
     ), result
+    # N-ci-policy-1: review/mergeability at the same run stamp stays pending.
+    # It must not demote an accepted cursor to unverified.
+    if change in {"review", "conflict"}:
+        assert result["ok"], result
+        assert result["data"]["event"]["conclusion"] == "passed"
+        assert result["data"]["disposition"] == "readiness_pending"
+        cursor = s.state.get_meta(CIEvents.key("alpha", binding))
+        assert cursor["disposition"] == "readiness_pending"
     assert not s.ci_events.passed("alpha", binding.model_dump())
     assert s.state.acquire_grant(job["id"], "codex", "current", "owner", "run") is None
+
+
+async def test_n_ci_policy_1_review_pending_then_approval_accepts_same_sequence(
+    running_service,
+):
+    """N-ci-policy-1: approval after a pending review must not need a new run."""
+    service = running_service
+    _, host, binding, job, _ = setup(service)
+    host.review = "REVIEW_REQUIRED"
+    first = await observe(service, job)
+    assert first["ok"], first
+    assert first["data"]["event"]["conclusion"] == "passed"
+    assert first["data"]["disposition"] == "readiness_pending"
+    assert not service.ci_events.passed("alpha", binding.model_dump())
+    assert (
+        service.state.admission_blockers(job)[0]["reason"] == "ci_evidence_pending"
+    )
+    host.review = "APPROVED"
+    second = await observe(service, job)
+    assert second["ok"], second
+    assert second["data"]["disposition"] == "accepted"
+    assert second["data"]["event"]["conclusion"] == "passed"
+    assert second["data"]["event"]["sequence"] == first["data"]["event"]["sequence"]
+    assert second["data"]["event"]["event_id"] != first["data"]["event"]["event_id"]
+    assert service.ci_events.passed("alpha", binding.model_dump())
+    host.review = "REVIEW_REQUIRED"
+    drifted = await observe(service, job)
+    assert drifted["data"]["disposition"] == "readiness_pending"
+    cursor = service.state.get_meta(CIEvents.key("alpha", binding))
+    assert cursor["disposition"] == "readiness_pending"
+    assert not service.ci_events.passed("alpha", binding.model_dump())
+    host.review = "APPROVED"
+    restored = await observe(service, job)
+    assert restored["data"]["disposition"] == "accepted"
+    assert service.ci_events.passed("alpha", binding.model_dump())
 
 
 async def test_host_replay_is_idempotent_and_cancelled_job_never_admits(

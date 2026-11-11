@@ -76,7 +76,8 @@ class Settlements:
             if any(
                 c["write_state"] != "saved"
                 or (c.get("write_receipt") or {}).get("state") != "confirmed"
-                or (c.get("write_receipt") or {}).get("operation_id") != c["id"]
+                or (c.get("write_receipt") or {}).get("operation_id")
+                != c.get("publication_operation_id", c["id"])
                 or not (c.get("write_receipt") or {}).get("commit")
                 for c in cycles
             ):

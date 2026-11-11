@@ -1,5 +1,6 @@
 """Refresh a derived vault without overwriting edits or losing the last export."""
 
+import json
 import os
 
 import pytest
@@ -81,3 +82,46 @@ def test_refresh_retains_obsidian_workspace_and_new_local_configuration(tmp_path
     assert (target / ".obsidian/workspace.json").read_text() == workspace
     assert (target / ".obsidian/app.json").read_text() == '{"readableLineLength":false}'
     assert (target / "Inicio.md").read_text() == "Atual"
+
+
+def test_n_knowledge_experience_1_second_refresh_keeps_config_edits(tmp_path):
+    """N-knowledge-experience-1: a second refresh keeps the edited config bytes."""
+
+    from oraculo.memory.schema import digest
+
+    target = tmp_path / "Cofre"
+    generated = {
+        "Inicio.md": "Anterior",
+        ".obsidian/workspace.json": '{"active":"gen"}',
+        ".obsidian/graph.json": '{"search":"Fontes/"}',
+    }
+    refresh_export(target, generated)
+    workspace = '{"active":"USER EDIT"}'
+    graph = '{"search":""}'
+    (target / ".obsidian/workspace.json").write_text(workspace)
+    (target / ".obsidian/graph.json").write_text(graph)
+    first = dict(generated, **{"Inicio.md": "Atual"})
+    refresh_export(target, first)
+    manifest = json.loads((target / ".oraculo-export.json").read_text())
+    assert manifest[".obsidian/workspace.json"] == digest(
+        generated[".obsidian/workspace.json"]
+    )
+    assert manifest[".obsidian/graph.json"] == digest(generated[".obsidian/graph.json"])
+    assert (target / ".obsidian/workspace.json").read_text() == workspace
+    assert (target / ".obsidian/graph.json").read_text() == graph
+    second = dict(
+        generated,
+        **{
+            "Inicio.md": "De novo",
+            ".obsidian/workspace.json": '{"active":"gen-2"}',
+            ".obsidian/graph.json": '{"search":"outro"}',
+        },
+    )
+    refresh_export(target, second)
+    assert (target / ".obsidian/workspace.json").read_text() == workspace
+    assert (target / ".obsidian/graph.json").read_text() == graph
+    assert (target / "Inicio.md").read_text() == "De novo"
+    kept = json.loads((target / ".oraculo-export.json").read_text())
+    assert kept[".obsidian/workspace.json"] == digest(
+        second[".obsidian/workspace.json"]
+    )

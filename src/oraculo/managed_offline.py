@@ -37,7 +37,11 @@ async def cancel(config, payload: dict, host) -> dict:
     except BlockingIOError:
         raise StateError("live_service_use_socket") from None
     try:
-        fd = os.open(ledger.with_suffix(".lock"), os.O_RDWR | os.O_NOFOLLOW)
+        fd = os.open(
+            ledger.with_suffix(".lock"),
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -49,7 +53,6 @@ async def cancel(config, payload: dict, host) -> dict:
                 store.authority_owned = True
                 try:
                     engine = ManagedTasks(config, store, host, None, admission=state)
-                    engine.config_path = getattr(config, "_config_path", None)
                     result = await engine.command("cancel", payload)
                 finally:
                     store.close()

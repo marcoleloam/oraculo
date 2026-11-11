@@ -17,20 +17,81 @@ from oraculo.protocol import (
     parse_envelope,
     validate_memory_submission,
 )
+from oraculo.state import StateError
 from oraculo.stdio import print_json
 
 DEFAULT_CONFIG = Path.home() / ".config/oraculo/config.toml"
+MANAGED_RETRY_ATTEMPTS = 4
+MANAGED_RETRY_BASE_SECONDS = 0.2
+MANAGED_RETRY_MAX_SECONDS = 1.0
+# Same budget as rollout/report verification. A busy daemon can answer
+# memory.cycle.begin after the old 5s fast-path; the CLI then retries.
+MEMORY_CYCLE_TIMEOUT = 125
+_SLOW_REQUEST_KINDS = {
+    "rollout.verify",
+    "operation.report",
+    "outcome.verify",
+    "operation.prepare",
+}
+_RETRYABLE_TASK_MESSAGES = {
+    "managed_adapter_busy_retry_same_key",
+    "managed_scope_busy",
+    "memory_cycle_timeout",
+}
+
+
+def _request_timeout(kind: str) -> float:
+    if kind.startswith("memory.cycle."):
+        return MEMORY_CYCLE_TIMEOUT
+    if kind in _SLOW_REQUEST_KINDS:
+        return 125
+    return 5
+
+
+def _retryable_task_error(exc: BaseException) -> bool:
+    return bool(getattr(exc, "retryable", False)) or str(exc) in _RETRYABLE_TASK_MESSAGES
+
+
+def task_error_receipt(exc: BaseException) -> dict:
+    """Stdout receipt for a task command that could not be completed."""
+    error = {
+        "code": type(exc).__name__,
+        "message": str(exc),
+        "retryable": _retryable_task_error(exc),
+    }
+    if getattr(exc, "operation_id", None):
+        error["operation_id"] = exc.operation_id
+    if getattr(exc, "scope", None) is not None:
+        error["scope"] = exc.scope
+    if getattr(exc, "adapter", None) is not None:
+        error["adapter"] = exc.adapter
+    return {"ok": False, "error": error}
+
+
+async def _retry_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def run_managed_attempts(invoke):
+    """Retry a retryable task error a few times with the same invocation."""
+    delay = MANAGED_RETRY_BASE_SECONDS
+    for attempt in range(MANAGED_RETRY_ATTEMPTS):
+        try:
+            return await invoke()
+        except StateError as exc:
+            if (
+                not _retryable_task_error(exc)
+                or attempt + 1 == MANAGED_RETRY_ATTEMPTS
+            ):
+                raise
+            await _retry_sleep(delay)
+            delay = min(delay * 2, MANAGED_RETRY_MAX_SECONDS)
 
 
 async def request(config: Config, envelope: dict) -> dict:
     raw = canonical_json(envelope).encode()
     parse_envelope(raw)
-    timeout = (
-        125
-        if envelope["kind"]
-        in {"rollout.verify", "operation.report", "outcome.verify", "operation.prepare"}
-        else 5
-    )
+    timeout = _request_timeout(envelope["kind"])
     async with asyncio.timeout(timeout):
         reader, writer = await asyncio.open_unix_connection(
             str(config.socket_path), limit=MAX_RESPONSE_BYTES + 1
@@ -924,7 +985,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "task":
                 from oraculo.managed_service import command as managed_command
-                from oraculo.state import StateError
                 from oraculo.task_store import TaskStore
                 from oraculo.task_transport import CommandTransport, StdioHostTransport
 
@@ -940,6 +1000,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 if args.action in {"list", "status", "history"}:
+                    if args.action != "list" and not isinstance(
+                        payload.get("task_id") if isinstance(payload, dict) else None,
+                        str,
+                    ):
+                        raise ValueError("task_id_required")
                     try:
                         result = asyncio.run(
                             managed_command(config, args.action, payload, None)
@@ -1034,9 +1099,17 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     try:
-                        result = asyncio.run(offline_cancel(config, payload, transport))
+                        result = asyncio.run(
+                            run_managed_attempts(
+                                lambda: offline_cancel(config, payload, transport)
+                            )
+                        )
                         print_json(result)
                         return 1 if result.get("phase") == "blocked" else 0
+                    except StateError as exc:
+                        # The operation failed. The receipt is the command result.
+                        print_json(task_error_receipt(exc))
+                        return 1
                     finally:
                         if args.stdio_host:
                             transport.close()
@@ -1092,10 +1165,19 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 try:
                     result = asyncio.run(
-                        managed_command(config, args.action, payload, transport)
+                        run_managed_attempts(
+                            lambda: managed_command(
+                                config, args.action, payload, transport
+                            )
+                        )
                     )
                     print_json(result)
                     return 1 if result.get("phase") == "blocked" else 0
+                except StateError as exc:
+                    # Preflight upgrade errors stay on stderr. This receipt is
+                    # only the managed operation, including a retryable busy.
+                    print_json(task_error_receipt(exc))
+                    return 1
                 finally:
                     if args.stdio_host:
                         transport.close()
@@ -1111,8 +1193,6 @@ def main(argv: list[str] | None = None) -> int:
                 with Singleton(config.state_dir):
                     asyncio.run(login(config.t3_mcp_url))
                 result = {"state": "authenticated"}
-            elif args.command == "doctor":
-                result = doctor(config)
             else:
                 if args.command == "request":
                     raw = args.file.read_text() if args.file else sys.stdin.read()

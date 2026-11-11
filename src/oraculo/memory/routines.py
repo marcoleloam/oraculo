@@ -14,6 +14,7 @@ from oraculo.memory.schema import (
     links,
     parse_page,
     project_key,
+    resolve_link,
 )
 from oraculo.protocol import content_hash
 
@@ -153,20 +154,44 @@ class KnowledgeRoutines:
                 metadata, _ = parse_page(content)
             except MemoryError:
                 continue
-            consumed.update(
-                target.removesuffix(".md")
-                for value in metadata.get("sources", [])
-                for target in links(value)
-            )
+            sources = metadata.get("sources")
+            if not isinstance(sources, list):
+                continue
+            for value in sources:
+                if not isinstance(value, str):
+                    continue
+                for target in links(value):
+                    try:
+                        consumed.add(resolve_link(target, set(files), path))
+                    except MemoryError:
+                        continue
         selected, size = [], 0
+        deferred = []
         for path, content in sorted(files.items()):
-            if (
-                not path.startswith(corpus(project_id) + "/raw/")
-                or path.removesuffix(".md") in consumed
-            ):
+            if not path.startswith(corpus(project_id) + "/raw/") or path in consumed:
                 continue
             length = len(content.encode())
-            if length > 2 * 1024 * 1024 or size + length > 2 * 1024 * 1024:
+            if length > 2 * 1024 * 1024:
+                deferred.append(
+                    {
+                        "path": path,
+                        "sha256": digest(content),
+                        "code": "proposal_too_large",
+                    }
+                )
+                continue
+            if size + length > 2 * 1024 * 1024:
+                continue
+            from .compiler import nightly_source_fits
+
+            if not nightly_source_fits(project_id, path, content):
+                deferred.append(
+                    {
+                        "path": path,
+                        "sha256": digest(content),
+                        "code": "proposal_too_large",
+                    }
+                )
                 continue
             selected.append(path)
             size += length
@@ -175,6 +200,7 @@ class KnowledgeRoutines:
         return selected, {
             "scanned_documents": len(files),
             "selected_sources": len(selected),
+            "deferred_sources": deferred,
             "selected_bytes": size,
             "selection_latency_ms": (perf_counter() - started) * 1000,
         }
@@ -202,7 +228,13 @@ class KnowledgeRoutines:
             else ([], {"selected_sources": 0, "selected_bytes": 0})
         )
         if mode == "nightly" and not sources:
-            return {"state": "no_pending_sources", "mode": mode, **metrics}
+            return {
+                "state": "deferred_sources"
+                if metrics.get("deferred_sources")
+                else "no_pending_sources",
+                "mode": mode,
+                **metrics,
+            }
         evidence = {
             "routine": mode,
             "date": day,

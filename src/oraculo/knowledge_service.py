@@ -363,9 +363,12 @@ async def tick(service):
         async with service.memory_lock:
             try:
                 result = await asyncio.to_thread(work)
-            except (MemoryError, StateError, OSError) as exc:
+            except Exception as exc:
+                # One bad vault page must not abort the scheduler before dispatch.
                 service.log.warning(
-                    "knowledge routine deferred: %s", type(exc).__name__
+                    "knowledge routine deferred: %s project=%s",
+                    type(exc).__name__,
+                    project["id"],
                 )
             else:
                 if result.get("state") == "scheduled":

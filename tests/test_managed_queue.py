@@ -1,4 +1,4 @@
-"""Real Unix callers share the writer in FIFO order; work remains independent."""
+"""Callers of different scopes proceed; one scope and the caller cap do not."""
 
 import asyncio
 import json
@@ -10,120 +10,135 @@ from test_managed_tasks import initialize
 from oraculo.managed_service import command
 
 
-async def wait_for_queue(service, count):
-    async with asyncio.timeout(2):
-        while service.managed_service.diagnostic()["queued_callers"] != count:
-            await asyncio.sleep(0.005)
-
-
 async def close(writer):
     writer.close()
     await writer.wait_closed()
 
 
-async def test_concurrent_callers_wait_fifo_without_releasing_current_owner(
-    running_service,
-):
+async def test_different_scopes_progress_while_one_ack_is_open(running_service):
     service = running_service
-    first_reader, first = await open_operation(service)
+    first_reader, first = await open_operation(
+        service, action="progress", payload={"task_id": "task-a", "message": "a"}
+    )
     first_frame = json.loads(await first_reader.readline())
-    second_reader, second = await open_operation(service)
-    third_reader, third = await open_operation(service)
-    await wait_for_queue(service, 2)
-    facade = service.managed_service
-    assert facade.diagnostic()["operation_id"] == first_frame["operation_id"]
-    assert not second_reader._buffer and not third_reader._buffer
-    # A background tick must not jump ahead of waiting interactive callers.
-    await service.reconcile_managed_tasks(None)
-    assert facade.diagnostic()["operation_id"] == first_frame["operation_id"]
-    await close(first)
+    second_reader, second = await open_operation(
+        service, action="progress", payload={"task_id": "task-b", "message": "b"}
+    )
     second_frame = json.loads(await asyncio.wait_for(second_reader.readline(), 2))
-    assert second_frame["tool"] == "orchestrator_capabilities"
-    assert not third_reader._buffer
+    assert first_frame["tool"] == second_frame["tool"] == "orchestrator_capabilities"
+    assert first_frame["operation_id"] != second_frame["operation_id"]
+    diag = service.managed_service.diagnostic()
+    assert len(diag["operations"]) == 2
+    assert diag["queued_callers"] == 0
+    await service.reconcile_managed_tasks(None)
+    assert len(service.managed_service.diagnostic()["operations"]) == 2
+    await close(first)
     await close(second)
-    third_frame = json.loads(await asyncio.wait_for(third_reader.readline(), 2))
-    assert third_frame["tool"] == "orchestrator_capabilities"
-    await close(third)
     await settled(service)
-    assert not facade.waiters
     assert (
-        facade.store.db.execute("SELECT count(*) FROM managed_tasks").fetchone()[0] == 0
+        service.managed_service.store.db.execute(
+            "SELECT count(*) FROM managed_tasks"
+        ).fetchone()[0]
+        == 0
     )
 
 
-async def test_queue_timeout_preserves_owner_and_has_no_task_effect(
+async def test_same_scope_returns_operation_id_without_a_global_busy(
     running_service,
-    monkeypatch,
 ):
-    monkeypatch.setattr("oraculo.managed_service.CALLER_QUEUE_TIMEOUT", 0.03)
     service = running_service
-    owner_reader, owner = await open_operation(service)
+    owner_reader, owner = await open_operation(
+        service, action="progress", payload={"task_id": "task-a", "message": "a"}
+    )
     frame = json.loads(await owner_reader.readline())
-    queued_reader, queued = await open_operation(service)
-    reply = json.loads(await asyncio.wait_for(queued_reader.readline(), 2))
-    assert reply["error"]["message"] == "managed_adapter_busy_retry_same_key"
+    other_reader, other = await open_operation(
+        service, action="progress", payload={"task_id": "task-a", "message": "again"}
+    )
+    reply = json.loads(await asyncio.wait_for(other_reader.readline(), 2))
+    assert reply["error"]["message"] == "managed_scope_busy"
+    assert reply["error"]["retryable"] is True
+    assert reply["error"]["operation_id"] == frame["operation_id"]
+    assert reply["error"]["scope"] == {"kind": "task", "task_id": "task-a"}
     facade = service.managed_service
     assert facade.busy and facade.diagnostic()["operation_id"] == frame["operation_id"]
-    assert not facade.waiters
-    await close(queued)
+    assert facade.diagnostic()["queued_callers"] == 0
+    await close(other)
     await close(owner)
     await settled(service)
 
 
-async def test_disconnected_waiter_is_skipped_before_host_call(running_service):
+async def test_disconnect_releases_only_that_scope(running_service):
     service = running_service
-    reader, owner = await open_operation(service)
-    await reader.readline()
-    _, disconnected = await open_operation(service)
-    next_reader, next_writer = await open_operation(service)
-    await wait_for_queue(service, 2)
-    await close(disconnected)
-    await asyncio.sleep(0.01)
+    owner_reader, owner = await open_operation(
+        service, action="progress", payload={"task_id": "task-a", "message": "a"}
+    )
+    await owner_reader.readline()
+    other_reader, other = await open_operation(
+        service, action="progress", payload={"task_id": "task-b", "message": "b"}
+    )
+    other_frame = json.loads(await asyncio.wait_for(other_reader.readline(), 2))
     await close(owner)
-    frame = json.loads(await asyncio.wait_for(next_reader.readline(), 2))
-    assert frame["tool"] == "orchestrator_capabilities"
-    await close(next_writer)
+    async with asyncio.timeout(2):
+        while len(service.managed_service.diagnostic()["operations"]) != 1:
+            await asyncio.sleep(0.01)
+    remaining = service.managed_service.diagnostic()["operations"][0]
+    assert remaining["operation_id"] == other_frame["operation_id"]
+    assert remaining["scope"] == {"kind": "task", "task_id": "task-b"}
+    await close(other)
     await settled(service)
 
 
-async def test_bounded_queue_rejects_excess_without_affecting_waiters(
-    running_service,
-    monkeypatch,
+async def test_caller_cap_rejects_excess_without_the_scope_error(
+    running_service, monkeypatch
 ):
     monkeypatch.setattr("oraculo.managed_service.MAX_QUEUED_CALLERS", 1)
     service = running_service
-    reader, owner = await open_operation(service)
+    reader, owner = await open_operation(
+        service, action="progress", payload={"task_id": "task-a", "message": "a"}
+    )
     await reader.readline()
-    next_reader, queued = await open_operation(service)
-    await wait_for_queue(service, 1)
-    excess_reader, excess = await open_operation(service)
+    excess_reader, excess = await open_operation(
+        service, action="progress", payload={"task_id": "task-b", "message": "b"}
+    )
     reply = json.loads(await asyncio.wait_for(excess_reader.readline(), 2))
     assert reply["error"]["message"] == "managed_adapter_busy_retry_same_key"
+    assert reply["error"]["retryable"] is True
+    assert "operation_id" not in reply["error"]
     await close(excess)
     await close(owner)
-    assert (
-        json.loads(await next_reader.readline())["tool"] == "orchestrator_capabilities"
+    await settled(service)
+    again_reader, again = await open_operation(
+        service, action="progress", payload={"task_id": "task-b", "message": "b"}
     )
-    await close(queued)
+    assert (
+        json.loads(await asyncio.wait_for(again_reader.readline(), 2))["tool"]
+        == "orchestrator_capabilities"
+    )
+    await close(again)
     await settled(service)
 
 
-async def test_cancelled_waiter_after_wakeup_does_not_strand_next_caller(
-    running_service,
-):
+async def test_cancelling_one_connection_keeps_the_other_scope(running_service):
     service = running_service
-    reader, owner = await open_operation(service)
-    await reader.readline()
-    facade = service.managed_service
-    first = asyncio.create_task(facade.acquire_caller())
-    second = asyncio.create_task(facade.acquire_caller())
-    await wait_for_queue(service, 2)
-    first.cancel()
-    await asyncio.gather(first, return_exceptions=True)
-    assert facade.busy and len(facade.waiters) == 1
-    await close(owner)
-    await asyncio.wait_for(second, 2)
-    assert not facade.waiters
+    first_reader, first = await open_operation(
+        service, action="progress", payload={"task_id": "task-a", "message": "a"}
+    )
+    await first_reader.readline()
+    first_owner = service.managed_service.owner
+    second_reader, second = await open_operation(
+        service, action="progress", payload={"task_id": "task-b", "message": "b"}
+    )
+    second_frame = json.loads(await asyncio.wait_for(second_reader.readline(), 2))
+    first_owner.cancel()
+    await asyncio.gather(first_owner, return_exceptions=True)
+    async with asyncio.timeout(2):
+        while len(service.managed_service.diagnostic()["operations"]) != 1:
+            await asyncio.sleep(0.01)
+    remaining = service.managed_service.diagnostic()["operations"][0]
+    assert remaining["operation_id"] == second_frame["operation_id"]
+    assert remaining["task_id"] == "task-b"
+    await close(first)
+    await close(second)
     await settled(service)
 
 
@@ -161,7 +176,7 @@ async def test_simultaneous_starts_launch_independent_running_tasks(running_serv
     try:
         await asyncio.wait_for(entered.wait(), 2)
         second = asyncio.create_task(start("work-two"))
-        await wait_for_queue(service, 1)
+        await asyncio.sleep(0)
     finally:
         release.set()
     results = await asyncio.gather(first, second)

@@ -74,6 +74,52 @@ class SignedCIObserver:
         return event
 
 
+# PR readiness is not a CI failure. These blockers stay on the lifecycle
+# receipt; a green run with only these open is pending, not failed.
+READINESS_BLOCKERS = frozenset(
+    {
+        "pr_review_pending",
+        "pr_changes_requested",
+        "pr_merge_conflicts",
+        "pr_mergeability_pending",
+        "pr_merge_state_blocked",
+        "pr_is_draft",
+        "pr_target_changed",
+    }
+)
+
+
+def readiness_pending(evidence) -> bool:
+    lifecycle = (evidence or {}).get("lifecycle") or {}
+    blockers = lifecycle.get("blockers") or []
+    return (
+        isinstance(blockers, list)
+        and bool(blockers)
+        and set(blockers) <= READINESS_BLOCKERS
+    )
+
+
+def same_run_progress(event, current) -> bool:
+    """Equal run stamp with a new event id is progress, not a stale cursor.
+
+    Review and mergeability change the event id without moving updated_at.
+    A higher attempt at that same stamp is still this run. A lower attempt
+    or an older sequence is not.
+    """
+    if not current:
+        return False
+    body = current["event"]
+    return (
+        all(
+            getattr(event, key) == body[key]
+            for key in ("repository", "pr", "head", "base", "run")
+        )
+        and event.attempt >= body["attempt"]
+        and event.sequence == body["sequence"]
+        and event.event_id != body["event_id"]
+    )
+
+
 class CIEvents:
     def __init__(self, state: State):
         self.state = state
@@ -130,17 +176,24 @@ class CIEvents:
                     raise DedupeConflict("ci_event_identity_reused")
                 if live:
                     current = self.state.get_meta(cursor)
-                    if not current or current["event_hash"] != previous["event_hash"]:
-                        return dict(previous, replay=True, disposition="stale")
-                    refreshed = dict(previous, observed_at=time.time())
-                    self.state.set_meta(cursor, refreshed)
-                    return dict(refreshed, replay=True)
+                    if current and current["event_hash"] == previous["event_hash"]:
+                        refreshed = dict(previous, observed_at=time.time())
+                        self.state.set_meta(cursor, refreshed)
+                        return dict(refreshed, replay=True)
+                    # The cursor moved to another snapshot of this same run.
+                    # Selecting the stored observation again is not stale.
+                    if current and same_run_progress(event, current):
+                        selected = dict(previous, observed_at=time.time())
+                        self.state.set_meta(cursor, selected)
+                        return dict(selected, replay=True)
+                    return dict(previous, replay=True, disposition="stale")
                 return dict(previous, replay=True)
             current = self.state.get_meta(cursor)
             matched = all(
                 raw[k] == v for k, v in binding.model_dump(mode="json").items()
             )
-            stale = current and (
+            progressed = same_run_progress(event, current)
+            stale = current and not progressed and (
                 event.sequence <= current["event"]["sequence"]
                 or (
                     event.head == current["event"]["head"]
@@ -148,8 +201,21 @@ class CIEvents:
                     and event.attempt < current["event"]["attempt"]
                 )
             )
+            readiness = (
+                live
+                and matched
+                and not stale
+                and event.conclusion == "passed"
+                and readiness_pending(observer.evidence)
+            )
             disposition = (
-                "stale" if stale else "accepted" if matched else "binding_mismatch"
+                "stale"
+                if stale
+                else "binding_mismatch"
+                if not matched
+                else "readiness_pending"
+                if readiness
+                else "accepted"
             )
             receipt = dict(
                 event=raw,
@@ -167,7 +233,7 @@ class CIEvents:
                 self.state.require_orchestration_schema()
             self.state.request_begin(identity, receipt)
             self.state.set_meta(identity, receipt)
-            if disposition == "accepted":
+            if disposition in {"accepted", "readiness_pending"}:
                 self.state.set_meta(cursor, receipt)
             elif live and current:
                 self.state.set_meta(cursor, dict(current, disposition="unverified"))

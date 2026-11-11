@@ -7,6 +7,7 @@ before host mutations; a same-key delegate retry is safe under the T3 contract.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import os
 import re
@@ -34,6 +35,7 @@ from oraculo.run_continuity import (
 from oraculo.settlement import Settlements
 from oraculo.state import StateError
 from oraculo.t3.client import T3Client
+from oraculo.t3.contracts import ContractError
 from oraculo.task_store import TaskStore
 
 # A stopped original run may be followed by completed continuations in the same
@@ -41,6 +43,42 @@ from oraculo.task_store import TaskStore
 STOPPED_RUN_STATUSES = frozenset({"cancelled", "interrupted"})
 CONTINUATION_RUN_STATUSES = STOPPED_RUN_STATUSES | {"completed"}
 CERTIFIED_WORK_STATUSES = frozenset({"succeeded", "failed", "stopped"})
+# Resume must not republish a task that already left the pre-publication gate.
+# pr_pending stays out so the first publication can still be retried.
+_RESUME_STABLE_PHASES = frozenset(
+    {
+        "pr_open",
+        "pr_reconciled",
+        "pr_waiting",
+        "pr_ready",
+        "merged",
+        "settled",
+        "awaiting_approval",
+        "plan_approved",
+        "validation_ready",
+        "pr_link_pending",
+        "pr_memory_pending",
+        "pr_checks_pending",
+        "merge_pending",
+        "final_memory_pending",
+        "settlement_pending",
+    }
+)
+# Phases where the pull request is no longer being opened. A later publish
+# only re-reads the receipt.
+_CLOSURE_OBSERVATION_PHASES = frozenset(
+    {
+        "pr_checks_pending",
+        "merge_pending",
+        "merged",
+        "pr_reconciled",
+        "pr_waiting",
+        "pr_ready",
+        "final_memory_pending",
+        "settlement_pending",
+        "settled",
+    }
+)
 
 LAUNCH_HINTS = {
     "invalid_independent_flag": (
@@ -82,6 +120,20 @@ class LaunchPreflightError(StateError):
     def __init__(self, reason: str, observed: dict | None = None):
         super().__init__(reason)
         self.observed = observed or {}
+
+
+def _diagnostic_code(exc: BaseException) -> str:
+    if isinstance(exc, (StateError, ContractError)):
+        return str(exc)
+    return type(exc).__name__
+
+
+def _review_diagnosis_failure(code: str) -> dict:
+    return dict(
+        reason=code,
+        certification="not_granted_by_diagnosis",
+        missing_evidence=[code],
+    )
 
 
 def git(
@@ -148,11 +200,34 @@ class ManagedTasks:
         publisher=None,
         lifecycle=None,
         admission=None,
+        *,
+        scopes=None,
     ):
         self.config, self.store = config, store
         self.host, self.memory, self.publisher = host, memory, publisher
         self.lifecycle = lifecycle
         self.admission = admission
+        self.scopes = scopes
+        self._proofs = {}
+
+    async def _host_proof(self, name: str, arguments: dict, *, fresh: bool = False):
+        """Reuse one host result when this operation asks for the same proof.
+
+        A fresh call always hits the host, then becomes the cached proof.
+        Freshness gates are: project binding in ``_scope``; the parent thread
+        when a native retry checks ``native_retry_parent_binding_changed``;
+        the child thread in ``_observe`` and report prevalidation; the child
+        thread while reconciling an uncertain launch. Route revalidation
+        (``orchestrator_capabilities``), terminal settlement, thread catalogs,
+        ``task_status`` and effect calls (delegate, launch, PR link) do not
+        use this cache.
+        """
+        key = (name, canonical_json(arguments))
+        if not fresh and key in self._proofs:
+            return copy.deepcopy(self._proofs[key])
+        result = copy.deepcopy(await self.host.call(name, arguments))
+        self._proofs[key] = result
+        return copy.deepcopy(result)
 
     async def _identity(self) -> tuple[dict, dict]:
         caps = await self.host.call("orchestrator_capabilities", {})
@@ -167,8 +242,8 @@ class ManagedTasks:
             thread_id=thread_id, run_id=run, project_id=thread["projectId"]
         ), caps
 
-    async def _thread(self, thread_id: str) -> dict:
-        result = await self.host.call(
+    async def _thread(self, thread_id: str, *, fresh: bool = False) -> dict:
+        result = await self._host_proof(
             "t3_thread_read",
             dict(
                 threadId=thread_id,
@@ -177,18 +252,20 @@ class ManagedTasks:
                 runLimit=1,
                 maxCharsPerItem=1,
             ),
+            fresh=fresh,
         )
         thread = result["thread"]
         if thread["threadId"] != thread_id:
             raise StateError("host_thread_identity_mismatch")
         return thread
 
-    async def _projects(self) -> list[dict]:
+    async def _projects(self, *, fresh: bool = False) -> list[dict]:
         rows, cursor, seen = [], None, set()
         for _ in range(100):
-            page = await self.host.call(
+            page = await self._host_proof(
                 "t3_project_list",
                 {"limit": 100, **({"cursor": cursor} if cursor is not None else {})},
+                fresh=fresh,
             )
             rows.extend(page["projects"])
             cursor = page["nextCursor"]
@@ -200,7 +277,11 @@ class ManagedTasks:
         raise StateError("project_catalog_incomplete")
 
     async def command(self, action: str, payload: dict) -> dict:
-        # A process-level lock also serializes independent adapter invocations.
+        # One operation, one proof cache. A reused engine must not keep the
+        # previous command's host reads.
+        self._proofs = {}
+        # Offline callers take the ledger lock. The live daemon already holds
+        # that lock and serializes only this operation's scope.
         lock_path = self.store.state.path.with_suffix(".lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -210,6 +291,12 @@ class ManagedTasks:
             except BlockingIOError:
                 raise StateError("managed_adapter_busy_retry_same_key") from None
             actor, caps = await self._identity()
+            if self.scopes is not None:
+                from oraculo.managed_service import operation_scope
+
+                scope = operation_scope(action, payload, actor)
+                if scope is not None:
+                    self.scopes.claim(scope)
             if action == "list":
                 return {
                     "tasks": [
@@ -338,11 +425,27 @@ class ManagedTasks:
 
                     recovery = LegacyDeliveryRecovery(self)
                     if action == "diagnose-delivery":
+                        # A diagnosis is a read. Host and state errors stay in
+                        # the response and must not block the task.
+                        try:
+                            diagnosis = await recovery.diagnose(task, actor)
+                        except ReportValidationError:
+                            raise
+                        except (StateError, OSError) as exc:
+                            diagnosis = dict(
+                                eligible=False,
+                                missing_evidence=_diagnostic_code(exc),
+                                certification=False,
+                            )
+                        except ContractError as exc:
+                            diagnosis = dict(
+                                eligible=False,
+                                missing_evidence=str(exc),
+                                certification=False,
+                            )
                         return dict(
                             self.store.describe(task_id),
-                            legacy_delivery_diagnosis=await recovery.diagnose(
-                                task, actor
-                            ),
+                            legacy_delivery_diagnosis=diagnosis,
                         )
                     await recovery.accept(task, payload, actor)
                 elif action in {"diagnose-review", "adjudicate-review"}:
@@ -350,9 +453,18 @@ class ManagedTasks:
 
                     recovery = TaskRecovery(self)
                     if action == "diagnose-review":
+                        try:
+                            diagnosis = await recovery.diagnose_review(task)
+                        except ReportValidationError:
+                            raise
+                        except (StateError, OSError) as exc:
+                            code = _diagnostic_code(exc)
+                            diagnosis = _review_diagnosis_failure(code)
+                        except ContractError as exc:
+                            diagnosis = _review_diagnosis_failure(str(exc))
                         return dict(
                             self.store.describe(task_id),
-                            review_diagnosis=await recovery.diagnose_review(task),
+                            review_diagnosis=diagnosis,
                         )
                     await recovery.adjudicate_review(task, payload, actor)
                 elif action in {"complete-origin", "supersede"}:
@@ -448,6 +560,13 @@ class ManagedTasks:
             except ReportValidationError as exc:
                 return self._report_rejection(task_id, str(exc))
             except Exception as exc:
+                # A late memory cycle is retried with the same key. Do not
+                # persist blocked, and do not drop a reservation already taken.
+                if (
+                    getattr(exc, "retryable", False)
+                    and str(exc) == "memory_cycle_timeout"
+                ):
+                    raise
                 # Do not return raw tool errors, prompts, stderr or private path dumps.
                 code = (
                     str(exc)
@@ -619,7 +738,7 @@ class ManagedTasks:
         current = resolve_project(
             self.config,
             cwd=project["project_path"],
-            projects=await self._projects(),
+            projects=await self._projects(fresh=True),
             explicit=project["project_id"],
         )
         if any(
@@ -667,17 +786,11 @@ class ManagedTasks:
                     task, task["supersession"]["intent"], actor
                 )
                 return
-            if task["phase"] in {
-                "pr_open",
-                "pr_reconciled",
-                "pr_waiting",
-                "pr_ready",
-                "merged",
-                "settled",
-                "awaiting_approval",
-                "plan_approved",
-                "validation_ready",
-            }:
+            if (
+                task["phase"] in _RESUME_STABLE_PHASES
+                or task.get("publication")
+                or task.get("merged")
+            ):
                 delivery = task.get("delivery_review") or {}
                 if delivery.get("mandatory_validations") or delivery.get(
                     "quality_reviews"
@@ -687,9 +800,7 @@ class ManagedTasks:
             report = task.get("submitted_report") or task.get("report")
             if report:
                 await self._finish(task_id, report, task["origin"])
-                publication = task.get("publication_request") or task.get(
-                    "publication_spec"
-                )
+                publication = self._publication_intent(task)
                 if (
                     publication
                     and not self.store.get(task_id).get("legacy_delivery_decision")
@@ -736,7 +847,7 @@ class ManagedTasks:
             )
         if task.get("launch_attempted"):
             if task["transport_mode"] == "native_child":
-                caller = await self._thread(actor["thread_id"])
+                caller = await self._thread(actor["thread_id"], fresh=True)
                 source_path = (
                     caller.get("worktreePath") or task["project"]["project_path"]
                 )
@@ -853,17 +964,29 @@ class ManagedTasks:
                 "implementation", fresh, explicit=route["target"]
             )
             current = workspace(plan["ws"]["path"])
+            config_hash = content_hash(self.config.model_dump(mode="json"))
+            advice_stale = bool(route.get("selected")) and not getattr(
+                self, "decisions"
+            ).usable(route.get("advice") or {})
             if (
                 not options
                 or current != plan["ws"]
-                or content_hash(self.config.model_dump(mode="json"))
-                != route["config_hash"]
-                or (
-                    route["selected"]
-                    and not getattr(self, "decisions").usable(route["advice"])
-                )
+                or config_hash != route["config_hash"]
+                or advice_stale
                 or self.admission.get_meta("runtime_maintenance")
             ):
+                # No launch was sent. Expiry or a config change must not pin
+                # this route; the next resume derives it again.
+                if not task.get("launch_attempted") and (
+                    config_hash != route["config_hash"] or advice_stale
+                ):
+                    self.store.update(
+                        task_id,
+                        task["phase"],
+                        {"routing": "stale_route_cleared"},
+                        decision_route=None,
+                        launch_arguments=None,
+                    )
                 raise StateError("managed_route_effect_revalidation_failed")
         # launch has NO idempotency key. Persist before sending; every later call
         # only reconciles list/read, even when an empty response looks retryable.
@@ -1036,7 +1159,7 @@ class ManagedTasks:
         ]
         if len(matches) != 1:
             raise StateError("launch_uncertain_no_unique_match")
-        thread = await self._thread(matches[0]["threadId"])
+        thread = await self._thread(matches[0]["threadId"], fresh=True)
         if thread.get("branch") != task["expected_branch"]:
             raise StateError("launch_reconciliation_workspace_mismatch")
         await self._accept_launch(
@@ -1055,8 +1178,6 @@ class ManagedTasks:
             for k in ("providerInstanceId", "model")
         ):
             raise StateError("managed_route_host_target_unconfirmed")
-        if self.admission is not None:
-            self.admission.bind_managed(task["id"], receipt)
         native = task["transport_mode"] == "native_child"
         thread_id = receipt.get("childThreadId") if native else receipt.get("threadId")
         if (
@@ -1066,7 +1187,10 @@ class ManagedTasks:
                 not native and receipt.get("projectId") != task["project"]["project_id"]
             )
         ):
+            # Leave the reservation reserved so cancel can still release it.
             raise StateError("task_launch_ack_incomplete")
+        if self.admission is not None:
+            self.admission.bind_managed(task["id"], receipt)
         child = dict(
             childThreadId=thread_id,
             childRunId=receipt.get("childRunId") if native else receipt.get("runId"),
@@ -1091,7 +1215,7 @@ class ManagedTasks:
 
     async def _observe(self, task: dict) -> dict:
         child = task["child"]
-        thread = await self._thread(child["childThreadId"])
+        thread = await self._thread(child["childThreadId"], fresh=True)
         expected_parent = (
             task["origin"]["thread_id"]
             if task["transport_mode"] == "native_child"
@@ -1354,7 +1478,9 @@ class ManagedTasks:
             raise ReportValidationError("child_not_launched")
         if not result[1]:
             try:
-                thread = await self._thread(task["child"]["childThreadId"])
+                thread = await self._thread(
+                    task["child"]["childThreadId"], fresh=True
+                )
                 ws = self._report_workspace(task, thread)
                 if ws["dirty"] or report["commit"] != ws["head"]:
                     raise StateError("validated_commit_or_clean_workspace_required")
@@ -1882,7 +2008,7 @@ class ManagedTasks:
         for field in ("report", "submitted_report"):
             if task.get(field) is not None and task[field] != report:
                 raise StateError("terminal_report_reused")
-        if not task["child"].get("childRunId"):
+        if not task["child"].get("childRunId") or not task.get("child_workspace"):
             await self._observe(task)
             task = self.store.get(task_id)
         # Even a negative result requires fresh terminal/current-run evidence.
@@ -2080,12 +2206,31 @@ class ManagedTasks:
         if self._certified(task):
             if self._reservation_held(task["id"]):
                 return "release"
-            if task["phase"] == "pr_pending" and (
-                task.get("publication_request") or task.get("publication_spec")
+            if (
+                task["phase"] == "pr_pending"
+                and not task.get("publication")
+                and self._publication_intent(task)
             ):
                 return "publish"
             return None
         return "observe"
+
+    @staticmethod
+    def _publication_intent(task: dict) -> dict | None:
+        """The recorded spec wins once publication has been attempted."""
+        if task.get("publication") or task.get("publication_attempted"):
+            recorded = task.get("publication_spec")
+            if recorded:
+                return recorded
+        return task.get("publication_request") or task.get("publication_spec")
+
+    @staticmethod
+    def _publication_is_closed(task: dict) -> bool:
+        return bool(task.get("publication")) and (
+            bool(task.get("merged"))
+            or bool(task.get("settled"))
+            or task.get("phase") in _CLOSURE_OBSERVATION_PHASES
+        )
 
     @staticmethod
     def _saved(cycle: dict) -> bool:
@@ -2093,8 +2238,37 @@ class ManagedTasks:
         return (
             cycle.get("write_state") == "saved"
             and receipt.get("state") == "confirmed"
-            and receipt.get("operation_id") == cycle["id"]
+            and receipt.get("operation_id")
+            == cycle.get("publication_operation_id", cycle["id"])
             and bool(receipt.get("commit"))
+        )
+
+    async def _reobserve_publication(self, task: dict, spec: dict):
+        """Refresh a recorded receipt. Do not regress, relink, or open memory."""
+        task_id = task["id"]
+        pr = self.publisher.ensure_pr(dict(spec, task_id=task_id, reconcile_only=True))
+        prior = task.get("publication") or {}
+        if prior.get("state") == "merged" and any(
+            prior.get(key) != pr.get(key)
+            for key in (
+                "host",
+                "repository",
+                "number",
+                "url",
+                "head_sha",
+                "base",
+                "branch",
+                "repository_id",
+                "project_id",
+                "merge_sha",
+            )
+        ):
+            raise StateError("publication_merge_receipt_changed")
+        self.store.update(
+            task_id,
+            task["phase"],
+            {"publication_reobserved": pr.get("url"), "state": pr.get("state")},
+            publication=pr,
         )
 
     async def _publish(self, task_id: str, spec: dict, actor: dict):
@@ -2132,6 +2306,9 @@ class ManagedTasks:
 
         credential_reference(spec.get("credential"))
         integration_binding(spec)
+        if self._publication_is_closed(task):
+            await self._reobserve_publication(task, spec)
+            return
         uncertain = bool(task.get("publication_attempted") or task.get("publication"))
         if not uncertain or task.get("legacy_delivery_decision"):
             await self._execution_gate(task)
@@ -2305,11 +2482,14 @@ class ManagedTasks:
     async def reconcile(self, task_id: str):
         """Daemon reconciliation: read known bindings and publish queued evidence.
 
+        Each task is its own proof cache. A fresh gate still re-reads the host.
+
         No launch/delegate here. Native task_status is parent-scoped, so a daemon
         queues one idempotent resume notice to that parent instead of impersonating it.
         Certified results are never re-observed or re-certified: an exact replay
         writes no event and sends nothing.
         """
+        self._proofs = {}
         task = self.store.get(task_id)
         if self.background_work(task) == "launch":
             try:
@@ -2333,7 +2513,7 @@ class ManagedTasks:
             elif work == "publish":
                 await self._publish(
                     task_id,
-                    task.get("publication_request") or task.get("publication_spec"),
+                    self._publication_intent(task),
                     task["origin"],
                 )
             elif report:
@@ -2344,9 +2524,7 @@ class ManagedTasks:
                     and observed["hasPendingChildRuns"] is False
                 ):
                     await self._finish(task_id, report, task["origin"])
-                    publication = task.get("publication_request") or task.get(
-                        "publication_spec"
-                    )
+                    publication = self._publication_intent(self.store.get(task_id))
                     if publication:
                         await self._publish(task_id, publication, task["origin"])
             else:

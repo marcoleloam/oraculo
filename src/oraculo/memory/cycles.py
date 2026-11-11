@@ -339,12 +339,20 @@ class MemoryCycles:
             item = self.get(cycle_id)
             if "report" in item:
                 if (
-                    item["work_status"] != status
-                    or item["report"]["evidence"] != selected
+                    item["work_status"] == status
+                    and item["report"]["evidence"] == selected
+                ):
+                    return item
+                # A failed write can take corrected evidence and a new proposal.
+                # Saved and not-yet-failed reports stay immutable.
+                if not (
+                    item["write_state"] == "failed" and item["work_status"] == status
                 ):
                     raise ConflictError("memory_finish_reused")
-                return item
-            if item["work_status"] not in {"running", status}:
+                item.pop("proposal", None)
+                item["write_error"] = None
+                item["next_attempt_at"] = 0
+            elif item["work_status"] not in {"running", status}:
                 raise ConflictError("memory_finish_reused")
             finished_at = item.get("finished_at", _now())
             if rejection:
@@ -437,6 +445,9 @@ class MemoryCycles:
             plain(evidence.get("title") or evidence.get("summary"), 140)
             or "Memória da tarefa"
         )
+        # Same slash shielding as the body. markdown() leaves '/' literal, and
+        # a title like "reviews/alpha" is otherwise rejected forever.
+        visible = markdown(title).replace("/", "&#47;")
         content = render_page(
             {
                 "schema_version": 1,
@@ -445,12 +456,12 @@ class MemoryCycles:
                 "type": "source",
                 "sources": [f"[[{raw}]]"],
                 "tags": [],
-                "aliases": [markdown(title)],
+                "aliases": [visible],
                 "reviewed": False,
                 "created": day,
                 "updated": day,
             },
-            f"# {markdown(title)}\n\nWork status: {item['work_status']}\n\n"
+            f"# {visible}\n\nWork status: {item['work_status']}\n\n"
             f"Recorded: {item['finished_at']}\n\n{summary}\n\n"
             f"Structured evidence and provenance: [[{raw}]]\n",
         )
@@ -472,10 +483,106 @@ class MemoryCycles:
             "citations": [f"[[{raw}]]"],
         }
 
+    def publish_nightly(self, project_id, identity, proposal):
+        """Durable F6 intent and confirmed publisher receipt, without new raw.
+
+        Replay uses the same proposal and cycle. A crash between publication
+        and ledger update is reconciled by publish_one through the journal.
+        """
+        cycle_key = (
+            "nightly-publication:"
+            + identity["attempt_id"]
+            + ":"
+            + proposal["operation_id"]
+        )
+        cycle_id = "cycle-" + digest(_json([project_id, cycle_key]))
+        existing = self.state.connection.execute(
+            "SELECT id FROM memory_cycles WHERE id=?", (cycle_id,)
+        ).fetchone()
+
+        def prepare():
+            return self._nightly_intent(project_id, identity, proposal, cycle_key)
+
+        if existing:
+            prepare()
+            return self.publish_one(cycle_id)["write_receipt"]
+        # Register intent under the publisher lock after validation, immediately
+        # before its journal/write. A CAS refusal has no publication to reconcile.
+        return self._publish_nightly(
+            {"id": cycle_id, "publication_proposal": proposal}, before_write=prepare
+        )["write_receipt"]
+
+    def _nightly_intent(self, project_id, identity, proposal, cycle_key):
+        cycle = self.begin(
+            project_id,
+            cycle_key,
+            "",
+            identity,
+            skip_read_reason="nightly_prepared_compilation",
+        )
+        with self.state.transaction():
+            item = self.get(cycle["id"])
+            previous = item.get("publication_proposal")
+            if previous is not None and previous != proposal:
+                raise ConflictError("nightly_publication_reused")
+            if item["write_state"] != "saved":
+                item.update(
+                    publication_proposal=proposal,
+                    publication_operation_id=proposal["operation_id"],
+                    write_state="pending",
+                )
+                self._save(item)
+        return item
+
+    def _publish_nightly(self, item, *, before_write=None):
+        intent_ready = before_write is None
+
+        def prepare():
+            nonlocal intent_ready
+            before_write()
+            intent_ready = True
+
+        try:
+            kwargs = {"before_write": prepare} if before_write is not None else {}
+            receipt = self.publisher.publish(item["publication_proposal"], **kwargs)
+            if (
+                receipt.get("state") != "confirmed"
+                or receipt.get("operation_id")
+                != item["publication_proposal"]["operation_id"]
+                or not receipt.get("commit")
+            ):
+                raise MemoryError("memory_publication_unconfirmed")
+            with self.state.transaction():
+                item = self.get(item["id"])
+                item.update(
+                    work_status="succeeded",
+                    write_state="saved",
+                    write_receipt={**receipt, "at": _now()},
+                    write_error=None,
+                    next_attempt_at=0,
+                    finished_at=_now(),
+                )
+                return self._save(item)
+        except Exception as exc:
+            if not intent_ready:
+                raise
+            with self.state.transaction():
+                item = self.get(item["id"])
+                item.update(
+                    write_state="failed",
+                    write_error=f"{type(exc).__name__}:{exc}"[:1000],
+                    write_attempts=item["write_attempts"] + 1,
+                    next_attempt_at=time.time() + 300,
+                )
+                self._save(item)
+            raise
+
     def publish_one(self, cycle_id: str) -> dict:
         item = self.get(cycle_id)
         if item["write_state"] == "saved":
             return item
+        if "publication_proposal" in item:
+            return self._publish_nightly(item)
         if item["write_state"] not in {"pending", "failed"}:
             raise MemoryError("memory_report_not_ready")
         try:
@@ -490,6 +597,11 @@ class MemoryCycles:
                 item = self.get(cycle_id)
                 if item["write_state"] == "saved":
                     return item
+                # A deterministic publication error keeps the bad proposal.
+                # Drop it so the retry rebuilds from the current report.
+                error = item.get("write_error") or ""
+                if item["write_state"] == "failed" and error.startswith("MemoryError:"):
+                    item.pop("proposal", None)
                 if "proposal" not in item:
                     item["proposal"] = self._proposal(item, raw)
                 item["write_attempts"] += 1

@@ -143,7 +143,9 @@ def build_review_proposal(
         raise MemoryError("invalid_review_request")
     if not decisions:
         return _review_result("noop", None, [], project_id)
-    pages = _concept_pages(files, project_id)
+    pages, page_problems = _concept_pages(files, project_id)
+    if page_problems:
+        return _review_result("rejected", None, page_problems, project_id)
     located, problems = _bind_decisions(pages, decisions)
     if problems:
         return _review_result("rejected", None, problems, project_id)
@@ -805,27 +807,52 @@ def _retired_alerts(
 
 def _concept_pages(
     files: Mapping[str, str], project_id: str
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     prefix = corpus(project_id) + "/wiki/concepts/"
     pages = {}
+    problems = []
     for path, content in sorted(files.items()):
         if not path.startswith(prefix) or not isinstance(content, str):
             continue
-        meta, body = parse_page(content)
+        if not content.startswith("---\n"):
+            problems.append(
+                _error(
+                    path,
+                    "invalid_page",
+                    detail="frontmatter_required",
+                    project_id=project_id,
+                )
+            )
+            continue
+        try:
+            meta, body = parse_page(content)
+        except MemoryError as exc:
+            problems.append(
+                _error(path, "invalid_page", detail=str(exc), project_id=project_id)
+            )
+            continue
         if meta.get("project_id") != project_id:
+            continue
+        page_id = meta.get("page_id")
+        claims = meta.get("claims")
+        if not isinstance(page_id, str) or not page_id or not isinstance(claims, list):
+            problems.append(
+                _error(
+                    path,
+                    "invalid_page",
+                    detail="page_id_and_claims_required",
+                    project_id=project_id,
+                )
+            )
             continue
         pages[path] = {
             "path": path,
             "content": content,
             "meta": meta,
             "body": body,
-            "claims": [
-                dict(claim)
-                for claim in meta.get("claims") or []
-                if isinstance(claim, dict)
-            ],
+            "claims": [dict(claim) for claim in claims if isinstance(claim, dict)],
         }
-    return pages
+    return pages, problems
 
 
 def _bind_decisions(
@@ -848,6 +875,8 @@ def _bind_decisions(
                 )
             index[claim_id] = path
     bound = []
+    seen: set[tuple[str, str, str]] = set()
+    reserved = set(index)
     for decision in decisions:
         if not isinstance(decision, dict) or decision.get("action") not in _ACTIONS:
             problems.append({"code": "invalid_decision", "severity": "error"})
@@ -885,6 +914,31 @@ def _bind_decisions(
                 {"code": "text_required", "severity": "error", "claim_id": claim_id}
             )
             continue
+        material = _decision_material(decision)
+        signature = (str(claim_id), action, material)
+        if signature in seen:
+            problems.append(
+                {
+                    "code": "duplicate_decision",
+                    "severity": "error",
+                    "claim_id": claim_id,
+                }
+            )
+            continue
+        if action in {"pointer", "supersede"}:
+            derived = _derived_id(pages[index[claim_id]], claim_id, action, material)
+            if derived in reserved:
+                problems.append(
+                    {
+                        "code": "duplicate_decision",
+                        "severity": "error",
+                        "claim_id": claim_id,
+                        "detail": derived,
+                    }
+                )
+                continue
+            reserved.add(derived)
+        seen.add(signature)
         bound.append((index[claim_id], decision))
     return bound, problems
 
@@ -929,6 +983,33 @@ def _apply_decisions(
     return {path: edited[path] for path in touched}, findings
 
 
+def _decision_material(decision: dict[str, Any]) -> str:
+    action = decision.get("action")
+    if action == "pointer":
+        value = decision.get("pointer")
+    elif action == "supersede":
+        value = decision.get("text")
+    else:
+        value = ""
+    return value if isinstance(value, str) else ""
+
+
+def _derived_id(page: dict[str, Any], claim_id: Any, action: str, text: str) -> str:
+    return (
+        "k"
+        + digest(
+            "\0".join(
+                [
+                    str(page["meta"].get("project_id")),
+                    action,
+                    str(claim_id),
+                    text,
+                ]
+            )
+        )[:32]
+    )
+
+
 def _derived_claim(
     page: dict[str, Any],
     claim: dict[str, Any],
@@ -945,19 +1026,7 @@ def _derived_claim(
         else None
     )
     value = decision.get("value") if isinstance(decision.get("value"), str) else None
-    new_id = (
-        "k"
-        + digest(
-            "\0".join(
-                [
-                    str(page["meta"].get("project_id")),
-                    action,
-                    str(claim.get("id")),
-                    text,
-                ]
-            )
-        )[:32]
-    )
+    new_id = _derived_id(page, claim.get("id"), action, text)
     return {
         "id": new_id,
         "project_id": page["meta"].get("project_id"),
@@ -1066,8 +1135,12 @@ def _render_curated(page: dict[str, Any]) -> str:
             sources.append(link[2:-2])
     aliases = [alias for alias in meta.get("aliases") or [] if isinstance(alias, str)]
     tags = [tag for tag in meta.get("tags") or [] if isinstance(tag, str)]
+    page_id = meta.get("page_id")
+    project = meta.get("project_id")
+    if not isinstance(page_id, str) or not isinstance(project, str):
+        raise MemoryError("invalid_page")
     concept = (
-        meta.get("concept") if isinstance(meta.get("concept"), str) else meta["page_id"]
+        meta.get("concept") if isinstance(meta.get("concept"), str) else page_id
     )
     title = aliases[0] if aliases else concept
     preserved = ""
@@ -1075,8 +1148,8 @@ def _render_curated(page: dict[str, Any]) -> str:
     if marker in page["body"]:
         preserved = page["body"].split(marker, 1)[1].strip()
     return render_knowledge_page(
-        project_id=meta["project_id"],
-        page_id=meta["page_id"],
+        project_id=project,
+        page_id=page_id,
         concept=concept,
         title=title,
         claims=[canonical_claim(claim) for claim in page["claims"]],

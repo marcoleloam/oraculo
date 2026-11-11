@@ -12,7 +12,13 @@ from test_decisions import Clock, Transport, advise, answer, config, snapshot
 from test_service import command
 
 from oraculo import decision_credentials
-from oraculo.decision_recovery import ACK, acknowledge, financial_status
+from oraculo.decision_recovery import (
+    ACK,
+    acknowledge,
+    cost,
+    financial_status,
+    validate_entry,
+)
 from oraculo.decisions import PREFIX, Decisions, HTTPDecisionTransport
 from oraculo.protocol import canonical_json, content_hash
 from oraculo.state import State, StateError
@@ -497,6 +503,32 @@ async def test_corrupt_book_not_recoverable_by_ack(tmp_path, book):
     assert (await advise(engine, snapshot(event="new")))[
         "reason"
     ] == "decision_accounting_corrupt"
+
+
+async def test_n_decisions_2_nonzero_output_tokens_stay_readable(tmp_path):
+    """N-decisions-2: real output_tokens must not lock validate_entry."""
+    raw = answer()
+    raw["usage"]["output_tokens"] = 3
+    raw["usage"]["output_tokens_details"]["reasoning_tokens"] = 1
+    raw["usage"]["total_tokens"] = raw["usage"]["input_tokens"] + 3
+    engine = Decisions(
+        State(tmp_path / "state"),
+        config(),
+        transport=Transport(raw),
+    )
+    first = await advise(engine)
+    assert first["state"] == "answered", first
+    stored = engine.entries()[0]
+    assert stored["result"]["usage"]["output_tokens"] == 3
+    assert stored["charge"] == cost(
+        stored["result"]["usage"]["input_tokens"], engine.config.tariff
+    )
+    validate_entry(engine, stored)
+    second = await advise(engine, snapshot(event="later"))
+    assert second["state"] == "answered", second
+    financial = engine.status("p")["financial"]
+    assert financial["state"] == "ready"
+    assert financial["reason"] == "accounting_ready"
 
 
 async def test_unknown_result_contradictory_usage_never_ack(tmp_path):

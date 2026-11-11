@@ -288,19 +288,8 @@ def github_ci(lifecycle, binding, cwd, managed_policy=None):
                 conclusion=linked_run.get("conclusion"),
             )
         )
-    passed = passed and (
-        (
-            receipt.get("ready") is True
-            and pull.get("state") == "open"
-            and pull.get("mergeable") is True
-        )
-        or (
-            managed_policy is not None
-            and receipt.get("state") == "merged"
-            and receipt.get("merge_verification")
-            and not receipt.get("blockers")
-        )
-    )
+    # Conclusion is the CI run/check outcome only. Review and mergeability
+    # stay on the lifecycle receipt and are gated separately.
     # A bounded final read catches source/base/run/policy changes during I/O.
     if (
         read(f"/pulls/{binding.pr}") != pull

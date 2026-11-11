@@ -531,6 +531,61 @@ def test_preflight_or_existing_pr_never_persists_new_intent(repo, condition):
     assert host.created == 0
 
 
+def test_c2_oversized_title_or_body_never_persists_emission(repo):
+    """C2: deterministic title/body limits fail before create intent."""
+    spec = specification(repo)
+    host = Host(spec)
+    persisted = []
+    spec["title"] = "t" * 257
+    with pytest.raises(PublicationError) as caught:
+        GitHubPublisher(host).ensure_pr(spec, before_create=lambda: persisted.append(1))
+    assert caught.value.code == "publication_title_too_long"
+    assert caught.value.emitted is False
+    assert persisted == []
+    assert host.created == 0
+    spec["title"] = "t" * 256
+    marker = (
+        "<!-- oraculo-task:"
+        + hashlib.sha256(spec["task_id"].encode()).hexdigest()
+        + " -->"
+    )
+    prefix = "\n\n" + marker + "\n"
+    spec["body"] = "b" * (65536 - len(prefix) + 1)
+    with pytest.raises(PublicationError) as caught:
+        GitHubPublisher(host).ensure_pr(spec, before_create=lambda: persisted.append(1))
+    assert caught.value.code == "publication_body_too_long"
+    assert caught.value.emitted is False
+    assert persisted == []
+    assert host.created == 0
+
+
+def test_c7_explicit_pr_identity_mismatch_is_not_a_lost_emission(repo):
+    """C7: an explicit PR with the wrong base is not publication_uncertain."""
+    spec = specification(repo)
+    host = Host(spec)
+    row = host.row(marked=True)
+    row["base"]["ref"] = "develop"
+
+    def runner(argv, cwd):
+        if argv[0] == "gh" and argv[-1] == "repos/example/public-project/pulls/12":
+            return json.dumps(row)
+        return host(argv, cwd)
+
+    explicit = {
+        **spec,
+        "reconcile_only": True,
+        "pr_id": 12,
+        "pr_url": "https://github.com/example/public-project/pull/12",
+        "source_project_id": "example",
+        "source_commit": spec["head_sha"],
+    }
+    with pytest.raises(PublicationError) as caught:
+        GitHubPublisher(runner).ensure_pr(explicit)
+    assert caught.value.code == "publication_pr_identity_mismatch"
+    assert caught.value.emitted is False
+    assert host.created == 0
+
+
 def test_intent_callback_failure_blocks_create_and_sanitizes(repo):
     spec = specification(repo)
     host = Host(spec)

@@ -239,6 +239,34 @@ async def test_public_lifecycle_confirmed_then_destination_changed_invalidates_c
     )
 
 
+async def test_n_decisions_5_runtime_probe_error_is_audited_unknown_receipt(
+    running_service, tmp_path
+):
+    """N-decisions-5: a runtime probe RuntimeError becomes an unknown receipt."""
+    service = running_service
+    task, expected, _, operations, _ = await public_setup(service)
+    empty = tmp_path / "runtime-root"
+    empty.mkdir()
+    service.config.rollout_targets[expected.environment] = RolloutTarget(
+        runtime_root=empty
+    )
+    result = await verify(service, task)
+    assert result["ok"], result
+    assert result["data"]["state"] == "unknown"
+    history = list(
+        service.state.connection.execute(
+            "SELECT payload FROM audit_events WHERE kind='rollout_observed'"
+        )
+    )
+    assert history
+    receipt = json.loads(history[-1][0])["receipt"]
+    assert receipt["state"] == "unknown"
+    assert receipt["reason"] == "destination_unverified"
+    assert operations.get("rollout-op")["state"] == "uncertain"
+    current = service.managed_service.store.describe(task["id"])
+    assert current["rollout_verification"]["state"] == "unknown"
+
+
 async def test_caller_payload_cannot_confirm_or_override_probe(running_service):
     service = running_service
     task, _, _, _, _ = await public_setup(service)

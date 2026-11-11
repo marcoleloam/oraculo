@@ -22,7 +22,9 @@ from .schema import (
     corpus,
     digest,
     links,
+    parse_page,
     project_key,
+    redact_wikilink,
     resolve_link,
 )
 
@@ -213,11 +215,24 @@ def _candidate_paths(files: dict[str, str]) -> list[str]:
     )
 
 
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def _parse_page(path: str, content: str) -> dict[str, Any]:
-    meta, body = _frontmatter(content)
+    try:
+        meta, body = parse_page(content)
+    except MemoryError:
+        meta, body = _frontmatter(content)
+        aliases = _list_field(content, "aliases")
+        tags = _list_field(content, "tags")
+    else:
+        # Publisher pages use yaml.safe_dump, whose list items start at column 0.
+        aliases = _string_list(meta.get("aliases"))
+        tags = _string_list(meta.get("tags"))
     title = _heading(body, meta)
-    aliases = _list_field(content, "aliases")
-    tags = _list_field(content, "tags")
     body_terms = tokenize(body)
     return {
         "path": path,
@@ -383,11 +398,7 @@ def _redact(content: str, allowed: set[str], source: str) -> str:
         try:
             resolve_link(target, allowed, source)
         except MemoryError:
-            content = re.sub(
-                r"\[\[" + re.escape(target) + r"(?:\|[^\]]*)?\]\]",
-                "[referência fora do escopo omitida]",
-                content,
-            )
+            content = redact_wikilink(content, target)
     return content
 
 

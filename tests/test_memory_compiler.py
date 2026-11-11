@@ -545,3 +545,254 @@ def test_published_claims_match_knowledge_claim_and_keep_unknown_dates(tmp_path)
     ceiling = page(pub, "alpha", "teto")[0].read_text(encoding="utf-8")
     ceiling_findings = validate_knowledge(ceiling, "alpha", vault_files(pub))
     assert not any(item["severity"] == "error" for item in ceiling_findings)
+
+
+def _republish(pub, project, concept, mutate):
+    path, meta, body = page(pub, project, concept)
+    mutate(meta)
+    edited = render_page(meta, body)
+    hashes = {}
+    citations = []
+    for link in meta.get("sources") or []:
+        if not (isinstance(link, str) and link.startswith("[[") and link.endswith("]]")):
+            continue
+        raw = link[2:-2]
+        target = pub.vault / raw
+        if target.is_file():
+            hashes[raw] = digest(target.read_bytes())
+            citations.append(link)
+    pub.publish(
+        {
+            "schema_version": 1,
+            "batch_id": "edit-" + concept,
+            "operation_id": "edit-" + concept,
+            "project_id": project,
+            "source_hashes": hashes,
+            "changes": [
+                {
+                    "page_id": meta["page_id"],
+                    "path": path.relative_to(pub.vault).as_posix(),
+                    "base_sha256": digest(path.read_text(encoding="utf-8")),
+                    "content": edited,
+                }
+            ],
+            "citations": citations,
+            "findings": [],
+        }
+    )
+    return edited
+
+
+def test_n_memory_compiler_1_assessed_contest_stays_publishable(tmp_path):
+    """N-memory-compiler-1: an assessed claim can be contested and published."""
+
+    pub = publisher(tmp_path)
+    older = snapshot(
+        pub,
+        "alpha",
+        {
+            "statements": [
+                {
+                    "text": "limit max is 1",
+                    "subject": "limit",
+                    "predicate": "max",
+                    "value": "1",
+                }
+            ]
+        },
+    )
+    compile_knowledge(pub, "alpha", [older], concept="limit", apply=True)
+
+    def assess(meta):
+        claim = meta["claims"][0]
+        claim["support"] = "insufficient"
+        claim["assessment"] = {
+            "verdict": "insufficient",
+            "reviewer": "ada",
+            "reason": "one observation does not fix the limit",
+            "assessed_at": "2026-11-01T00:00:00+00:00",
+        }
+
+    _republish(pub, "alpha", "limit", assess)
+    newer = snapshot(
+        pub,
+        "alpha",
+        {
+            "statements": [
+                {
+                    "text": "limit max is 3",
+                    "subject": "limit",
+                    "predicate": "max",
+                    "value": "3",
+                }
+            ]
+        },
+    )
+    dry = compile_knowledge(pub, "alpha", [newer], concept="limit", apply=False)
+    assert dry["state"] == "proposed"
+    assert any(
+        item["code"] == "assessment_superseded_by_contest" for item in dry["findings"]
+    )
+    change = dry["proposal"]["changes"][0]
+    files = vault_files(pub)
+    files[change["path"]] = change["content"]
+    audited = validate_knowledge(change["content"], "alpha", files)
+    assert not any(item["severity"] == "error" for item in audited)
+    applied = compile_knowledge(pub, "alpha", [newer], concept="limit", apply=True)
+    assert applied["state"] == "confirmed"
+    claims = page(pub, "alpha", "limit")[1]["claims"]
+    assert {claim["value"] for claim in claims} == {"1", "3"}
+    assert {claim["support"] for claim in claims} == {"contested"}
+    assert all(claim["assessment"] is None for claim in claims)
+
+
+def test_n_memory_compiler_3_recompile_keeps_yaml_dates_and_assessment(tmp_path):
+    """N-memory-compiler-3: naive ISO and YAML dates survive recompilation."""
+
+    from datetime import date, datetime
+
+    pub = publisher(tmp_path)
+    source = snapshot(
+        pub,
+        "alpha",
+        {
+            "statements": [
+                {
+                    "text": "limit max is 1",
+                    "subject": "limit",
+                    "predicate": "max",
+                    "value": "1",
+                }
+            ]
+        },
+    )
+    compile_knowledge(pub, "alpha", [source], concept="limit", apply=True)
+    original_id = page(pub, "alpha", "limit")[1]["claims"][0]["id"]
+
+    def certify(meta):
+        claim = meta["claims"][0]
+        claim["support"] = "supported"
+        claim["assessment"] = {
+            "verdict": "supported",
+            "reviewer": "ada",
+            "reason": "the quoted raw report matches this limit",
+            "assessed_at": "2026-11-01T12:00:00",
+        }
+        claim["valid_until"] = date(2026, 12, 31)
+        claim["observed_at"] = datetime(2026, 11, 1, 12, 0, 0)
+
+    _republish(pub, "alpha", "limit", certify)
+    stored = page(pub, "alpha", "limit")[1]["claims"][0]
+    assert stored["support"] == "supported"
+    assert not isinstance(stored["valid_until"], str) or stored["valid_until"]
+    added = snapshot(pub, "alpha", {"summary": "contexto adicional sem outro teto"})
+    result = compile_knowledge(pub, "alpha", [added], concept="limit", apply=True)
+    assert result["state"] == "confirmed"
+    assert not any(
+        item["code"] == "existing_claim_downgraded" for item in result["findings"]
+    )
+    kept = next(
+        claim
+        for claim in page(pub, "alpha", "limit")[1]["claims"]
+        if claim["id"] == original_id
+    )
+    assert kept["support"] == "supported"
+    assert kept["assessment"]["verdict"] == "supported"
+    assert kept["assessment"]["assessed_at"].startswith("2026-11-01T12:00:00")
+    assert str(kept["valid_until"]).startswith("2026-12-31")
+    assert kept["observed_at"] is not None
+    assert str(kept["observed_at"]).startswith("2026-11-01T12:00:00")
+
+
+def test_n_memory_compiler_3_invalid_assessment_downgrade_is_reported(tmp_path):
+    """N-memory-compiler-3: dropping supported is recorded, not silent."""
+
+    pub = publisher(tmp_path)
+    source = snapshot(
+        pub,
+        "alpha",
+        {
+            "statements": [
+                {
+                    "text": "limit max is 1",
+                    "subject": "limit",
+                    "predicate": "max",
+                    "value": "1",
+                }
+            ]
+        },
+    )
+    compile_knowledge(pub, "alpha", [source], concept="limit", apply=True)
+    path, meta, body = page(pub, "alpha", "limit")
+    claim = meta["claims"][0]
+    claim["support"] = "supported"
+    claim["assessment"] = {
+        "verdict": "supported",
+        "reviewer": "ada",
+        "reason": "recorded before the date was corrupted",
+        "assessed_at": "not-a-date",
+    }
+    path.write_text(render_page(meta, body), encoding="utf-8")
+    relative = path.relative_to(pub.vault).as_posix()
+    catalog = json.loads(pub.catalog.read_bytes().decode("utf-8"))
+    catalog[relative] = digest(path.read_bytes())
+    pub.catalog.write_bytes(json.dumps(catalog, sort_keys=True).encode())
+    added = snapshot(pub, "alpha", {"summary": "outra nota sem teto"})
+    result = compile_knowledge(pub, "alpha", [added], concept="limit", apply=False)
+    assert result["state"] == "proposed"
+    downgraded = next(
+        item
+        for item in result["findings"]
+        if item["code"] == "existing_claim_downgraded"
+    )
+    assert downgraded["support"] == "supported"
+    assert downgraded["detail"] == "source_linked"
+    kept = next(
+        item
+        for item in parse_page(result["proposal"]["changes"][0]["content"])[0]["claims"]
+        if item["id"] == claim["id"]
+    )
+    assert kept["support"] == "source_linked"
+    assert kept["assessment"] is None
+
+
+def test_n_memory_compiler_4_contested_claim_keeps_old_evidence(tmp_path):
+    """N-memory-compiler-4: contesting a triple is not new nightly evidence."""
+
+    from oraculo.knowledge import validate_nightly_proposal
+
+    pub = publisher(tmp_path)
+    first = snapshot(
+        pub,
+        "alpha",
+        {
+            "statements": [
+                {
+                    "text": "limit max is 1",
+                    "subject": "limit",
+                    "predicate": "max",
+                    "value": "1",
+                }
+            ]
+        },
+    )
+    second = snapshot(
+        pub,
+        "alpha",
+        {
+            "statements": [
+                {
+                    "text": "limit max is 3",
+                    "subject": "limit",
+                    "predicate": "max",
+                    "value": "3",
+                }
+            ]
+        },
+    )
+    compile_knowledge(pub, "alpha", [first], concept="limit", apply=True)
+    preview = compile_knowledge(pub, "alpha", [second], concept="limit", apply=False)
+    assert preview["state"] == "proposed"
+    proposed = parse_page(preview["proposal"]["changes"][0]["content"])[0]["claims"]
+    assert {claim["support"] for claim in proposed} == {"contested"}
+    validate_nightly_proposal(pub, "alpha", preview["proposal"], [second])

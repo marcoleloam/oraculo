@@ -235,6 +235,17 @@ async def test_ready_receipt_matches_compile_and_waits_for_publisher(running_ser
     published = await _propose(service, nightly["job_id"], preview["proposal"])
     assert published["ok"], published
     assert published["data"]["state"] == "confirmed"
+    cycles = service.memory_cycles.for_objective(
+        service.state.get_job(nightly["job_id"])["objective_id"]
+    )
+    published_cycles = [c for c in cycles if c["write_state"] == "saved"]
+    assert len(published_cycles) == 1
+    assert published_cycles[0]["identity"]["job_id"] == nightly["job_id"]
+    assert published_cycles[0]["identity"]["attempt_id"]
+    assert (
+        published_cycles[0]["write_receipt"]["operation_id"] == preview["operation_id"]
+    )
+
     assert service.publisher.git.head() != head
     opened = (service.publisher.vault / preview["path"]).read_text(encoding="utf-8")
     opened_meta, _body = parse_page(opened)
@@ -465,3 +476,44 @@ async def test_foreign_source_and_poisoned_metadata_do_not_authorize(running_ser
             {"memory_operation": "ingest", "knowledge_sources": [foreign]},
         )
     assert service.publisher.git.head() == head
+
+
+async def test_rollover_ready_publishes_subset_through_grant(
+    running_service, monkeypatch
+):
+    import oraculo.memory.compiler as compiler
+
+    service = running_service
+    old = service.publisher.snapshot(
+        "alpha", json.dumps({"summary": "histórico " * 300})
+    )
+    saved = compile_knowledge(
+        service.publisher, "alpha", [old], concept=DEFAULT_NIGHTLY_CONCEPT, apply=True
+    )
+    original = (service.publisher.vault / saved["path"]).read_bytes()
+    monkeypatch.setattr(compiler, "MAX_PROPOSAL_BYTES", len(original))
+    for index in range(20):
+        service.publisher.snapshot(
+            "alpha", json.dumps({"summary": f"Nova decisão {index}", "checks": ["ok"]})
+        )
+    nightly, _, payloads = _nightly_payload(service)
+    context = await service.memory_context(
+        service.project("alpha"), payloads["nightly"]
+    )
+    receipt = context["prepared_compilation"]
+    assert receipt["status"] == "ready"
+    assert receipt["deferred_sources"]
+    assert len(receipt["frozen_sources"]) == len(
+        payloads["nightly"]["knowledge_sources"]
+    )
+    assert receipt["target_path"] != saved["path"]
+    preview = compile_knowledge(
+        service.publisher, "alpha", **receipt["lookup"]["payload"]
+    )
+    assert content_hash(preview["proposal"]) == receipt["proposal_sha256"]
+    published = await _propose(service, nightly["job_id"], preview["proposal"])
+    assert published["ok"], published
+    assert published["data"]["state"] == "confirmed"
+    assert (service.publisher.vault / saved["path"]).read_bytes() == original
+    next_sources, _ = _routines(service).pending_sources("alpha", 20)
+    assert set(next_sources) == {item["path"] for item in receipt["deferred_sources"]}

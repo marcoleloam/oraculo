@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -66,6 +67,11 @@ class Controller:
 
     def plist_bytes(self):
         return b"<plist>synthetic</plist>"
+
+    def owned_plist(self):
+        if self.failure == "plist":
+            raise rt.RuntimeError("plist_conflict")
+        return {"Label": "synthetic"}
 
     def request(self, kind, payload):
         self.steps.append(kind)
@@ -159,6 +165,122 @@ def test_failure_journal_and_rollback(setup, failure, selected):
     controller.failure = None
     rt.activate(root, bin_dir, conf, controller, rollback=True)
     assert rt.current_release(root) == "old"
+
+
+def test_e2_unacquired_service_operation_does_not_correlate(setup, monkeypatch):
+    """E2: a plain service journal that never acquired maintenance is not a holder."""
+    root, bin_dir, conf, controller = setup
+    expected = rt.config_hash(conf)
+    rt.write_json(
+        root / "operation.json",
+        dict(
+            schema_version=1,
+            operation_id="runtime-held",
+            state="recovery_required",
+            previous="old",
+            target="new",
+            config_sha256=expected,
+            token="synthetic",
+            was_running=True,
+            capacity={"effective": 3},
+        ),
+    )
+    rt.write_json(
+        root / "service-operation.json",
+        dict(
+            operation_id="plain-unacquired",
+            token=None,
+            state="acquiring_maintenance",
+        ),
+    )
+    result = rt.activate(root, bin_dir, conf, controller, "new")
+    assert result["state"] == "active"
+    assert result["operation_id"] == "runtime-held"
+    assert rt.current_release(root) == "new"
+    retired = json.loads((root / "service-operation.json").read_text())
+    assert retired["state"] == "complete"
+    assert retired["operation_id"] == "plain-unacquired"
+    assert retired["retired_by_runtime_operation"] == "runtime-held"
+    from oraculo.service_control import start_operation
+
+    monkeypatch.setattr(controller, "start", lambda **kwargs: controller.status())
+    assert (
+        start_operation(controller, retired, root / "service-operation.json")["state"]
+        == "online"
+    )
+
+
+def test_e2_acquired_service_operation_still_requires_correlation(setup):
+    root, bin_dir, conf, controller = setup
+    expected = rt.config_hash(conf)
+    rt.write_json(
+        root / "operation.json",
+        dict(
+            schema_version=1,
+            operation_id="runtime-held",
+            state="recovery_required",
+            previous="old",
+            target="new",
+            config_sha256=expected,
+            token="synthetic",
+            was_running=True,
+            capacity={"effective": 3},
+        ),
+    )
+    rt.write_json(
+        root / "service-operation.json",
+        dict(operation_id="service-held", token="other", state="stopping"),
+    )
+    with pytest.raises(rt.RuntimeError, match="maintenance_correlation"):
+        rt.activate(root, bin_dir, conf, controller, "new")
+    assert rt.current_release(root) == "old"
+
+
+def test_e4_foreign_plist_blocks_before_pointer_switch(setup):
+    """E4: plist ownership is checked before current or the launcher move."""
+    root, bin_dir, conf, controller = setup
+    controller.failure = "plist"
+    with pytest.raises(rt.RuntimeError, match="plist_conflict"):
+        rt.activate(root, bin_dir, conf, controller, "new")
+    assert rt.current_release(root) == "old"
+    assert not (root / "operation.json").exists()
+    assert not any(str(step).startswith("install:") for step in controller.steps)
+    assert "stop" not in controller.steps
+
+
+def test_e1_standalone_runtime_status_has_no_package_import(tmp_path):
+    """E1: a bare python -I can exec runtime.py before the package is installed."""
+    runtime_py = Path(__file__).resolve().parents[1] / "src" / "oraculo" / "runtime.py"
+    code = "\n".join(
+        [
+            "import runpy, sys",
+            "runtime_py, root, bin_dir = sys.argv[1:] ",
+            "sys.path[:] = [item for item in sys.path if 'site-packages' not in item and item not in ('', '.')]",
+            "sys.argv = [runtime_py, 'runtime', 'status', '--root', root, '--bin-dir', bin_dir]",
+            "runpy.run_path(runtime_py, run_name='__main__')",
+        ]
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            code,
+            str(runtime_py),
+            str(tmp_path / "root"),
+            str(tmp_path / "bin"),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("PYTHON")
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["state"] == "uninstalled"
 
 
 def test_crash_after_pointer_before_receipt_recovers(setup, monkeypatch):

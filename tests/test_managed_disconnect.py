@@ -110,9 +110,21 @@ async def test_cancelled_background_waiter_retains_busy_until_worker_exits(
         assert await asyncio.to_thread(entered.wait, 1)
         service.managed_flush.cancel()
         await asyncio.sleep(0.03)
-        assert service.managed_service.busy, "worker still owns SQLite/admission"
-        with pytest.raises(StateError, match="managed_adapter_busy_retry_same_key"):
-            await command(service.config, "start", {}, None)
+        assert service.managed_service.busy, "worker still owns the task scope"
+        held = service.managed_service.diagnostic()["operations"]
+        assert held and held[0]["mode"] == "background"
+        reader, writer = await open_operation(
+            service,
+            action="progress",
+            payload={"task_id": "task-other", "message": "go"},
+        )
+        frame = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        assert frame["tool"] == "orchestrator_capabilities"
+        assert any(
+            op["mode"] == "background" for op in service.managed_service.diagnostic()["operations"]
+        )
+        writer.close()
+        await writer.wait_closed()
     finally:
         release.set()
         await asyncio.gather(service.managed_flush, return_exceptions=True)
@@ -159,10 +171,13 @@ async def test_silent_ack_times_out_and_status_identifies_owner(
     assert active["host_request_id"] == frame["request_id"]
     assert active["timeout_seconds"] == 0.15
     other_reader, other_writer = await open_operation(service)
-    busy = json.loads(await other_reader.readline())
-    assert busy["error"]["message"] == "managed_adapter_busy_retry_same_key"
-    assert busy["error"]["retryable"] is True
-    assert busy["error"]["adapter"]["operation_id"] == frame["operation_id"]
+    other = json.loads(await asyncio.wait_for(other_reader.readline(), 2))
+    assert other["tool"] == "orchestrator_capabilities"
+    assert other["operation_id"] != frame["operation_id"]
+    diag = service.managed_service.diagnostic()
+    assert len(diag["operations"]) == 2
+    assert diag["operation_id"] == frame["operation_id"]
+    assert diag["phase"] == "host_ack"
     other_writer.close()
     await other_writer.wait_closed()
     response = json.loads(await reader.readline())
@@ -186,17 +201,24 @@ async def test_live_slow_ack_retains_operation_and_default_minutes(
         > StdioHostTransport.DEFAULT_ACK_TIMEOUT
         >= 600
     )
-    monkeypatch.setattr("oraculo.managed_service.HOST_ACK_TIMEOUT", 0.4)
+    # The first start stays inside its opening ACK until the same key has
+    # finished. That launch is real git work, so the parked ACK must outlive it.
+    monkeypatch.setattr("oraculo.managed_service.HOST_ACK_TIMEOUT", 15)
     service = running_service
     initialize(service.config.projects_root / "alpha")
     host = Caller(service.config.projects_root)
     entered = asyncio.Event()
+    release = asyncio.Event()
     original = host.call
 
+    once = True
+
     async def delayed(name, args):
-        if name == "orchestrator_capabilities":
+        nonlocal once
+        if name == "orchestrator_capabilities" and once:
+            once = False
             entered.set()
-            await asyncio.sleep(0.15)
+            await release.wait()
         return await original(name, args)
 
     monkeypatch.setattr(host, "call", delayed)
@@ -204,9 +226,12 @@ async def test_live_slow_ack_retains_operation_and_default_minutes(
         command(service.config, "start", payload(service), host)
     )
     await entered.wait()
-    with pytest.raises(StateError, match="busy_retry_same_key"):
-        await command(service.config, "start", payload(service), host)
+    # Identity is not the scope. The same key finishes while this ACK is open
+    # and stays idempotent: one child, one task.
+    other = await command(service.config, "start", payload(service), host)
+    release.set()
     task = await active
+    assert other["id"] == task["id"]
     assert task["phase"] == "executing" and len(host.created) == 1
     assert not service.managed_service.busy
 
@@ -308,8 +333,10 @@ async def test_client_disconnect_during_memory_retains_real_wait(
         diag = (await command(service.config, "list", {}, None))["adapter"]
         assert diag["state"] == "active" and diag["client_eof"] is True
         assert diag["phase"] == "memory"
-        with pytest.raises(StateError, match="busy_retry_same_key"):
+        with pytest.raises(StateError, match="managed_scope_busy") as caught:
             await command(service.config, "start", payload(service), host)
+        assert caught.value.operation_id
+        assert caught.value.retryable is True
         assert not host.created
     finally:
         release.set()
@@ -418,23 +445,42 @@ async def test_memory_timeout_then_late_service_result_keeps_same_cycle(
                 finished.set()
         return await handle(envelope)
 
+    monkeypatch.setattr("oraculo.cli.MEMORY_CYCLE_TIMEOUT", 1.0)
     monkeypatch.setattr(service, "handle", paused)
     active = asyncio.create_task(
         command(service.config, "start", payload(service), host)
     )
+    task_id = None
     try:
         await asyncio.wait_for(entered.wait(), 3)
-        result = await asyncio.wait_for(active, 7)  # Real request() five-second bound.
-        assert result["phase"] == "blocked" and not host.created
+        # The daemon loop still answers reads while this begin is outstanding.
+        status = await asyncio.wait_for(
+            request(service.config, make_envelope("status.get", "*", {})),
+            1,
+        )
+        assert status["ok"]
+        assert not active.done()
+        with pytest.raises(StateError, match="^memory_cycle_timeout$") as caught:
+            await asyncio.wait_for(active, 4)
+        assert caught.value.retryable is True
+        rows = service.managed_service.store.db.execute(
+            "SELECT payload FROM managed_tasks"
+        ).fetchall()
+        assert len(rows) == 1
+        saved = json.loads(rows[0]["payload"])
+        assert saved["phase"] != "blocked"
+        assert not saved.get("blocked_reason")
+        assert not host.created
         assert service.state.capacity()["occupied"] == 1
         assert not service.managed_service.busy
+        task_id = saved["id"]
     finally:
         release.set()
         await asyncio.wait_for(finished.wait(), 2)
     cycles = service.memory_cycles.list("alpha")
     assert len(cycles) == 1
     replay = await command(service.config, "start", payload(service), host)
-    assert replay["id"] == result["id"] and replay["phase"] == "executing"
+    assert replay["id"] == task_id and replay["phase"] == "executing"
     assert len(service.memory_cycles.list("alpha")) == 1 and len(host.created) == 1
 
 

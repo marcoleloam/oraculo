@@ -135,6 +135,88 @@ def guard(world, carry, operation="op-carry"):
         return result
 
 
+def test_b2_managed_thread_receipt_proves_carry(tmp_path):
+    """B2: a managed_thread reservation stores threadId/runId, not child* keys."""
+    from oraculo.reservation_carry import prove
+
+    conf = config(tmp_path / "config.toml")
+    loaded, state, store = open_world(conf)
+    try:
+        task_id = store.create(ORIGIN, "managed-thread", {"title": "managed-thread"})[
+            "id"
+        ]
+        receipt = {
+            "threadId": "thread:managed",
+            "projectId": "alpha",
+            "runId": "run:managed:1",
+        }
+        child = {
+            "childThreadId": receipt["threadId"],
+            "childRunId": receipt["runId"],
+        }
+        state.reserve_managed(task_id, "claudeAgent")
+        store.update(
+            task_id,
+            "launch_pending",
+            {"intent": "managed-thread"},
+            launch_attempted=True,
+        )
+        state.bind_managed(task_id, receipt)
+        store.update(
+            task_id,
+            "launch_acknowledged",
+            {"thread": child["childThreadId"]},
+            child=child,
+            transport_mode="managed_thread",
+        )
+        store.update(task_id, "executing", RUNNING, observed=RUNNING)
+        report = {"summary": "PASS managed-thread"}
+        store.update(
+            task_id,
+            "validation_submitted",
+            {
+                "report_sha256": content_hash(report),
+                "submission": {
+                    "thread_id": child["childThreadId"],
+                    "run_id": child["childRunId"],
+                },
+            },
+            submitted_report=report,
+        )
+        proof = prove(state, loaded, [task_id])
+    finally:
+        state.close()
+        store.close()
+    assert proof["tasks"][0]["transport_mode"] == "managed_thread"
+    assert proof["tasks"][0]["child_thread_id"] == "thread:managed"
+    assert proof["tasks"][0]["child_run_id"] == "run:managed:1"
+    assert proof["released"] == []
+
+
+def test_d2_cancelled_launch_does_not_block_carry(tmp_path):
+    """D2: cancelled is terminal for the carry scan even if launch was attempted."""
+    from oraculo.reservation_carry import prove
+
+    conf = config(tmp_path / "config.toml")
+    loaded, state, store = open_world(conf)
+    try:
+        held = add_task(state, store, "held")
+        stale = store.create(ORIGIN, "cancelled-legacy", {"title": "cancelled"})["id"]
+        store.update(
+            stale,
+            "cancelled",
+            {"reason": "origin_cancelled"},
+            work_status="cancelled",
+            launch_attempted=True,
+        )
+        proof = prove(state, loaded, [held])
+    finally:
+        state.close()
+        store.close()
+    assert proof["task_ids"] == [held]
+    assert [task["task_id"] for task in proof["tasks"]] == [held]
+
+
 def test_carry_accepts_finished_executors_and_preserves_everything(world):
     before = snapshot(world["config"])
     result = guard(world, world["carry"])
@@ -371,6 +453,9 @@ class Service:
 
     def plist_bytes(self):
         return b"<plist>synthetic</plist>"
+
+    def owned_plist(self):
+        return {"Label": "synthetic", "OraculoManagedRoot": str(self.root)}
 
     def request(self, kind, payload):
         self.steps.append(kind)

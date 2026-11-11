@@ -3,13 +3,16 @@ from __future__ import annotations
 import base64
 import contextlib
 import fcntl
+import html
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import unquote
 
 from oraculo.config import resources_root
 
@@ -32,6 +35,22 @@ from .schema import (
     safe_path,
     validate_page,
 )
+
+# Human-facing vault root. Obsidian and the operator edit these freely.
+# They are scaffolded when missing, and they are never integrity-gated.
+SCAFFOLD_FILES = frozenset({".gitignore", "AGENTS.md", "CLAUDE.md", "index.md"})
+
+
+def _review_reference(target: str) -> bool:
+    return "reviews/" in unquote(html.unescape(target)).replace("\\", "/").lower()
+
+
+def _review_navigation_targets(surface: str) -> list[str]:
+    targets = links(surface) + markdown_targets(surface.replace("![", "["))
+    targets += re.findall(r"(?m)^\s{0,3}\[[^\]\n]+\]:\s*<?([^\s>]+)", surface)
+    for tag in re.findall(r"<[^>]+>", surface):
+        targets += re.findall(r"""(?i)\b(?:href|src)\s*=\s*["']?([^"'\s>]+)""", tag)
+    return targets
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -109,9 +128,19 @@ class Publisher:
                         source.read_bytes() if source.is_file() else fallback.encode()
                     )
             if updates:
-                self._transaction(
-                    "initialize-" + digest(json.dumps(sorted(updates))), updates
-                )
+                operation_id = "initialize-" + digest(json.dumps(sorted(updates)))
+                journal_path = self.journals / f"{operation_id}.json"
+                if journal_path.exists():
+                    stored = json.loads(journal_path.read_bytes().decode("utf-8"))
+                    if stored.get("state") == "confirmed":
+                        # A recreated vault keeps the old receipt. Write the
+                        # missing scaffold again; do not treat that as a new
+                        # catalog baseline.
+                        self._restore_missing(updates, operation_id + "-rescaffold")
+                    else:
+                        self._transaction(operation_id, updates)
+                else:
+                    self._transaction(operation_id, updates)
 
     def initialize_project(
         self, project_id: str, templates: Path | None = None
@@ -153,9 +182,73 @@ class Publisher:
 
     def _check_integrity(self) -> None:
         for relative, expected in self._hashes().items():
+            if relative in SCAFFOLD_FILES:
+                continue
             path = safe_path(self.vault, relative)
             if not path.is_file() or digest(path.read_bytes()) != expected:
                 raise ConflictError(f"external_change:{relative}")
+
+    def _restore_missing(self, updates: dict[str, bytes], operation_id: str) -> None:
+        written: list[str] = []
+        for relative, data in updates.items():
+            target = safe_path(self.vault, relative)
+            if target.exists():
+                continue
+            atomic_write(target, data)
+            written.append(relative)
+        if written:
+            self.git.commit(written, operation_id)
+
+    def rebaseline(self) -> dict[str, Any]:
+        """Rewrite catalog.json from files tracked at the vault git HEAD.
+
+        Uses the worktree bytes of those paths so an audited repair accepts
+        the current vault. Root scaffold files stay out of the catalog. The
+        journal keeps the previous catalog and the commit. File bytes in the
+        vault are not rewritten.
+        """
+        with self.locked():
+            self._recover()
+            return self._rebaseline()
+
+    def _rebaseline(self) -> dict[str, Any]:
+        head = self.git.head()
+        if not head:
+            raise MemoryError("memory_vault_not_initialized")
+        listed = self.git.run("ls-tree", "-r", "--name-only", head).stdout.splitlines()
+        hashes: dict[str, str] = {}
+        for relative in listed:
+            if relative in SCAFFOLD_FILES:
+                continue
+            path = safe_path(self.vault, relative)
+            if path.is_file():
+                hashes[relative] = digest(path.read_bytes())
+        payload = json.dumps(hashes, sort_keys=True).encode()
+        operation_id = "rebaseline-" + digest(payload)
+        journal_path = self.journals / f"{operation_id}.json"
+        if journal_path.exists():
+            stored = json.loads(journal_path.read_bytes().decode("utf-8"))
+            if stored.get("state") == "confirmed":
+                return stored["receipt"]
+        previous = self._hashes()
+        atomic_write(self.catalog, payload)
+        receipt = {
+            "state": "confirmed",
+            "operation_id": operation_id,
+            "commit": head,
+            "paths": sorted(hashes),
+        }
+        self._save_journal(
+            journal_path,
+            {
+                "operation_id": operation_id,
+                "state": "confirmed",
+                "before_catalog": previous,
+                "catalog_sha256": digest(payload),
+                "receipt": receipt,
+            },
+        )
+        return receipt
 
     def _save_journal(self, path: Path, journal: dict[str, Any]) -> None:
         atomic_write(path, json.dumps(journal, ensure_ascii=False).encode())
@@ -217,8 +310,18 @@ class Publisher:
         commit = self.git.operation_commit(journal["operation_id"])
         if commit is None:
             commit = self.git.commit(list(updates), journal["operation_id"])
-        hashes = self._hashes()
-        hashes.update({p: digest(data) for p, data in updates.items()})
+        hashes = {
+            path: value
+            for path, value in self._hashes().items()
+            if path not in SCAFFOLD_FILES
+        }
+        hashes.update(
+            {
+                path: digest(data)
+                for path, data in updates.items()
+                if path not in SCAFFOLD_FILES
+            }
+        )
         atomic_write(self.catalog, json.dumps(hashes, sort_keys=True).encode())
         receipt = {
             "state": "confirmed",
@@ -236,7 +339,7 @@ class Publisher:
         result = []
         for path in sorted(self.journals.glob("*.json")):
             journal = json.loads(path.read_bytes().decode("utf-8"))
-            if journal["state"] != "confirmed":
+            if journal.get("state") != "confirmed" and "after" in journal:
                 result.append(self._finish(path, journal))
         return result
 
@@ -258,25 +361,42 @@ class Publisher:
             if target.exists():
                 if target.read_bytes() != data:
                     raise ConflictError("raw_hash_mismatch")
+                self._store_provenance(project_id, raw_hash, provenance)
                 return relative
+            # Provenance is keyed only by project and raw hash. Write it before
+            # the journal commits so a crash cannot drop it on the exists-retry.
+            self._store_provenance(project_id, raw_hash, provenance)
             self._transaction(
                 "raw-" + digest(project_id + raw_hash), {relative: data}, raw_hash
             )
-            provenance_dir = self.state_dir / "provenance"
-            atomic_write(
-                provenance_dir / f"{project_key(project_id)}-{raw_hash}.json",
-                json.dumps(
-                    {
-                        **(provenance or {}),
-                        "project_id": project_id,
-                        "captured_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    ensure_ascii=False,
-                ).encode(),
-            )
         return relative
 
-    def publish(self, proposal: MemoryProposal | dict[str, Any]) -> dict[str, Any]:
+    def _store_provenance(
+        self,
+        project_id: str,
+        raw_hash: str,
+        provenance: dict[str, Any] | None,
+    ) -> None:
+        path = (
+            self.state_dir / "provenance" / f"{project_key(project_id)}-{raw_hash}.json"
+        )
+        if path.exists():
+            return
+        atomic_write(
+            path,
+            json.dumps(
+                {
+                    **(provenance or {}),
+                    "project_id": project_id,
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+            ).encode(),
+        )
+
+    def publish(
+        self, proposal: MemoryProposal | dict[str, Any], *, before_write=None
+    ) -> dict[str, Any]:
         proposal = MemoryProposal.model_validate(proposal)
         serialized = proposal.model_dump_json()
         if len(serialized.encode()) > 2 * 1024 * 1024:
@@ -290,6 +410,8 @@ class Publisher:
                 stored = json.loads(journal.read_bytes().decode("utf-8"))
                 if stored.get("payload_hash") != digest(serialized):
                     raise ConflictError("operation_id_reused")
+                if before_write is not None:
+                    before_write()
                 return stored["receipt"]
             batch_path = self.state_dir / "batches" / f"{proposal.batch_id}.json"
             if batch_path.exists():
@@ -300,13 +422,16 @@ class Publisher:
                 batch_path, json.dumps({"operation_id": proposal.operation_id}).encode()
             )
             self._check_integrity()
-            return self._publish(proposal, digest(serialized))
+            return self._publish(
+                proposal, digest(serialized), before_write=before_write
+            )
 
     def _publish(
         self,
         proposal: MemoryProposal,
         payload_hash: str,
         raw_sources: dict[str, bytes] | None = None,
+        before_write=None,
     ) -> dict[str, Any]:
         from .context import Context
 
@@ -402,15 +527,22 @@ class Publisher:
                 continue
             text = content.decode()
             surface, _claims = _shield_claims(text)
+            # Embeds are navigation too, but ordinary image assets remain outside
+            # canonical link resolution. Claim text/quotes stay shielded as data.
+            for target in _review_navigation_targets(surface):
+                if _review_reference(target):
+                    raise MemoryError("review_reference_in_canonical")
             for target in links(surface) + markdown_targets(surface):
                 resolve_link(target, known, path)
             meta, _ = parse_page(text)
             note = meta.get("source_note")
             if isinstance(note, str) and not note.startswith("[["):
+                if _review_reference(note):
+                    raise MemoryError("review_reference_in_canonical")
                 resolve_link(note, known, path)
-            if "reviews/" in content.decode():
-                raise MemoryError("review_reference_in_canonical")
         for citation in proposal.citations:
+            if _review_reference(citation):
+                raise MemoryError("review_reference_in_canonical")
             resolve_link(citation.removeprefix("[[").removesuffix("]]"), known)
         all_pages = {**pages, **{p: b.decode() for p, b in updates.items()}}
         own_pages = sorted(
@@ -432,6 +564,8 @@ class Publisher:
             previous
             + f"\n## [{today}] ingest | {proposal.batch_id}\n\nbatch_id: {proposal.batch_id}\noperation_id: {proposal.operation_id}\n"
         ).encode()
+        if before_write is not None:
+            before_write()
         return self._transaction(
             proposal.operation_id,
             updates,

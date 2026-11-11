@@ -199,6 +199,92 @@ def test_crash_after_publisher_commit_replays_without_duplicate(cycles, monkeypa
     assert log.count("operation_id: " + first["id"]) == 1
 
 
+def test_f2_slash_title_publishes_and_failed_write_can_be_corrected(
+    cycles, monkeypatch
+):
+    """F2: reviews/ in a title must not trap the cycle, and repair can resubmit."""
+    item = start(cycles)
+    cycles.finish(
+        item["id"],
+        "succeeded",
+        {
+            "title": "Don't move pages under reviews/alpha",
+            "summary": "kept",
+        },
+    )
+    saved = cycles.publish_one(item["id"])
+    assert saved["write_state"] == "saved", saved.get("write_error")
+    text = (
+        cycles.publisher.vault / saved["proposal"]["changes"][0]["path"]
+    ).read_text()
+    assert "reviews/" not in text
+    assert "Don't move pages under reviews&#47;alpha" in text
+
+    other = start(cycles, "run-cached")
+    cycles.finish(other["id"], "failed", {"summary": "clean summary"})
+    bad = cycles._proposal(
+        cycles.get(other["id"]), "projects/alpha/raw/" + ("a" * 64) + ".md"
+    )
+    bad["changes"][0]["content"] = bad["changes"][0]["content"].replace(
+        "clean summary", "clean summary reviews/alpha"
+    )
+    with cycles.state.transaction():
+        stored = cycles.get(other["id"])
+        stored.update(
+            proposal=bad,
+            write_state="failed",
+            write_error="MemoryError:review_reference_in_canonical",
+            next_attempt_at=0,
+        )
+        cycles._save(stored)
+    retried = cycles.retry_write(other["id"])
+    assert retried["write_state"] == "saved", retried.get("write_error")
+    retried_text = (
+        cycles.publisher.vault / retried["proposal"]["changes"][0]["path"]
+    ).read_text()
+    assert "reviews/" not in retried_text
+    assert "clean summary" in retried_text
+
+    corrected_source = start(cycles, "run-correct")
+    cycles.finish(
+        corrected_source["id"], "failed", {"title": "first title", "summary": "first"}
+    )
+    with pytest.raises(ConflictError, match="memory_finish_reused"):
+        cycles.finish(
+            corrected_source["id"], "failed", {"title": "too soon", "summary": "no"}
+        )
+    real_publish = cycles.publisher.publish
+
+    def fail_publish(proposal):
+        raise MemoryError("review_reference_in_canonical")
+
+    monkeypatch.setattr(cycles.publisher, "publish", fail_publish)
+    failed = cycles.publish_one(corrected_source["id"])
+    assert failed["write_state"] == "failed"
+    assert failed["proposal"]["changes"][0]["content"]
+    monkeypatch.setattr(cycles.publisher, "publish", real_publish)
+    corrected = cycles.finish(
+        corrected_source["id"],
+        "failed",
+        {"title": "corrected title", "summary": "second"},
+    )
+    assert corrected["write_state"] == "pending"
+    assert "proposal" not in corrected
+    assert corrected["report"]["evidence"]["summary"] == "second"
+    published = cycles.publish_one(corrected_source["id"])
+    assert published["write_state"] == "saved", published.get("write_error")
+    published_text = (
+        cycles.publisher.vault / published["proposal"]["changes"][0]["path"]
+    ).read_text()
+    assert "corrected title" in published_text
+    with pytest.raises(ConflictError, match="memory_finish_reused"):
+        cycles.finish(
+            corrected_source["id"],
+            "failed",
+            {"title": "too late", "summary": "nope"},
+        )
+
+
 def test_conflict_is_preserved_and_retry_recovers(cycles):
     cycles.publisher.publish(proposal())
     path = cycles.publisher.vault / proposal()["changes"][0]["path"]

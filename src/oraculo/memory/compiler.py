@@ -12,6 +12,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any
 
+from oraculo.memory.claims import _coerce_date
 from oraculo.memory.schema import (
     ConflictError,
     MemoryError,
@@ -27,6 +28,7 @@ from oraculo.memory.schema import (
 MAX_SOURCES = 20
 MAX_PAGES = 20
 MAX_PROPOSAL_BYTES = 2 * 1024 * 1024
+DEFAULT_NIGHTLY_CONCEPT = "Compilação noturna incremental"
 PLACEHOLDER_DATE = "1970-01-01"
 CLAIM_FIELDS = (
     "id",
@@ -88,10 +90,6 @@ _INSTRUCTION = re.compile(
     r")"
 )
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,40}")
-_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
-_AWARE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})"
-)
 
 
 def concept_page_id(project_id: str, concept: str) -> str:
@@ -190,6 +188,7 @@ def compile_knowledge(
     union = _union_sources(recorded, selected)
     operation_id = _operation_id(project_id, concept, version, union)
     extracted, findings = _extract_all(project_id, concept, selected, current["claims"])
+    findings = list(current.get("claim_findings") or []) + findings
     claims = _merge_claims(current["claims"], extracted)
     claims, contest_findings = _mark_contests(claims)
     findings.extend(contest_findings)
@@ -211,6 +210,22 @@ def compile_knowledge(
     )
     encoded = proposal.model_dump_json().encode()
     if len(proposal.changes) > MAX_PAGES or len(encoded) > MAX_PROPOSAL_BYTES:
+        if (
+            concept == DEFAULT_NIGHTLY_CONCEPT
+            and current["meta"].get("reviewed") is not True
+        ):
+            return _nightly_overflow(
+                publisher,
+                project_id,
+                selected,
+                version,
+                apply,
+                {
+                    "code": "proposal_too_large",
+                    "pages": len(proposal.changes),
+                    "bytes": len(encoded),
+                },
+            )
         return _result(
             "rejected",
             operation_id,
@@ -266,6 +281,16 @@ def compile_knowledge(
             page_id=current["page_id"],
             path=current["path"],
         )
+    except MemoryError as exc:
+        return _result(
+            "rejected",
+            operation_id,
+            version,
+            findings=findings + [{"code": str(exc)}],
+            proposal=payload,
+            page_id=current["page_id"],
+            path=current["path"],
+        )
     return _result(
         "confirmed",
         operation_id,
@@ -276,6 +301,103 @@ def compile_knowledge(
         page_id=current["page_id"],
         path=current["path"],
     )
+
+
+def nightly_shard_concept(manifest):
+    return (
+        DEFAULT_NIGHTLY_CONCEPT
+        + " / lote "
+        + digest(json.dumps(manifest, separators=(",", ":")))[:40]
+    )
+
+
+def nightly_source_fits(project_id, path, text):
+    """Pure admission check for a complete raw on an empty nightly shard."""
+    sha = digest(text)
+    source = {"path": path, "sha256": sha, "text": text, "raw": text.encode()}
+    manifest = [(path, sha)]
+    concept = nightly_shard_concept(manifest)
+    page_id = concept_page_id(project_id, concept)
+    claims, findings = _extract_all(project_id, concept, [source], [])
+    claims, contests = _mark_contests(claims)
+    proposal = _proposal(
+        None,
+        project_id=project_id,
+        concept=concept,
+        title=concept,
+        version="1",
+        operation_id=_operation_id(project_id, concept, "1", manifest),
+        page_id=page_id,
+        path=concept_page_path(project_id, page_id),
+        base=None,
+        claims=claims,
+        union=manifest,
+        prior={},
+        preserved="",
+        findings=findings + contests,
+    )
+    return len(proposal.model_dump_json().encode()) <= MAX_PROPOSAL_BYTES
+
+
+def _nightly_overflow(publisher, project_id, selected, version, apply, overflow):
+    """Roll over a full nightly page; never trim raw or rewrite its old claims.
+
+    A shard identity is derived from its complete immutable source manifest.
+    Shrinking a batch only defers whole sources. An individually oversized
+    source cannot prevent another selected source from progressing.
+    """
+    ordered = sorted(selected, key=lambda item: item["path"])
+    for start in range(len(ordered)):
+        count = len(ordered) - start
+        while count:
+            batch = ordered[start : start + count]
+            manifest = [(item["path"], item["sha256"]) for item in batch]
+            shard = nightly_shard_concept(manifest)
+            paths = [item["path"] for item in batch]
+            preview = compile_knowledge(
+                publisher,
+                project_id,
+                paths,
+                concept=shard,
+                version=version,
+                apply=False,
+            )
+            if preview["state"] != "rejected" or not any(
+                item.get("code") == "proposal_too_large" for item in preview["findings"]
+            ):
+                if apply and preview["state"] == "proposed":
+                    preview = compile_knowledge(
+                        publisher,
+                        project_id,
+                        paths,
+                        concept=shard,
+                        version=version,
+                        apply=True,
+                    )
+                preview["target_concept"] = shard
+                preview["compiled_sources"] = paths
+                preview["deferred_sources"] = [
+                    {
+                        "path": item["path"],
+                        "sha256": item["sha256"],
+                        "code": "proposal_too_large",
+                    }
+                    for item in ordered
+                    if item["path"] not in paths
+                ]
+                preview["findings"] = [
+                    overflow,
+                    {"code": "nightly_page_rollover"},
+                ] + preview["findings"]
+                return preview
+            count //= 2
+    result = _result("deferred", None, version, findings=[overflow])
+    result["compiled_sources"] = []
+    result["deferred_sources"] = [
+        {"path": item["path"], "sha256": item["sha256"], "code": "proposal_too_large"}
+        for item in ordered
+    ]
+    return result
 
 
 def render_knowledge_page(
@@ -478,11 +600,13 @@ def _load_current(
                 ],
             }
     recorded = _recorded(meta, concept)
+    claims, claim_findings = _existing_claims(meta)
     return {
         "path": relative,
         "page_id": str(meta.get("page_id") or page_id),
         "meta": meta,
-        "claims": _existing_claims(meta),
+        "claims": claims,
+        "claim_findings": claim_findings,
         "recorded": recorded,
         "preserved": _preserved(meta, body),
         "content": content,
@@ -512,11 +636,34 @@ def _recorded(meta: dict[str, Any], concept: str) -> dict[str, Any] | None:
     return {"version": version, "operation_id": operation, "sources": sources}
 
 
-def _existing_claims(meta: dict[str, Any]) -> list[dict[str, Any]]:
+def _existing_claims(
+    meta: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     claims = meta.get("claims")
     if not isinstance(claims, list):
-        return []
-    return [canonical_claim(claim) for claim in claims if isinstance(claim, dict)]
+        return [], []
+    normalized: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        canonical = canonical_claim(claim)
+        previous = claim.get("support")
+        if (
+            isinstance(previous, str)
+            and previous in SUPPORTS
+            and canonical["support"] != previous
+        ):
+            findings.append(
+                {
+                    "code": "existing_claim_downgraded",
+                    "claim_id": canonical["id"],
+                    "support": previous,
+                    "detail": canonical["support"],
+                }
+            )
+        normalized.append(canonical)
+    return normalized, findings
 
 
 def _preserved(meta: dict[str, Any], body: str) -> str:
@@ -941,11 +1088,16 @@ def _triple(statement: dict[str, Any]) -> tuple[str, str, str] | None:
 
 
 def _explicit_date(value: Any) -> str | None:
-    if not isinstance(value, str):
+    """Accept the same dates ``claims._coerce_date`` publishes.
+
+    YAML may yield ``date`` or ``datetime`` objects, and a reviewer may write a
+    naive ISO timestamp. Those stay on the claim. Unparseable values stay null.
+    """
+
+    try:
+        return _coerce_date(value)
+    except MemoryError:
         return None
-    if _DATE.fullmatch(value) or _AWARE.fullmatch(value):
-        return value
-    return None
 
 
 def supersedes_ids(value: Any) -> list[str]:
@@ -1047,16 +1199,16 @@ def _canonical_assessment(value: Any, support: str) -> dict[str, str] | None:
         return None
     reviewer = value.get("reviewer")
     reason = value.get("reason")
-    assessed_at = value.get("assessed_at")
+    assessed_at = _explicit_date(value.get("assessed_at"))
     if not all(isinstance(item, str) and item.strip() for item in (reviewer, reason)):
         return None
-    if _explicit_date(assessed_at) is None:
+    if assessed_at is None:
         return None
     return {
         "verdict": support,
         "reviewer": reviewer.strip(),
         "reason": reason.strip(),
-        "assessed_at": assessed_at.strip(),
+        "assessed_at": assessed_at,
     }
 
 
@@ -1124,7 +1276,15 @@ def _mark_contests(
                 }
             )
             continue
+        superseded = []
         for claim in group:
+            assessment = claim.get("assessment")
+            verdict = (
+                assessment.get("verdict") if isinstance(assessment, dict) else None
+            )
+            if isinstance(assessment, dict) and verdict != "contested":
+                superseded.append(claim.get("id"))
+                claim["assessment"] = None
             claim["support"] = "contested"
         findings.append(
             {
@@ -1136,6 +1296,18 @@ def _mark_contests(
                 "detail": "distinct values stay contested",
             }
         )
+        if superseded:
+            findings.append(
+                {
+                    "code": "assessment_superseded_by_contest",
+                    "subject": subject,
+                    "predicate": predicate,
+                    "claim_ids": superseded,
+                    "detail": (
+                        "reviewer assessment cleared because the triple is now contested"
+                    ),
+                }
+            )
     return claims, findings
 
 

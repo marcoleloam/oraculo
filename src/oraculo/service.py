@@ -1119,6 +1119,19 @@ class Service:
                 return receipt
             if proposal["project_id"] != envelope.project_id:
                 raise StateError("proposal_project_mismatch")
+            if job_payload.get("knowledge_routine") == "nightly":
+                return await self.memory_io(
+                    "publish_nightly",
+                    envelope.project_id,
+                    {
+                        "attempt_id": attempt["id"],
+                        "job_id": job["id"],
+                        "objective_id": job["objective_id"],
+                        "thread_id": attempt["thread_id"],
+                        "run_id": attempt["run_id"],
+                    },
+                    proposal,
+                )
             return await asyncio.to_thread(self.publisher.publish, proposal)
 
     async def memory_io(self, method: str, *args, **kwargs):
@@ -1413,11 +1426,13 @@ class Service:
 
     async def _connection(self, reader, writer):
         request_id = "unknown"
+        kind = None
         try:
             async with asyncio.timeout(5):
                 raw = await reader.readline()
             envelope = parse_envelope(raw)
             request_id = envelope.request_id
+            kind = envelope.kind
             if envelope.kind == "managed.execute":
                 if self.managed_service is None:
                     from oraculo.managed_service import ManagedService
@@ -1444,18 +1459,37 @@ class Service:
                     "message": "invalid_envelope_or_proposal"
                     if isinstance(exc, ValidationError)
                     else str(exc),
-                    "retryable": False,
+                    "retryable": bool(getattr(exc, "retryable", False)),
                 },
             }
-            if str(exc) == "managed_adapter_busy_retry_same_key":
+            from oraculo.managed_service import ScopeBusy
+
+            if isinstance(exc, ScopeBusy):
                 response["error"]["retryable"] = True
-                response["error"]["adapter"] = self.managed_service.diagnostic()
+                response["error"]["operation_id"] = exc.operation_id
+                response["error"]["scope"] = exc.scope
+                if self.managed_service is not None:
+                    response["error"]["adapter"] = self.managed_service.diagnostic()
+            elif str(exc) == "managed_adapter_busy_retry_same_key":
+                response["error"]["retryable"] = True
+                if self.managed_service is not None:
+                    response["error"]["adapter"] = self.managed_service.diagnostic()
         try:
             async with asyncio.timeout(5):
                 writer.write(canonical_json(response).encode() + b"\n")
                 await writer.drain()
-        except (OSError, TimeoutError):
-            pass
+        except (OSError, TimeoutError) as exc:
+            # The caller can retry a lost response. Keep the failure diagnosable.
+            self.log.warning(
+                canonical_json(
+                    {
+                        "event": "response_write_failed",
+                        "request_id": request_id,
+                        "kind": kind,
+                        "error_type": type(exc).__name__,
+                    }
+                )
+            )
 
     def prompt(self, name: str) -> str:
         path = resources_root() / "prompts" / f"{name}.md"
@@ -1531,6 +1565,39 @@ class Service:
             (job["id"],),
         )
 
+    def block_dispatch_candidate(self, job: dict, exc: BaseException) -> None:
+        """One candidate's local failure must not take the daemon loop down."""
+        reason = str(exc) or type(exc).__name__
+        with self.state.transaction():
+            current = self.state.get_job(job["id"])
+            if not current or current["state"] != "queued":
+                return
+            self.state.connection.execute(
+                "UPDATE jobs SET state='blocked' WHERE id=?",
+                (job["id"],),
+            )
+            self.state.set_meta(
+                f"blocker:{job['id']}",
+                {
+                    "reason": reason,
+                    "error_type": type(exc).__name__,
+                    "action": (
+                        "Fix the recorded project or source error, then retry "
+                        "or cancel the job"
+                    ),
+                },
+            )
+        self.log.warning(
+            canonical_json(
+                {
+                    "event": "dispatch_candidate_blocked",
+                    "job_id": job["id"],
+                    "error_type": type(exc).__name__,
+                    "reason": reason,
+                }
+            )
+        )
+
     async def dispatch(self, client: Any) -> None:
         if not self.state.capacity()["available"]:
             await self.inspect_exhausted_dispatches(client)
@@ -1551,7 +1618,11 @@ class Service:
             if not self.router.select(job["kind"], self.catalog):
                 self.health = "blocked_eligibility"
                 continue
-            project = self.project(objective["project_id"])
+            try:
+                project = self.project(objective["project_id"])
+            except (StateError, OSError) as exc:
+                self.block_dispatch_candidate(job, exc)
+                continue
             coordinator = await self.ensure_coordinator(client, project)
             if not coordinator:
                 return
@@ -1608,14 +1679,18 @@ class Service:
                     return
                 continue
             payload = json.loads(job["payload"])
-            context: dict = {}
-            if job["kind"] == "memory":
-                context = await self.memory_context(project, payload)
-            else:
-                cycle = await self.prepare_work_memory(job)
-                context = self.state.get_meta(
-                    f"work_memory_reference:{job['id']}:{cycle['identity']['attempt_number']}"
-                )
+            try:
+                context: dict = {}
+                if job["kind"] == "memory":
+                    context = await self.memory_context(project, payload)
+                else:
+                    cycle = await self.prepare_work_memory(job)
+                    context = self.state.get_meta(
+                        f"work_memory_reference:{job['id']}:{cycle['identity']['attempt_number']}"
+                    )
+            except (StateError, OSError) as exc:
+                self.block_dispatch_candidate(job, exc)
+                continue
             if not self.dispatch_current(job, attempt_count):
                 continue
             body = {
@@ -1972,25 +2047,39 @@ class Service:
             source = payload.get("source_path")
             if operation == "ingest" and source:
                 path = Path(source)
-                if (
-                    not path.resolve().is_relative_to(Path(project["path"]).resolve())
-                    or path.is_symlink()
-                ):
+                root = Path(project["path"]).resolve()
+                if not path.resolve().is_relative_to(root) or path.is_symlink():
                     raise StateError("source_outside_project")
-                raw = path.read_bytes()
-                if len(raw) > self.config.memory.max_proposal_bytes:
-                    raise StateError("source_too_large")
+                limit = self.config.memory.max_proposal_bytes
+
+                def read_bounded() -> bytes:
+                    # Re-check after the await so a swapped symlink cannot escape.
+                    if path.is_symlink() or not path.resolve().is_relative_to(root):
+                        raise StateError("source_outside_project")
+                    if path.stat().st_size > limit:
+                        raise StateError("source_too_large")
+                    with path.open("rb") as stream:
+                        bounded = stream.read(limit + 1)
+                    if len(bounded) > limit:
+                        raise StateError("source_too_large")
+                    return bounded
+
+                raw = await asyncio.to_thread(read_bounded)
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise StateError("source_not_utf8") from None
                 result["raw_path"] = await asyncio.to_thread(
                     self.publisher.snapshot,
                     project["id"],
-                    raw.decode("utf-8"),
+                    text,
                     {
                         "source_path": str(path),
                         "project_id": project["id"],
                         "captured_at": time.time(),
                     },
                 )
-                result["source_content"] = raw.decode("utf-8")
+                result["source_content"] = text
             if (
                 operation == "ingest"
                 and payload.get("execution_evidence")
@@ -2121,22 +2210,24 @@ class Service:
                 self.managed_service = ManagedService(self)
             except BlockingIOError:
                 return
-        if self.managed_service.busy or self.managed_service.waiters:
-            return
         facade = self.managed_service
         from oraculo.managed_service import BACKGROUND_HOST_TIMEOUT
 
-        facade.begin("background", uuid.uuid4().hex, action="reconcile")
+        facade._pin_ledger()
         loop = asyncio.get_running_loop()
 
         class HostProxy:
             failed = False
+            operation_id = None
 
             async def call(self, name, arguments):
                 if self.failed:
                     raise StateError("managed_background_host_uncertain")
                 facade.phase(
-                    "host_call", tool=name, timeout_seconds=BACKGROUND_HOST_TIMEOUT
+                    "host_call",
+                    operation_id=self.operation_id,
+                    tool=name,
+                    timeout_seconds=BACKGROUND_HOST_TIMEOUT,
                 )
                 future = asyncio.run_coroutine_threadsafe(
                     client.call(name, arguments), loop
@@ -2148,7 +2239,12 @@ class Service:
                     self.failed = True
                     raise StateError("managed_background_host_timeout") from None
                 finally:
-                    facade.phase("adapter", tool=None, timeout_seconds=None)
+                    facade.phase(
+                        "adapter",
+                        operation_id=self.operation_id,
+                        tool=None,
+                        timeout_seconds=None,
+                    )
 
         def reconcile_batch():
             from oraculo.managed_tasks import ManagedTasks
@@ -2157,9 +2253,9 @@ class Service:
 
             store = admission = None
             try:
-                # The facade retains the process lock. A worker-local connection
-                # keeps slow Git operations off the service loop; busy serializes
-                # it with caller-bound mutations under the same authority.
+                # The facade retains the process lock for its whole life. This
+                # worker uses its own connection; each task takes only its scope,
+                # so a caller of another task is not blocked.
                 store = TaskStore(path)
                 store.authority_owned = True
                 admission = State(
@@ -2168,11 +2264,12 @@ class Service:
                     provider_limits=self.state.provider_limits,
                 )
                 host = HostProxy()
+                memory = facade.memory()
                 adapter = ManagedTasks(
                     self.config,
                     store,
                     host,
-                    facade.memory(),
+                    memory,
                     RepositoryPublisher(),
                     admission=admission,
                 )
@@ -2198,13 +2295,24 @@ class Service:
                 async def run_batch():
                     last = cursor
                     for row in rows:
-                        facade.phase("adapter", task_id=row["id"])
+                        op_id = uuid.uuid4().hex
+                        if not facade.try_background(op_id, row["id"]):
+                            # A stuck scope must not pin the scan cursor.
+                            last = row["rowid"]
+                            continue
+                        host.operation_id = op_id
+                        memory.operation_id = op_id
                         try:
+                            facade.phase(
+                                "adapter", operation_id=op_id, task_id=row["id"]
+                            )
                             await adapter.reconcile(row["id"])
                         except Exception as exc:
                             self.log.warning(
                                 "managed_reconcile_failed:%s", type(exc).__name__
                             )
+                        finally:
+                            facade.finish(op_id)
                         last = row["rowid"]
                         if host.failed:
                             return last
@@ -2220,16 +2328,12 @@ class Service:
                     admission.close()
 
         # Own the executor Future, not its cancellable asyncio waiter. Cancelling
-        # a to_thread waiter cannot stop SQLite/Git work already in that thread.
-        try:
-            worker = loop.run_in_executor(None, reconcile_batch)
-        except BaseException:
-            facade.end()
-            raise
-        facade.owner = facade.background_worker = worker
+        # the waiter cannot stop SQLite/Git work, and must not drop another
+        # operation's scope. Each task releases its own scope inside the worker.
+        worker = loop.run_in_executor(facade._workers, reconcile_batch)
+        facade.background_worker = worker
 
         def completed(future):
-            facade.end()
             if not future.cancelled() and future.exception():
                 self.log.warning(
                     "managed_reconcile_failed:%s", type(future.exception()).__name__

@@ -65,6 +65,26 @@ class TaskStore:
             self.db.execute("ALTER TABLE task_returns ADD COLUMN delivery TEXT")
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(5)")
 
+    @property
+    def db(self):
+        """Ledger connection. Inside transaction(), the operation's own connection.
+
+        Callers keep using ``self.db`` during a write. A State connection follows
+        the thread-local transaction so a shared proxy cannot join another
+        operation. Bootstrap and read-only stores keep the object assigned here.
+        """
+        state = getattr(self, "state", None)
+        if isinstance(getattr(type(state), "connection", None), property):
+            return state.connection
+        return self._db
+
+    @db.setter
+    def db(self, value):
+        self._db = value
+        state = getattr(self, "state", None)
+        if isinstance(getattr(type(state), "connection", None), property):
+            state.connection = value
+
     def close(self):
         if self.state is None:
             self.db.close()
@@ -87,11 +107,25 @@ class TaskStore:
             ).fetchone()
         )
 
-    def create(self, origin: dict, key: str, request: dict) -> dict:
+    def _write_atomic(self, fn):
+        """One hop for a multi-statement write. Stores without atomic join as-is."""
+        state = getattr(self, "state", None)
+        atomic = getattr(state, "atomic", None) if state is not None else None
+        if callable(atomic):
+            return atomic(fn)
+        return fn()
+
+    def create(
+        self, origin: dict, key: str, request: dict, *, _atomic_body=False
+    ) -> dict:
         if not key or len(key) > 200:
             raise StateError("task_dedupe_key_required")
         if request.get("return_format", "readable") not in {"readable", "json"}:
             raise StateError("invalid_return_format")
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.create(origin, key, request, _atomic_body=True)
+            )
         task_id = "task-" + content_hash([origin["thread_id"], key])
         digest = content_hash(request)
         with self.state.transaction():
@@ -124,9 +158,17 @@ class TaskStore:
             )
             return self.update(task_id, "received", {"request_sha256": digest})
 
-    def update(self, task_id: str, phase: str, proof: dict, **changes) -> dict:
+    def update(
+        self, task_id: str, phase: str, proof: dict, *, _atomic_body=False, **changes
+    ) -> dict:
         if not proof:
             raise StateError("task_transition_requires_proof")
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.update(
+                    task_id, phase, proof, _atomic_body=True, **changes
+                )
+            )
         with self.state.transaction():
             task = self.get(task_id)
             before = canonical_json(task)
@@ -201,7 +243,7 @@ class TaskStore:
             ).fetchone()
         )
 
-    def prepare_returns(self, task_id: str) -> list[dict]:
+    def prepare_returns(self, task_id: str, *, _atomic_body=False) -> list[dict]:
         """Atomically select notification intentions before any external effect.
 
         Both formats share one semantic rule: a fresh batch is represented by
@@ -214,6 +256,10 @@ class TaskStore:
         """
         from oraculo.presentation import notification_signature, task_view
 
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.prepare_returns(task_id, _atomic_body=True)
+            )
         with self.state.transaction():
             task = self.get(task_id)
             origin = canonical_json(task["origin"])
@@ -316,8 +362,16 @@ class TaskStore:
             ),
         )
 
-    def recover_report(self, expected: dict, replacement: dict, audit: dict):
+    def recover_report(
+        self, expected: dict, replacement: dict, audit: dict, *, _atomic_body=False
+    ):
         """CAS, original evidence, replacement, event and outbox in one transaction."""
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.recover_report(
+                    expected, replacement, audit, _atomic_body=True
+                )
+            )
         with self.state.transaction():
             if self.get(expected["id"]) != expected:
                 raise StateError("report_recovery_task_changed_retry")
@@ -378,9 +432,13 @@ class TaskStore:
         )
         return payload
 
-    def acknowledge_return(self, event_id: str, receipt: dict):
+    def acknowledge_return(self, event_id: str, receipt: dict, *, _atomic_body=False):
         if not receipt.get("messageId") or not receipt.get("threadId"):
             raise StateError("return_receipt_missing")
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.acknowledge_return(event_id, receipt, _atomic_body=True)
+            )
         with self.state.transaction():
             row = self.db.execute(
                 "SELECT task_id FROM task_returns WHERE id=?", (event_id,)
@@ -484,13 +542,24 @@ class TaskStore:
         return result
 
     def record_pr_observation(
-        self, task_id: str, receipt: dict, expected_revision: int
+        self,
+        task_id: str,
+        receipt: dict,
+        expected_revision: int,
+        *,
+        _atomic_body=False,
     ):
         """Persist a fresh trusted lifecycle read before applying any PR gate.
 
         Called only after the adapter's authenticated repository inspection;
         public command payloads never enter this method as observations.
         """
+        if not _atomic_body:
+            return self._write_atomic(
+                lambda: self.record_pr_observation(
+                    task_id, receipt, expected_revision, _atomic_body=True
+                )
+            )
         with self.state.transaction():
             task = self.get(task_id)
             if task.get("snapshot_revision", 0) != expected_revision:

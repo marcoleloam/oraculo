@@ -17,6 +17,7 @@ from oraculo.protocol import canonical_json, content_hash
 from oraculo.run_continuity import report_link, terminal_chain
 from oraculo.state import StateError
 from oraculo.t3.client import T3Client
+from oraculo.t3.contracts import ContractError
 
 
 def descendant_binding(snapshot):
@@ -43,9 +44,17 @@ def descendant_binding(snapshot):
     return sorted(result, key=lambda c: c["thread_id"])
 
 
+def _child_root(task):
+    root = (task.get("child_workspace") or {}).get("path")
+    if not root:
+        raise StateError("child_workspace_not_ready")
+    return root
+
+
 def read_private(reference, task, *, limit):
     if not isinstance(reference, dict) or set(reference) != {"path", "sha256"}:
         raise StateError("review_artifact_reference_required")
+    child_root = _child_root(task)
     try:
         path = Path(reference["path"])
         if not path.is_absolute():
@@ -53,9 +62,13 @@ def read_private(reference, task, *, limit):
         path = path.resolve(strict=True)
         # Technical evidence is private, never tracked in the delivery checkout.
         roots = [
-            task["project"]["project_path"],
-            task["child_workspace"]["path"],
-            task["parent_workspace"]["path"],
+            root
+            for root in (
+                (task.get("project") or {}).get("project_path"),
+                child_root,
+                (task.get("parent_workspace") or {}).get("path"),
+            )
+            if root
         ]
         if any(path.is_relative_to(Path(root).resolve()) for root in roots):
             raise StateError("review_evidence_must_be_private")
@@ -70,12 +83,12 @@ def read_private(reference, task, *, limit):
         return raw
     except StateError:
         raise
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, KeyError):
         raise StateError("review_artifact_unavailable") from None
 
 
 def coverage(task, commit):
-    cwd = task["child_workspace"]["path"]
+    cwd = _child_root(task)
     paths = git(
         cwd,
         "diff",
@@ -131,9 +144,23 @@ class ReviewAdjudication:
             raise ReportValidationError("review_bound_child_required")
         client = T3Client("http://127.0.0.1/mcp")
         client.call = self.engine.host.call
-        snapshot = await client.settlement_snapshot(
-            task["child"]["childThreadId"], terminal_only=True, complete_runs=True
-        )
+        try:
+            snapshot = await client.settlement_snapshot(
+                task["child"]["childThreadId"],
+                terminal_only=True,
+                complete_runs=True,
+            )
+        except (StateError, ContractError, OSError) as exc:
+            code = (
+                str(exc)
+                if isinstance(exc, (StateError, ContractError))
+                else type(exc).__name__
+            )
+            return dict(
+                reason=code,
+                certification="not_granted_by_diagnosis",
+                missing_evidence=[code],
+            )
         reason = (
             "thread_children_pending_or_unknown"
             if snapshot["childrenTerminal"] is not True

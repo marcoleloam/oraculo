@@ -19,8 +19,6 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from oraculo.protocol import content_hash
-
 DEFAULT_ROOT = Path.home() / ".local/share/oraculo"
 DEFAULT_BIN = Path.home() / ".local/bin"
 CURRENT_STATE_SCHEMA = 4
@@ -543,6 +541,9 @@ def activate(
     valid_id(release_id)
     manifest = verify(root / "releases" / release_id, installed=True)
     check_launcher(root, bin_dir)
+    # A foreign LaunchAgent must fail before any pointer or launcher rewrite.
+    if controller.supported:
+        controller.owned_plist()
     expected_hash = config_hash(config_path)
     if pending and expected_hash != journal["config_sha256"]:
         raise RuntimeError(
@@ -596,7 +597,19 @@ def activate(
     service_operation = (
         json.loads(service_path.read_text()) if service_path.exists() else None
     )
-    if service_operation and service_operation.get("state") == "complete":
+    from oraculo.service_control import unacquired
+
+    unacquired_service_operation = (
+        service_operation
+        if service_operation and unacquired(service_operation)
+        else None
+    )
+    # A plain service attempt that never acquired maintenance is not a holder.
+    # Treating it as the correlated operation blocks activate/rollback after a
+    # refused stop and leaves only manual journal deletion as an exit.
+    if service_operation and (
+        service_operation.get("state") == "complete" or unacquired(service_operation)
+    ):
         service_operation = None
     if (
         service_operation
@@ -710,6 +723,8 @@ def activate(
             step("stopped")
             if config_hash(config_path) != expected_hash:
                 raise RuntimeError("config_changed")
+            if controller.supported:
+                controller.owned_plist()
             step("switching")
             switch(root, release_id)
             step("pointer_switched")
@@ -757,6 +772,13 @@ def activate(
         if service_operation:
             service_operation["state"] = "complete"
             write_json(service_path, service_operation)
+        elif unacquired_service_operation:
+            # Retain the refused attempt for audit, but do not leave a pending
+            # service journal with no configuration binding after recovery.
+            unacquired_service_operation.update(
+                state="complete", retired_by_runtime_operation=operation
+            )
+            write_json(service_path, unacquired_service_operation)
     except Exception:
         step("recovery_required")
         raise
@@ -1051,6 +1073,8 @@ def dispatch(args):
                         )
                     )
                     write_json(args.output, proof)
+                    from oraculo.protocol import content_hash
+
                     return receipt(
                         "prepared",
                         proof_path=str(args.output),

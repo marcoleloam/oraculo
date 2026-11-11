@@ -1,18 +1,35 @@
 """Azure CI observation for source-SHA builds with blocking status policies."""
 
+from oraculo.ci_events import READINESS_BLOCKERS
 from oraculo.ci_host import _stamp
 from oraculo.protocol import content_hash
 from oraculo.publication import discover_repository_remote, inspect_repository
 from oraculo.state import StateError
 
 
+def _head_branch(ref):
+    prefix = "refs/heads/"
+    if (
+        not isinstance(ref, str)
+        or not ref.startswith(prefix)
+        or not ref[len(prefix) :]
+        or ref[len(prefix) :].startswith("-")
+    ):
+        raise StateError("ci_host_binding_mismatch")
+    return ref[len(prefix) :]
+
+
 def azure_ci(lifecycle, binding, cwd):
     # Identity comes from the actual remote plus authenticated repository lookup.
+    # The PR's target branch is the base. The local checkout is often the
+    # default branch, not the PR head, so it does not bind this read.
     remote = discover_repository_remote(
         cwd, repository=binding.repository, host="azure", runner=lifecycle.runner
     )
-    m = inspect_repository(cwd, remote=remote["remote"], runner=lifecycle.runner)
-    if m.get("repository") != binding.repository or m.get("host") != "azure":
+    probed = inspect_repository(
+        cwd, remote=remote["remote"], runner=lifecycle.runner
+    )
+    if probed.get("repository") != binding.repository or probed.get("host") != "azure":
         raise StateError("ci_repository_binding_mismatch")
     spec = {"cwd": str(cwd)}
     from oraculo.azure_repos import AzureRepos
@@ -22,7 +39,35 @@ def azure_ci(lifecycle, binding, cwd):
         if lifecycle.azure_factory
         else AzureRepos.from_spec(spec, lifecycle.runner)
     )
-    m = adapter._identity(m)
+    identity = adapter._identity(probed)
+    raw, _ = adapter._request(
+        identity,
+        adapter._repo_path(identity) + "/pullrequests/" + str(binding.pr),
+    )
+    if not isinstance(raw, dict):
+        raise StateError("ci_host_binding_mismatch")
+    base = _head_branch(raw.get("targetRefName"))
+    branch = _head_branch(raw.get("sourceRefName"))
+    head = (raw.get("lastMergeSourceCommit") or {}).get("commitId")
+    if not isinstance(head, str):
+        raise StateError("ci_host_binding_mismatch")
+    located = inspect_repository(
+        cwd, remote=remote["remote"], base=base, runner=lifecycle.runner
+    )
+    if (
+        located.get("repository") != binding.repository
+        or located.get("host") != "azure"
+        or located.get("remote") != identity.get("remote")
+    ):
+        raise StateError("ci_repository_binding_mismatch")
+    # Keep the repository ids from the first lookup. A second lookup by id
+    # is a different URL and is not required once the target ref is known.
+    m = {
+        **identity,
+        "base": base,
+        "branch": branch,
+        "head_sha": head,
+    }
     row, pr = adapter._get(m, binding.pr)
     if pr["head_sha"] != binding.head or pr["base_sha"] != binding.base:
         raise StateError("ci_host_binding_mismatch")
@@ -86,7 +131,9 @@ def azure_ci(lifecycle, binding, cwd):
         allow_no_checks=False,
         policy_source="authenticated_azure_policy_evaluations",
     )
-    receipt = adapter.inspect(pr, policy, cwd)
+    receipt = adapter.inspect(pr, policy, cwd, bind_local_checkout=False)
+    blockers = set(receipt.get("blockers") or [])
+    ci_blocked = bool(blockers - READINESS_BLOCKERS)
     conclusion = "pending"
     if build.get("status") == "completed":
         if build.get("result") == "canceled":
@@ -94,7 +141,7 @@ def azure_ci(lifecycle, binding, cwd):
         else:
             conclusion = (
                 "passed"
-                if build.get("result") == "succeeded" and receipt.get("ready") is True
+                if build.get("result") == "succeeded" and not ci_blocked
                 else "failed"
             )
     stamp = _stamp(

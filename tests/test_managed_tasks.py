@@ -98,7 +98,9 @@ class Host:
             }
 
     def allocate(self, args, *, native):
-        number = len(self.created) + 1
+        # Separate fake hosts share one fixture repo. child_origin keeps their
+        # worktrees from colliding while each host still counts its own children.
+        number = getattr(self, "child_origin", 0) + len(self.created) + 1
         child_id, run_id = f"child-{number}", f"child-run-{number}"
         brief = json.loads(args["task"] if native else args["message"])
         project_id = brief["project_id"]
@@ -1178,6 +1180,7 @@ async def test_cancel_requires_origin_and_refuses_bound_child(system):
 async def test_offline_cancel_releases_reservation_only_without_daemon(
     service_config,
 ):
+    """D10: deleting managed-tasks.lock must not surface a raw FileNotFoundError."""
     from oraculo.managed_offline import cancel as offline_cancel
     from oraculo.service import Singleton
 
@@ -1223,7 +1226,11 @@ async def test_offline_cancel_releases_reservation_only_without_daemon(
         with pytest.raises(StateError, match="live_service_use_socket"):
             await offline_cancel(config, {"task_id": task["id"]}, host)
     host.list_visible = False
+    lock = config.state_dir / "managed-tasks.lock"
+    assert lock.is_file()
+    lock.unlink()
     result = await offline_cancel(config, {"task_id": task["id"]}, host)
+    assert lock.is_file() and (lock.stat().st_mode & 0o777) == 0o600
     assert result["phase"] == "cancelled" and result["source"] == "offline_ledger"
     reopened = State(config.db_path, max_executors=1)
     try:
