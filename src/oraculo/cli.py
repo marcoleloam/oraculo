@@ -379,6 +379,14 @@ def parser() -> argparse.ArgumentParser:
     )
     task.add_argument("--file", type=Path, help="JSON payload; stdin when omitted")
     task.add_argument(
+        "--all-submitted",
+        action="store_true",
+        help=(
+            "resume only: close every task of the calling origin that already "
+            "has a submitted report, in one bridge session; takes no payload"
+        ),
+    )
+    task.add_argument(
         "--stdio-host",
         action="store_true",
         help="Bridge native T3 calls through interactive JSON request/ack",
@@ -391,7 +399,10 @@ def parser() -> argparse.ArgumentParser:
     listing = task.add_argument_group(
         "task list", "Filters and paging; a summary per task unless --full"
     )
-    listing.add_argument("--project", help="Only tasks of this project id")
+    listing.add_argument(
+        "--project",
+        help="Only tasks of this project id (also narrows resume --all-submitted)",
+    )
     listing.add_argument(
         "--state", help="Only tasks whose phase or work_status equals this value"
     )
@@ -1150,21 +1161,36 @@ def main(argv: list[str] | None = None) -> int:
                 from oraculo.task_store import TaskStore
                 from oraculo.task_transport import CommandTransport, StdioHostTransport
 
-                if args.stdio_host and (not args.file or args.transport_command):
+                batch = args.all_submitted
+                if batch and (args.action != "resume" or args.file):
+                    raise ValueError(
+                        "--all-submitted applies to task resume and takes no --file"
+                    )
+                if args.project and not batch and args.action != "list":
+                    raise ValueError("--project requires task list or --all-submitted")
+                if args.stdio_host and (
+                    (not args.file and not batch) or args.transport_command
+                ):
                     raise ValueError(
                         "--stdio-host requires --file and excludes --transport-command"
                     )
                 payload = (
                     task_list_payload(args)
                     if args.action == "list"
+                    else ({"project": args.project} if args.project else {})
+                    if batch
                     else json.loads(
                         args.file.read_text() if args.file else sys.stdin.read()
                     )
                 )
-                if args.action != "list" and task_list_flags(args):
+                misplaced = [
+                    f
+                    for f in task_list_flags(args)
+                    if not (batch and f == "--project")
+                ]
+                if args.action != "list" and misplaced:
                     raise ValueError(
-                        "task_list_flags_require_list: "
-                        + ", ".join(task_list_flags(args))
+                        "task_list_flags_require_list: " + ", ".join(misplaced)
                     )
                 if args.action in {"list", "status", "history"}:
                     if args.action != "list" and not isinstance(
@@ -1335,6 +1361,12 @@ def main(argv: list[str] | None = None) -> int:
                     is not True
                 ):
                     raise StateError("origin_recovery_service_upgrade_required")
+                if (
+                    batch
+                    and capabilities.get("data", {}).get("batch_resume_submitted")
+                    is not True
+                ):
+                    raise StateError("batch_resume_service_upgrade_required")
                 command = (
                     json.loads(args.transport_command.read_text())
                     if args.transport_command
@@ -1349,11 +1381,17 @@ def main(argv: list[str] | None = None) -> int:
                     result = asyncio.run(
                         run_managed_attempts(
                             lambda: managed_command(
-                                config, args.action, payload, transport
+                                config,
+                                "resume-submitted" if batch else args.action,
+                                payload,
+                                transport,
                             )
                         )
                     )
                     print_json(result)
+                    if batch:
+                        # Per-task outcomes are the receipt; 0 means all closed.
+                        return 0 if result.get("complete") else 1
                     return 1 if result.get("phase") == "blocked" else 0
                 except StateError as exc:
                     # Preflight upgrade errors stay on stderr. This receipt is

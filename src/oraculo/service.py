@@ -1299,6 +1299,10 @@ class Service:
                     "delivery_review_separation": True,
                     "legacy_delivery_recovery": True,
                     "ci_round_memory": True,
+                    "batch_resume_submitted": True,
+                    "daemon_native_closure": (
+                        self.config.managed_native_daemon_closure
+                    ),
                 }
             else:
                 if self.managed_service is None:
