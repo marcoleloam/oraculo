@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -13,6 +14,10 @@ from typing import Any
 from oraculo.protocol import canonical_json, content_hash
 
 STATE_SCHEMA_CEILING = 8
+# Short IMMEDIATE writers queue instead of failing while another operation
+# commits. Long enough for a burst of durable writes, short enough that a
+# transaction left open still surfaces. Not a cross-operation wait for git/host.
+BUSY_TIMEOUT_SECONDS = 30
 
 
 class StateError(ValueError):
@@ -65,12 +70,9 @@ class State:
         self.provider_limits = provider_limits or {}
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.connection = sqlite3.connect(self.path, isolation_level=None, timeout=5)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=FULL")
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.execute("PRAGMA busy_timeout=5000")
+        # One durable connection for reads. Each transaction() opens its own.
+        self._txn_local = threading.local()
+        self.connection = self._connect()
         if self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE name='schema_migrations'"
         ).fetchone():
@@ -155,21 +157,78 @@ class State:
         return max(main, ledger if ledger >= 6 else 4)
 
     def close(self) -> None:
-        self.connection.close()
+        self._connection.close()
+
+    def _connect(self) -> sqlite3.Connection:
+        """WAL connection owned by the thread that opens it."""
+        connection = sqlite3.connect(
+            self.path,
+            isolation_level=None,
+            timeout=BUSY_TIMEOUT_SECONDS,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_SECONDS * 1000}")
+        return connection
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Active transaction connection, else the shared read connection.
+
+        A read-only subclass may assign the connection without ``State.__init__``.
+        It has no thread-local transaction, so the assigned connection is used.
+        """
+        local = getattr(self, "_txn_local", None)
+        current = getattr(local, "connection", None) if local is not None else None
+        if current is not None:
+            return current
+        return self._connection
+
+    @connection.setter
+    def connection(self, value) -> None:
+        self._connection = value
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        if self.connection.in_transaction:
-            yield self.connection
+        """One IMMEDIATE transaction that another operation cannot join.
+
+        The same thread may nest. Every other caller gets its own WAL
+        connection, so a rollback here cannot erase that caller's writes.
+        ``BEGIN IMMEDIATE`` plus ``busy_timeout`` is the only exclusion.
+        The body must not await an external effect.
+        """
+        current = getattr(self._txn_local, "connection", None)
+        if current is not None:
+            yield current
             return
-        self.connection.execute("BEGIN IMMEDIATE")
+        connection = self._connect()
+        self._txn_local.connection = connection
         try:
-            yield self.connection
-        except BaseException:
-            self.connection.rollback()
-            raise
-        else:
-            self.connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+        finally:
+            self._txn_local.connection = None
+            connection.close()
+
+    def atomic(self, fn):
+        """Run fn in one transaction owned by this thread.
+
+        A nested call joins that transaction and does not commit it. This does
+        not hop statement-by-statement on a shared connection: another
+        operation's rollback must not see these writes. The body must not await.
+        """
+        if getattr(self._txn_local, "connection", None) is not None:
+            return fn()
+        with self.transaction():
+            return fn()
 
     def _one(self, sql: str, args: Sequence[Any] = ()) -> dict[str, Any] | None:
         row = self.connection.execute(sql, args).fetchone()
@@ -484,9 +543,15 @@ class State:
             ),
         }
 
-    def reserve_managed(self, task_id: str, provider: str, slots: int = 1) -> dict:
+    def reserve_managed(
+        self, task_id: str, provider: str, slots: int = 1, *, _body=False
+    ) -> dict:
         if not provider or type(slots) is not int or slots < 1:
             raise StateError("managed_admission_invalid")
+        if not _body:
+            return self.atomic(
+                lambda: self.reserve_managed(task_id, provider, slots, _body=True)
+            )
         with self.transaction():
             prior = self._one(
                 "SELECT * FROM managed_reservations WHERE id=?", (task_id,)
@@ -511,19 +576,27 @@ class State:
                 "SELECT * FROM managed_reservations WHERE id=?", (task_id,)
             )
 
-    def bind_managed(self, task_id: str, receipt: dict) -> None:
+    def bind_managed(self, task_id: str, receipt: dict, *, _body=False) -> None:
+        if not _body:
+            return self.atomic(
+                lambda: self.bind_managed(task_id, receipt, _body=True)
+            )
         with self.transaction():
             self.connection.execute(
                 "UPDATE managed_reservations SET state='executing',receipt=? WHERE id=?",
                 (canonical_json(receipt), task_id),
             )
 
-    def release_managed(self, task_id: str, proof: dict) -> None:
+    def release_managed(self, task_id: str, proof: dict, *, _body=False) -> None:
         if (
             proof.get("workState") != "result_available"
             or proof.get("hasPendingChildRuns") is not False
         ):
             raise StateError("managed_terminal_proof_required")
+        if not _body:
+            return self.atomic(
+                lambda: self.release_managed(task_id, proof, _body=True)
+            )
         with self.transaction():
             self.audit("managed.release", {"task_id": task_id, "proof": proof})
             untracked = self.get_meta("managed_legacy_untracked") or []
@@ -534,10 +607,16 @@ class State:
                 "DELETE FROM managed_reservations WHERE id=?", (task_id,)
             )
 
-    def release_unlaunched(self, task_id: str, proof: dict) -> dict[str, Any]:
+    def release_unlaunched(
+        self, task_id: str, proof: dict, *, _body=False
+    ) -> dict[str, Any]:
         """Drop a reservation after the origin proved no child ever launched."""
         if proof.get("child_bound") is not False or proof.get("catalog_matches") != 0:
             raise StateError("managed_cancel_proof_required")
+        if not _body:
+            return self.atomic(
+                lambda: self.release_unlaunched(task_id, proof, _body=True)
+            )
         with self.transaction():
             row = self._one("SELECT * FROM managed_reservations WHERE id=?", (task_id,))
             if row and row["state"] != "reserved":

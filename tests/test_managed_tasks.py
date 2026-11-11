@@ -98,7 +98,9 @@ class Host:
             }
 
     def allocate(self, args, *, native):
-        number = len(self.created) + 1
+        # Separate fake hosts share one fixture repo. child_origin keeps their
+        # worktrees from colliding while each host still counts its own children.
+        number = getattr(self, "child_origin", 0) + len(self.created) + 1
         child_id, run_id = f"child-{number}", f"child-run-{number}"
         brief = json.loads(args["task"] if native else args["message"])
         project_id = brief["project_id"]

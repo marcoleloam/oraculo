@@ -7,6 +7,7 @@ before host mutations; a same-key delegate retry is safe under the T3 contract.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import os
 import re
@@ -199,11 +200,34 @@ class ManagedTasks:
         publisher=None,
         lifecycle=None,
         admission=None,
+        *,
+        scopes=None,
     ):
         self.config, self.store = config, store
         self.host, self.memory, self.publisher = host, memory, publisher
         self.lifecycle = lifecycle
         self.admission = admission
+        self.scopes = scopes
+        self._proofs = {}
+
+    async def _host_proof(self, name: str, arguments: dict, *, fresh: bool = False):
+        """Reuse one host result when this operation asks for the same proof.
+
+        A fresh call always hits the host, then becomes the cached proof.
+        Freshness gates are: project binding in ``_scope``; the parent thread
+        when a native retry checks ``native_retry_parent_binding_changed``;
+        the child thread in ``_observe`` and report prevalidation; the child
+        thread while reconciling an uncertain launch. Route revalidation
+        (``orchestrator_capabilities``), terminal settlement, thread catalogs,
+        ``task_status`` and effect calls (delegate, launch, PR link) do not
+        use this cache.
+        """
+        key = (name, canonical_json(arguments))
+        if not fresh and key in self._proofs:
+            return copy.deepcopy(self._proofs[key])
+        result = copy.deepcopy(await self.host.call(name, arguments))
+        self._proofs[key] = result
+        return copy.deepcopy(result)
 
     async def _identity(self) -> tuple[dict, dict]:
         caps = await self.host.call("orchestrator_capabilities", {})
@@ -218,8 +242,8 @@ class ManagedTasks:
             thread_id=thread_id, run_id=run, project_id=thread["projectId"]
         ), caps
 
-    async def _thread(self, thread_id: str) -> dict:
-        result = await self.host.call(
+    async def _thread(self, thread_id: str, *, fresh: bool = False) -> dict:
+        result = await self._host_proof(
             "t3_thread_read",
             dict(
                 threadId=thread_id,
@@ -228,18 +252,20 @@ class ManagedTasks:
                 runLimit=1,
                 maxCharsPerItem=1,
             ),
+            fresh=fresh,
         )
         thread = result["thread"]
         if thread["threadId"] != thread_id:
             raise StateError("host_thread_identity_mismatch")
         return thread
 
-    async def _projects(self) -> list[dict]:
+    async def _projects(self, *, fresh: bool = False) -> list[dict]:
         rows, cursor, seen = [], None, set()
         for _ in range(100):
-            page = await self.host.call(
+            page = await self._host_proof(
                 "t3_project_list",
                 {"limit": 100, **({"cursor": cursor} if cursor is not None else {})},
+                fresh=fresh,
             )
             rows.extend(page["projects"])
             cursor = page["nextCursor"]
@@ -251,7 +277,11 @@ class ManagedTasks:
         raise StateError("project_catalog_incomplete")
 
     async def command(self, action: str, payload: dict) -> dict:
-        # A process-level lock also serializes independent adapter invocations.
+        # One operation, one proof cache. A reused engine must not keep the
+        # previous command's host reads.
+        self._proofs = {}
+        # Offline callers take the ledger lock. The live daemon already holds
+        # that lock and serializes only this operation's scope.
         lock_path = self.store.state.path.with_suffix(".lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -261,6 +291,12 @@ class ManagedTasks:
             except BlockingIOError:
                 raise StateError("managed_adapter_busy_retry_same_key") from None
             actor, caps = await self._identity()
+            if self.scopes is not None:
+                from oraculo.managed_service import operation_scope
+
+                scope = operation_scope(action, payload, actor)
+                if scope is not None:
+                    self.scopes.claim(scope)
             if action == "list":
                 return {
                     "tasks": [
@@ -524,6 +560,13 @@ class ManagedTasks:
             except ReportValidationError as exc:
                 return self._report_rejection(task_id, str(exc))
             except Exception as exc:
+                # A late memory cycle is retried with the same key. Do not
+                # persist blocked, and do not drop a reservation already taken.
+                if (
+                    getattr(exc, "retryable", False)
+                    and str(exc) == "memory_cycle_timeout"
+                ):
+                    raise
                 # Do not return raw tool errors, prompts, stderr or private path dumps.
                 code = (
                     str(exc)
@@ -695,7 +738,7 @@ class ManagedTasks:
         current = resolve_project(
             self.config,
             cwd=project["project_path"],
-            projects=await self._projects(),
+            projects=await self._projects(fresh=True),
             explicit=project["project_id"],
         )
         if any(
@@ -804,7 +847,7 @@ class ManagedTasks:
             )
         if task.get("launch_attempted"):
             if task["transport_mode"] == "native_child":
-                caller = await self._thread(actor["thread_id"])
+                caller = await self._thread(actor["thread_id"], fresh=True)
                 source_path = (
                     caller.get("worktreePath") or task["project"]["project_path"]
                 )
@@ -1116,7 +1159,7 @@ class ManagedTasks:
         ]
         if len(matches) != 1:
             raise StateError("launch_uncertain_no_unique_match")
-        thread = await self._thread(matches[0]["threadId"])
+        thread = await self._thread(matches[0]["threadId"], fresh=True)
         if thread.get("branch") != task["expected_branch"]:
             raise StateError("launch_reconciliation_workspace_mismatch")
         await self._accept_launch(
@@ -1172,7 +1215,7 @@ class ManagedTasks:
 
     async def _observe(self, task: dict) -> dict:
         child = task["child"]
-        thread = await self._thread(child["childThreadId"])
+        thread = await self._thread(child["childThreadId"], fresh=True)
         expected_parent = (
             task["origin"]["thread_id"]
             if task["transport_mode"] == "native_child"
@@ -1435,7 +1478,9 @@ class ManagedTasks:
             raise ReportValidationError("child_not_launched")
         if not result[1]:
             try:
-                thread = await self._thread(task["child"]["childThreadId"])
+                thread = await self._thread(
+                    task["child"]["childThreadId"], fresh=True
+                )
                 ws = self._report_workspace(task, thread)
                 if ws["dirty"] or report["commit"] != ws["head"]:
                     raise StateError("validated_commit_or_clean_workspace_required")
@@ -2436,11 +2481,14 @@ class ManagedTasks:
     async def reconcile(self, task_id: str):
         """Daemon reconciliation: read known bindings and publish queued evidence.
 
+        Each task is its own proof cache. A fresh gate still re-reads the host.
+
         No launch/delegate here. Native task_status is parent-scoped, so a daemon
         queues one idempotent resume notice to that parent instead of impersonating it.
         Certified results are never re-observed or re-certified: an exact replay
         writes no event and sends nothing.
         """
+        self._proofs = {}
         task = self.store.get(task_id)
         if self.background_work(task) == "launch":
             try:

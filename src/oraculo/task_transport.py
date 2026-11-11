@@ -89,7 +89,14 @@ class SocketMemory:
     ) -> dict:
         envelope = make_envelope("memory.cycle." + action, project, payload)
         envelope["origin"] = {k: actor[k] for k in ("thread_id", "run_id")}
-        response = await request(self.config, envelope)
+        try:
+            response = await request(self.config, envelope)
+        except TimeoutError:
+            # The slot, if already reserved, stays reserved. Callers must not
+            # persist this as a blocked task; the same key is retried.
+            exc = StateError("memory_cycle_timeout")
+            exc.retryable = True
+            raise exc from None
         if not response.get("ok"):
             raise StateError("memory_adapter_unavailable")
         return response["data"]
