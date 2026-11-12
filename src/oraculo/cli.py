@@ -65,6 +65,8 @@ def task_error_receipt(exc: BaseException) -> dict:
         error["scope"] = exc.scope
     if getattr(exc, "adapter", None) is not None:
         error["adapter"] = exc.adapter
+    if getattr(exc, "recovery", None) is not None:
+        error["recovery"] = exc.recovery
     return {"ok": False, "error": error}
 
 
@@ -81,6 +83,8 @@ async def run_managed_attempts(invoke):
         except StateError as exc:
             if (
                 not _retryable_task_error(exc)
+                # An interrupted host channel is repeated by the caller.
+                or getattr(exc, "auto_retry", True) is False
                 or attempt + 1 == MANAGED_RETRY_ATTEMPTS
             ):
                 raise
@@ -208,6 +212,136 @@ def positive_int(value: str) -> int:
     return number
 
 
+OUTPUT_LIMIT_ERRORS = {"stdio_output_limit", "invalid_response"}
+TASK_LIST_FLAGS = (
+    "project",
+    "state",
+    "limit",
+    "since",
+    "cursor",
+    "full",
+    "key",
+    "origin_thread",
+)
+
+
+def task_list_flags(args) -> list[str]:
+    return [
+        "--" + name.replace("_", "-")
+        for name in TASK_LIST_FLAGS
+        if getattr(args, name, None) not in (None, False)
+    ]
+
+
+def parse_since(value: str, now: float | None = None) -> float:
+    """Epoch seconds from an ISO time or a duration back from now (90m, 24h, 7d)."""
+    import re
+    import time
+    from datetime import datetime
+
+    text = value.strip()
+    duration = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", text)
+    if duration:
+        seconds = (
+            float(duration.group(1))
+            * dict(s=1, m=60, h=3600, d=86400, w=604800)[duration.group(2)]
+        )
+        return max(0.0, (time.time() if now is None else now) - seconds)
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            "since_invalid: use an ISO time (2026-11-11T12:00:00Z) or a duration "
+            "such as 90m, 24h, 7d"
+        ) from None
+    # A time without an offset is local time.
+    return (moment if moment.tzinfo else moment.astimezone()).timestamp()
+
+
+def task_list_payload(args) -> dict:
+    from oraculo.task_store import TaskStore
+
+    if args.origin_thread and not args.key:
+        raise ValueError("task_list_origin_thread_requires_key")
+    limit = args.limit or TaskStore.LIST_LIMIT_DEFAULT
+    if limit > TaskStore.LIST_LIMIT_MAX:
+        raise ValueError(
+            f"task_list_limit_invalid: --limit max {TaskStore.LIST_LIMIT_MAX}"
+        )
+    payload = dict(view="full" if args.full else "summary", limit=limit)
+    for name in ("project", "state", "cursor", "key", "origin_thread"):
+        if getattr(args, name):
+            payload[name] = getattr(args, name)
+    if args.since:
+        payload["since"] = parse_since(args.since)
+    return payload
+
+
+def legacy_task_page(result: dict, payload: dict) -> dict:
+    """Apply `task list` filters to the unpaged answer of an older daemon.
+
+    That daemon already built every description; this only bounds the output.
+    `--key` cannot be applied because described tasks do not expose their key.
+    """
+    from datetime import datetime
+
+    from oraculo.task_panel import project_binding
+
+    if "key" in payload:
+        raise ValueError("task_list_key_requires_service_upgrade")
+    tasks = [t for t in result.get("tasks", []) if isinstance(t, dict)]
+    if "project" in payload:
+        tasks = [t for t in tasks if project_binding(t) == payload["project"]]
+    if "state" in payload:
+        tasks = [
+            t
+            for t in tasks
+            if payload["state"] in (t.get("phase"), t.get("work_status"))
+        ]
+    if "since" in payload:
+        tasks = [
+            t
+            for t in tasks
+            if type(t.get("observed_at")) in (int, float)
+            and t["observed_at"] >= payload["since"]
+        ]
+    total = len(tasks)
+    start = int(payload["cursor"]) if payload.get("cursor", "").isdecimal() else 0
+    page = tasks[start : start + payload["limit"]]
+    end = start + len(page)
+    if payload["view"] == "summary":
+        page = [
+            dict(
+                id=t.get("id"),
+                title=t.get("title"),
+                project_id=project_binding(t),
+                phase=t.get("phase"),
+                work_status=t.get("work_status"),
+                blocked_reason=t.get("blocked_reason"),
+                admission=(t.get("admission") or {}).get("state"),
+                admission_source=(t.get("admission") or {}).get("source"),
+                child_thread_id=(t.get("child") or {}).get("childThreadId"),
+                updated_at=(
+                    datetime.fromtimestamp(t["observed_at"])
+                    .astimezone()
+                    .isoformat(timespec="seconds")
+                    if type(t.get("observed_at")) in (int, float)
+                    else None
+                ),
+            )
+            for t in page
+        ]
+    return dict(
+        {k: v for k, v in result.items() if k != "tasks"},
+        tasks=page,
+        total=total,
+        next_cursor=str(end) if end < total else None,
+        limit=payload["limit"],
+        view=payload["view"],
+        paging="client_side_legacy_daemon",
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="oraculo")
     root.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -249,6 +383,14 @@ def parser() -> argparse.ArgumentParser:
     )
     task.add_argument("--file", type=Path, help="JSON payload; stdin when omitted")
     task.add_argument(
+        "--all-submitted",
+        action="store_true",
+        help=(
+            "resume only: close every task of the calling origin that already "
+            "has a submitted report, in one bridge session; takes no payload"
+        ),
+    )
+    task.add_argument(
         "--stdio-host",
         action="store_true",
         help="Bridge native T3 calls through interactive JSON request/ack",
@@ -257,6 +399,32 @@ def parser() -> argparse.ArgumentParser:
         "--transport-command",
         type=Path,
         help="JSON argv for an explicit caller-bound host bridge",
+    )
+    listing = task.add_argument_group(
+        "task list", "Filters and paging; a summary per task unless --full"
+    )
+    listing.add_argument(
+        "--project",
+        help="Only tasks of this project id (also narrows resume --all-submitted)",
+    )
+    listing.add_argument(
+        "--state", help="Only tasks whose phase or work_status equals this value"
+    )
+    listing.add_argument(
+        "--limit", type=positive_int, help="Tasks per page (default 50, max 500)"
+    )
+    listing.add_argument(
+        "--since", help="Updated at or after an ISO time, or within 90m, 24h, 7d"
+    )
+    listing.add_argument("--cursor", help="next_cursor of the previous page")
+    listing.add_argument(
+        "--full", action="store_true", help="Full description of each task"
+    )
+    listing.add_argument(
+        "--key", help="Find the task bound to this original request key"
+    )
+    listing.add_argument(
+        "--origin-thread", help="With --key: the origin thread that owns it"
     )
     from oraculo.host_ack import register_parsers as bridge_parsers
 
@@ -360,6 +528,15 @@ def parser() -> argparse.ArgumentParser:
     auth.add_argument("action", choices=["login"])
     status = commands.add_parser("status")
     status.add_argument("--project", default="*")
+    status.add_argument(
+        "--limit",
+        type=positive_int,
+        default=50,
+        help="Newest plans, cycles, settlements, objectives and jobs kept (default 50)",
+    )
+    status.add_argument(
+        "--full", action="store_true", help="Every record, without the bound"
+    )
     capacity = commands.add_parser("capacity")
     capacity.add_argument("--set", dest="max_executors", type=positive_int)
     submit = commands.add_parser("submit")
@@ -988,17 +1165,37 @@ def main(argv: list[str] | None = None) -> int:
                 from oraculo.task_store import TaskStore
                 from oraculo.task_transport import CommandTransport, StdioHostTransport
 
-                if args.stdio_host and (not args.file or args.transport_command):
+                batch = args.all_submitted
+                if batch and (args.action != "resume" or args.file):
+                    raise ValueError(
+                        "--all-submitted applies to task resume and takes no --file"
+                    )
+                if args.project and not batch and args.action != "list":
+                    raise ValueError("--project requires task list or --all-submitted")
+                if args.stdio_host and (
+                    (not args.file and not batch) or args.transport_command
+                ):
                     raise ValueError(
                         "--stdio-host requires --file and excludes --transport-command"
                     )
                 payload = (
-                    {}
+                    task_list_payload(args)
                     if args.action == "list"
+                    else ({"project": args.project} if args.project else {})
+                    if batch
                     else json.loads(
                         args.file.read_text() if args.file else sys.stdin.read()
                     )
                 )
+                misplaced = [
+                    f
+                    for f in task_list_flags(args)
+                    if not (batch and f == "--project")
+                ]
+                if args.action != "list" and misplaced:
+                    raise ValueError(
+                        "task_list_flags_require_list: " + ", ".join(misplaced)
+                    )
                 if args.action in {"list", "status", "history"}:
                     if args.action != "list" and not isinstance(
                         payload.get("task_id") if isinstance(payload, dict) else None,
@@ -1006,34 +1203,49 @@ def main(argv: list[str] | None = None) -> int:
                     ):
                         raise ValueError("task_id_required")
                     try:
-                        result = asyncio.run(
-                            managed_command(config, args.action, payload, None)
-                        )
-                    except (OSError, TimeoutError):
-                        store = TaskStore(
-                            config.state_dir / "managed-tasks.sqlite3", read_only=True
-                        )
                         try:
-                            result = (
-                                {
-                                    "tasks": [
-                                        store.describe(row[0])
-                                        for row in store.db.execute(
-                                            "SELECT id FROM managed_tasks ORDER BY rowid DESC"
-                                        )
-                                    ]
-                                }
-                                if args.action == "list"
-                                else store.describe(payload["task_id"])
+                            result = asyncio.run(
+                                managed_command(config, args.action, payload, None)
                             )
-                            if args.action == "history":
-                                result = store.history(
-                                    payload["task_id"], payload.get("offset", 0)
+                            if args.action == "list" and "view" not in result:
+                                # A daemon older than the paged read answers
+                                # with every full description.
+                                result = legacy_task_page(result, payload)
+                        except (OSError, TimeoutError):
+                            store = TaskStore(
+                                config.state_dir / "managed-tasks.sqlite3",
+                                read_only=True,
+                            )
+                            try:
+                                result = (
+                                    store.list_page(payload, full=store.describe)
+                                    if args.action == "list"
+                                    else store.describe(payload["task_id"])
                                 )
-                            result["source"] = "local_ledger"
-                        finally:
-                            store.close()
-                    print_json(result)
+                                if args.action == "history":
+                                    result = store.history(
+                                        payload["task_id"], payload.get("offset", 0)
+                                    )
+                                result["source"] = "local_ledger"
+                            finally:
+                                store.close()
+                        print_json(result)
+                    except ValueError as exc:
+                        if str(exc) not in OUTPUT_LIMIT_ERRORS:
+                            raise
+                        raise ValueError(
+                            f"{exc}: "
+                            + (
+                                "task list response missing or over the output "
+                                "limit; lower --limit or narrow with --project/"
+                                "--state/--since/--key, and drop --full"
+                                if args.action == "list"
+                                else f"task {args.action} response missing or over "
+                                "the output limit; use task list (--key/--state/"
+                                "--limit) for a summary or task history with a later "
+                                '"offset"'
+                            )
+                        ) from None
                     return 0
                 if args.action in {
                     "reconcile-legacy-failure",
@@ -1153,6 +1365,12 @@ def main(argv: list[str] | None = None) -> int:
                     is not True
                 ):
                     raise StateError("origin_recovery_service_upgrade_required")
+                if (
+                    batch
+                    and capabilities.get("data", {}).get("batch_resume_submitted")
+                    is not True
+                ):
+                    raise StateError("batch_resume_service_upgrade_required")
                 command = (
                     json.loads(args.transport_command.read_text())
                     if args.transport_command
@@ -1167,11 +1385,17 @@ def main(argv: list[str] | None = None) -> int:
                     result = asyncio.run(
                         run_managed_attempts(
                             lambda: managed_command(
-                                config, args.action, payload, transport
+                                config,
+                                "resume-submitted" if batch else args.action,
+                                payload,
+                                transport,
                             )
                         )
                     )
                     print_json(result)
+                    if batch:
+                        # Per-task outcomes are the receipt; 0 means all closed.
+                        return 0 if result.get("complete") else 1
                     return 1 if result.get("phase") == "blocked" else 0
                 except StateError as exc:
                     # Preflight upgrade errors stay on stderr. This receipt is
@@ -1207,7 +1431,11 @@ def main(argv: list[str] | None = None) -> int:
                         "decisions." + args.action, args.project, payload
                     )
                 elif args.command == "status":
-                    envelope = make_envelope("status.get", args.project, {})
+                    envelope = make_envelope(
+                        "status.get",
+                        args.project,
+                        {} if args.full else {"view": "summary", "limit": args.limit},
+                    )
                 elif args.command == "capacity":
                     envelope = make_envelope(
                         "capacity.get"
@@ -1394,9 +1622,15 @@ def main(argv: list[str] | None = None) -> int:
         print_json(result)
         return 0 if result.get("ok", True) else 1
     except (OSError, ValueError, TimeoutError) as exc:
+        message = str(exc)
+        if args.command == "status" and message in OUTPUT_LIMIT_ERRORS:
+            message += (
+                ": status response missing or over the output limit; lower "
+                "--limit, select --project ID, and drop --full"
+            )
         print(
             json.dumps(
-                {"ok": False, "error": type(exc).__name__, "message": str(exc)},
+                {"ok": False, "error": type(exc).__name__, "message": message},
                 ensure_ascii=False,
             ),
             file=sys.stderr,

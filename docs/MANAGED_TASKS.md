@@ -294,6 +294,39 @@ oraculo --config /path/to/config.toml task status --file task.json
 oraculo --config /path/to/config.toml task resume --file task.json
 ```
 
+`task list` responde com um resumo por tarefa, da mais nova para a mais antiga:
+`id`, `title`, `project_id`, `phase`, `work_status`, `blocked_reason`,
+`admission`, `child_thread_id`, `updated_at`, `origin_thread_id` e `key`, além de
+`total` (tarefas que atendem ao filtro) e `next_cursor`.
+
+| Opção | Efeito |
+| --- | --- |
+| `--project ID` | Só as tarefas do projeto. Sem projeto resolvido, vale o projeto da origem. |
+| `--state VALOR` | `phase` ou `work_status` igual ao valor. |
+| `--since QUANDO` | Atualizadas a partir de um horário ISO ou de uma duração (`90m`, `24h`, `7d`). |
+| `--limit N` | Tarefas por página. Padrão 50, máximo 500. |
+| `--cursor C` | Página seguinte: o `next_cursor` da resposta anterior, com os mesmos filtros. |
+| `--key CHAVE` | Tarefa ligada a uma chave de pedido. `--origin-thread ID` restringe à conversa de origem. |
+| `--full` | Descrição completa de cada tarefa da página. |
+
+O filtro e a paginação são feitos em SQL na leitura do daemon (ou do ledger
+offline). Só as tarefas da página são descritas, e o resumo não carrega
+relatório, contexto nem eventos. Uma página `--full` também termina ao atingir
+4 MiB; o `next_cursor` continua dali. Em `admission`, o serviço informa o estado
+atual da reserva (`admission_source=service`) e mantém o do lançamento em
+`admission_at_launch`; o ledger offline só tem o do lançamento
+(`admission_source=launch_record`).
+
+A leitura `managed.read` com `payload` vazio mantém o contrato antigo, sem
+paginação, usado pelo painel. Uma CLI nova diante de um daemon antigo aplica
+filtro e resumo no cliente e marca `paging=client_side_legacy_daemon`; nesse caso
+`--key` responde `task_list_key_requires_service_upgrade`.
+
+Se uma saída ainda passar do limite, o erro cita as opções que a reduzem
+(`--limit`, `--project`, `--state`, `--since`, `--key`, retirar `--full`).
+`--project`, `--state` e as demais opções de lista são recusadas nas outras
+ações com `task_list_flags_require_list`.
+
 `request.json` (diretórios, nomes e identidades abaixo são exemplos):
 
 ```json
@@ -357,6 +390,13 @@ O ciclo 006 consulta **antes** do lançamento. Conteúdo indisponível bloqueia;
 consulta vazia confirmada permite prosseguir. O contexto integral fica em um
 artefato privado de hash SHA-256, fora do repositório, evitando truncamento em
 prompts. O executor recebe referência, digest e instrução de leitura integral.
+O pedido segue a mesma regra: o texto vai para `managed-contexts/` como
+`<sha256>.request.txt` (modo 0600, somente os bytes UTF-8 do texto) e o
+lançamento leva `request_artifact` (`path`, `sha256`, `bytes`) em vez do texto.
+A primeira regra do brief manda ler o arquivo inteiro e conferir o hash antes
+de qualquer outra coisa. Os argumentos de lançamento são gravados uma vez e
+reenviados byte a byte; tarefas lançadas por versão anterior mantêm o pedido
+inline.
 O recibo atesta transporte da memória, não prova cognitiva de que o modelo a usou.
 O contexto contém somente o corpus do projeto e shared já sanitizado pelo
 publicador canônico. Nenhum método deste adapter escreve diretamente no vault.
@@ -378,9 +418,11 @@ relatório com `task finish`:
 ```
 
 O próprio executor só submete esse relatório: não pode certificar o término do
-seu turno ainda ativo. No modo nativo, a notificação T3 acorda a origem, cujo
-adapter chama `resume`. No top-level, o daemon reconcilia o run original e os
-filhos e finaliza o relatório submetido. Ausência de relatório, validação falha,
+seu turno ainda ativo. No modo nativo, o daemon fecha a tarefa sozinho depois
+que o relatório foi submetido (veja
+[Fechamento de filho nativo pelo daemon](#fechamento-de-filho-nativo-pelo-daemon));
+a origem também pode chamar `resume` ou `resume --all-submitted`. No top-level, o
+daemon reconcilia o run original e os filhos e finaliza o relatório submetido. Ausência de relatório, validação falha,
 run cancelado, perguntas ou continuações pendentes impedem publicação. Antes de
 certificar sucesso e salvar a memória de conclusão, o adapter verifica o run
 original, o estado atual e os descendentes. Falha, cancelamento ou interrupção
@@ -393,6 +435,22 @@ de liberar a reserva. Veja [política, ACKs e runbook](RUN_CONTINUITY_AND_ACKS.m
 `finish` confirma SHA do
 checkout limpo, mantém trabalho separado da gravação e só libera PR após recibo
 canônico `confirmed`/commit. Falhas de memória ficam visíveis e são retomáveis.
+
+A prova de descendentes de um filho nativo sem descendentes conhecidos não
+lista mais o projeto inteiro: pede ao host só as conversas com status diferente
+de `completed` e `idle`, das mais novas até a criação do filho, e segue a cadeia
+de pais de cada uma. Qualquer descendente vivo ou encerrado sem sucesso faz o
+gate voltar ao catálogo completo e bloquear como antes. Depois da memória, a
+mesma prova é lida de novo (filho, lista filtrada e `task_status`). Limites, o que cada
+prova garante e a contagem de quadros estão em
+[MANAGED_ADAPTER.md](MANAGED_ADAPTER.md#host-proofs-inside-one-operation).
+
+Toda resposta `blocked` traz `recovery` com o próximo comando (`command`,
+`payload` com o `task_id` e `instruction`). Falha do canal do host enquanto a
+operação só fez leituras não bloqueia a tarefa: o comando falha com
+`retryable=true` e `recovery` mandando repetir o mesmo comando; a fase não muda
+e fica só uma nota local em `diagnostics`. Veja
+[Interrupted before any effect](MANAGED_ADAPTER.md#interrupted-before-any-effect).
 
 ### Validação antes da submissão
 
@@ -770,8 +828,10 @@ explicitamente. Desconhecido, processo ativo e schema futuro bloqueiam a troca.
 
 A reconciliação em segundo plano usa a mesma autoridade do serviço, serializada
 com sessões caller-bound. Ela finaliza threads independentes e reenvia retornos
-persistidos. Filhos nativos continuam exigindo `task_status` no contexto real da
-origem após o callback; o daemon não se passa pelo pai. Falhas/cancelamentos
+persistidos. O daemon nunca chama `task_status` nem se passa pelo pai: um filho
+nativo com relatório submetido é fechado com todas as outras provas, e isso fica
+registrado na evidência de conclusão. No caminho caller-bound da origem a leitura
+de `task_status` continua obrigatória. Falhas/cancelamentos
 terminais com descendentes parados liberam a reserva e salvam o resultado de
 falha. Isso não satisfaz os gates de sucesso, publicação ou settlement.
 
@@ -866,13 +926,102 @@ mesmo comando revalida as fontes e reenvia o mesmo evento sem duplicá-lo. Após
 schema 4, esse comando deixa de ser aplicável. Só então continuar o procedimento
 de quiescência e migração; reconciliar uma tarefa não certifica quiescência global.
 
+### Fechamento de filho nativo pelo daemon
+
+Decisão do usuário de 2026-11-11: aceitar a certificação sem a leitura
+`task_status`, que é escopada ao pai e não existe para o daemon. Vale só para
+este caminho. O reconciliador em segundo plano fecha um filho nativo quando:
+
+- o executor submeteu o relatório pela própria ponte (`submitted_report`);
+- a tarefa está em `validation_submitted` ou `memory_pending`, ou está
+  `blocked` apenas por uma interrupção de ponte anterior a qualquer efeito
+  (`managed_host_ack_*`, `host_response_uncertain`,
+  `managed_host_channel_failed`, sem `report` gravado e sem publicação);
+- não há cancelamento, substituição, conclusão pela origem nem decisão legada.
+
+As provas são as mesmas funções de gate do caminho da origem, lidas pelo cliente
+T3 do próprio daemon: thread terminal, sem run ativo, sem pedidos pendentes,
+cadeia de runs completa e terminal contendo o `childRunId` original, nenhum
+descendente vivo, worktree limpo no commit relatado, gates de entrega/revisão,
+memória confirmada, nova prova fresca depois da memória e só então liberação da
+reserva. Duas diferenças:
+
+- a leitura `task_status` é a única prova omitida. `completion_evidence.closure`
+  grava `mode = daemon_reconciled_without_native_task_status`, e a auditoria
+  `managed.release` grava o mesmo modo. Sem ela, a prova de descendentes é
+  sempre o catálogo completo do projeto, com a leitura de cada descendente; a
+  listagem filtrada por status fica restrita ao caminho da origem;
+- o relatório precisa ter sido submetido pelo próprio filho, no run que executou
+  por último. Relatório escrito pela origem ou submissão legada sem vínculo é
+  recusado (`daemon_closure_submission_unbound`).
+
+O daemon não lança, não delega e não publica por este caminho. A publicação de
+uma tarefa nativa em `pr_pending` continua com a origem. Um filho cujo
+`childRunId` nunca foi lido também fica com a origem
+(`native_original_run_unbound`).
+
+Prova ausente não bloqueia a tarefa: ela fica na fase em que estava e a
+tentativa se repete em ciclo posterior, com espera de 60 s dobrando até 30 min.
+A origem recebe **um** aviso acionável, pelo outbox de retornos já existente,
+com o que falta e o comando `oraculo task resume --all-submitted`: na primeira
+falha definitiva (por exemplo worktree sujo, run original ausente, cadeia
+incompleta) ou depois de 5 falhas transitórias (descendente vivo, memória não
+confirmada, host sem resposta). Depois de 24 tentativas o daemon para e a origem
+precisa agir. O contador fica em metadados do ledger
+(`managed_daemon_closure:<task_id>`), sem eventos na tarefa.
+
+Quando o fechamento automático acontece, a origem recebe um único aviso de
+estado final; o texto diz que o fechamento foi feito pelo serviço. Resultado
+negativo certificado fica `blocked` com `work_not_successful`, como no caminho
+da origem.
+
+Limites respeitados: `runtime_maintenance` suspende o lote e cada tarefa; o
+escopo por tarefa é tomado como em qualquer reconciliação, e tarefa com escopo
+ocupado é pulada; o lote continua limitado a 16 tarefas; tarefa certificada não
+é observada de novo. Se a origem retomar a mesma tarefa ao mesmo tempo, o escopo
+recusa a segunda operação e o replay posterior não certifica outra vez.
+
+Para desligar, use `managed_native_daemon_closure = false` em `config.toml`
+(padrão `true`) e reinicie pelo procedimento normal. Desligado, o fechamento
+volta a depender do `resume` da origem.
+
+### Resume em lote pela origem
+
+`oraculo task resume --all-submitted [--project ID]` não recebe `--file`. Em uma
+única sessão de ponte ele retoma todas as tarefas da origem chamadora que estão
+em `validation_submitted` ou bloqueadas apenas por interrupção anterior a
+efeito. Identidade (`orchestrator_capabilities` e a leitura da própria thread) e
+catálogo de projetos são lidos uma vez e compartilhados entre as tarefas dessa
+operação; as provas de término, descendentes, worktree e a prova depois da
+memória são lidas de novo para cada tarefa, com `task_status` obrigatório.
+
+O escopo de cada tarefa é tomado na sua vez. A resposta traz um item por tarefa:
+
+| `outcome` | Significado |
+| --- | --- |
+| `closed` | Certificada, memória confirmada, reserva liberada. |
+| `closed_negative` | Resultado negativo certificado (`work_not_successful`). |
+| `blocked` | Falha persistida, como em um `resume` individual; `reason` diz qual. |
+| `rejected` | Entrada corrigível; nada foi persistido. |
+| `retryable` | `memory_cycle_timeout`; repita o mesmo comando. |
+| `skipped_busy` | Escopo ocupado por outra operação (`operation_id`). |
+| `skipped_changed` | Outra operação fechou ou mudou a tarefa antes do escopo. |
+| `interrupted` / `not_attempted` | A ponte caiu; as tarefas seguintes não foram tocadas. |
+| `deferred` | Acima de 32 tarefas por sessão; repita o comando. |
+
+Uma tarefa que falha não interrompe as seguintes, exceto quando a própria ponte
+cai. `complete` é verdadeiro quando todas terminaram `closed`/`closed_negative`,
+e o código de saída é 0 só nesse caso. Um daemon anterior responde
+`batch_resume_service_upgrade_required`.
+
 ### Resultado certificado é imutável na reconciliação
 
 Uma tarefa está **certificada** quando tem `report`, `work_status` terminal
 (`succeeded`, `failed` ou `stopped`) e memória `saved`/`confirmed`. Desde então:
 
 - `reconcile` (daemon) não observa o filho, não revalida o relatório, não chama
-  `_finish` e não grava eventos. Só restam dois trabalhos possíveis: liberar uma
+  `_finish` e não grava eventos, em thread independente ou filho nativo. Só
+  restam dois trabalhos possíveis: liberar uma
   reserva que ficou presa (gates frescos idênticos aos da primeira passagem, sem
   recertificar) ou executar uma publicação já pedida em `pr_pending`. PR, watch e
   merge continuam orientados por evento.
@@ -956,11 +1105,21 @@ Compatibilidade e implantação:
   modo que eventos de ciclos repetidos já gravados por um daemon antigo não
   acordam a origem depois da atualização. Entregas antigas sem apresentação
   congelada não têm significado conhecido e não suprimem nada.
-- Entregas já congeladas, legíveis ou JSON, são barreiras imutáveis: não se muda
-  mensagem/chave nem se suprime uma emissão possivelmente já enviada. Um backlog
-  congelado antes da atualização ainda pode mostrar repetições. Não é possível
-  removê-las sem quebrar reconciliação; T3 não oferece edição de mensagem ou um
-  canal invisível verificado.
+- Uma entrega congelada cujo envio foi iniciado é barreira imutável: não se muda
+  mensagem/chave nem se suprime uma emissão possivelmente já enviada. A coluna
+  aditiva `task_returns.attempt` distingue os casos: `prepared` (congelada,
+  nunca entregue ao host) e `attempted` (o envio saiu; o recibo pode ter se
+  perdido). Entrega congelada antes dessa coluna tem `attempt` nulo e é tratada
+  como possivelmente enviada. Um backlog congelado antes da atualização ainda
+  pode mostrar repetições. Não é possível removê-las sem quebrar reconciliação;
+  T3 não oferece edição de mensagem ou um canal invisível verificado.
+- Uma entrega `prepared` não chegou a ninguém e volta ao lote novo. Se existe
+  evento mais recente, ela é superada: fica no histórico como `coalesced` ou
+  `suppressed`, com `superseded=true` em `task history`, e a origem recebe só o
+  estado mais novo. Se o significado atual é igual ao último aviso confirmado,
+  nada é enviado. Assim, um bloqueio resolvido por uma operação posterior antes
+  de qualquer envio nunca é avisado. O flush acontece uma vez, depois do estado
+  final da operação, e não é tentado em um canal que já falhou.
 - O daemon atualizado cria tabela/índice de forma aditiva e marca schema5 no
   ledger gerenciado; não reescreve tarefas, eventos, recibos ou deliveries
   antigos. O estado principal permanece schema4. Leituras offline novas aceitam

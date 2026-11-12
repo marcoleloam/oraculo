@@ -11,6 +11,9 @@ t3_mcp_url = "https://t3.example.invalid/mcp"
 # an operational limit up to this ceiling without editing config/restarting.
 # Plans request concurrency independently with max_parallel (1 = serial).
 max_executors = 1
+# The daemon closes native children that already submitted their report,
+# without the parent-scoped task_status read. false = only the origin's resume.
+managed_native_daemon_closure = true
 poll_active_seconds = 15
 poll_idle_seconds = 60
 proactive_interval_seconds = 1800

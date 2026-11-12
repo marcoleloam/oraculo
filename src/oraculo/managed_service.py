@@ -538,6 +538,27 @@ class ManagedService:
         current["source"] = "service"
         return dict(task, admission_at_launch=task.get("admission"), admission=current)
 
+    def summary_admission(self, tasks):
+        """Current reservation state for one page of summaries, in one query."""
+        if not tasks:
+            return
+        state = self.service.state
+        marks = ",".join("?" * len(tasks))
+        reserved = {
+            row["id"]: row["state"]
+            for row in state.connection.execute(
+                f"SELECT id,state FROM managed_reservations WHERE id IN ({marks})",
+                [task["id"] for task in tasks],
+            )
+        }
+        untracked = set(state.get_meta("managed_legacy_untracked") or [])
+        for task in tasks:
+            task["admission_at_launch"] = task["admission"]
+            task["admission"] = reserved.get(
+                task["id"], "untracked" if task["id"] in untracked else "not_reserved"
+            )
+            task["admission_source"] = "service"
+
     def describe(self, action, payload):
         if action == "history":
             return dict(
@@ -553,6 +574,17 @@ class ManagedService:
                 protocol_version=1,
                 adapter=self.diagnostic(),
             )
+        if payload:
+            # Filters and paging run in SQL; only the page is described.
+            page = self.store.list_page(
+                payload, full=lambda i: self.with_admission(self.store.describe(i))
+            )
+            if page["view"] == "summary":
+                self.summary_admission(page["tasks"])
+            return dict(
+                page, source="service", protocol_version=1, adapter=self.diagnostic()
+            )
+        # Legacy unpaged contract (empty payload), kept for the task panel.
         return dict(
             tasks=[
                 self.with_admission(self.store.describe(r[0]))
@@ -810,6 +842,11 @@ async def command(config, action, payload, transport):
                         exc.scope = error.get("scope")
                     if "adapter" in error:
                         exc.adapter = error.get("adapter")
+                    if isinstance(error.get("recovery"), dict):
+                        # The caller repeats this one; no automatic replay.
+                        exc.recovery = error["recovery"]
+                        exc.interrupted = True
+                        exc.auto_retry = False
                     raise exc
                 return frame["data"]
             if frame.get("operation_id") != operation:

@@ -194,6 +194,33 @@ def task_view(task: dict) -> dict:
         if phase == "validation_ready"
         else "Nenhuma ação necessária."
     )
+    closure = task.get("daemon_closure")
+    closure = closure if isinstance(closure, dict) else {}
+    # Summaries may carry completion_evidence as a bare flag.
+    evidence = task.get("completion_evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    pending_closure = (
+        closure.get("state") == "origin_action_required"
+        and closure.get("phase") == phase
+        and closure.get("blocked_reason") == task.get("blocked_reason")
+    )
+    if pending_closure:
+        # The service could not close a delivered task by itself. The phase is
+        # unchanged; this is the one notice that names the missing proof.
+        action = (
+            "A origem deve executar "
+            + plain(closure.get("command"))
+            + " (ou task resume desta tarefa)."
+        )
+    elif evidence.get("closure") and work in {
+        "succeeded",
+        "failed",
+        "stopped",
+    }:
+        activity = plain(
+            activity + " Fechamento automático pelo serviço, sem ponte da origem.",
+            600,
+        )
     child = task.get("child") or {}
     origin = task.get("origin") or {}
     if (
@@ -230,6 +257,9 @@ def task_view(task: dict) -> dict:
             "Há um impedimento registrado; consulte a origem.",
         )
         if blocked
+        else "Fechamento automático pendente: "
+        + BLOCKERS.get(closure.get("missing"), plain(closure.get("missing")))
+        if pending_closure
         else None,
         next_action=action,
         updated_at=timestamp(task.get("observed_at")),

@@ -102,6 +102,9 @@ class Config(StrictModel):
     state_dir: Path = Path.home() / "Library/Application Support/Oraculo"
     t3_mcp_url: str = "https://t3.example.invalid/mcp"
     max_executors: int = Field(default=1, ge=1)
+    # The daemon closes native children that already submitted their report.
+    # false restores closure only by the origin's resume.
+    managed_native_daemon_closure: bool = True
     poll_active_seconds: int = Field(default=15, ge=1)
     poll_idle_seconds: int = Field(default=60, ge=1)
     proactive_interval_seconds: int = Field(default=1800, ge=1)

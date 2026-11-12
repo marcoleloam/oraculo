@@ -481,9 +481,16 @@ def register_parsers(commands):
     )
     ack.add_argument("--frame", type=Path, required=True)
     ack.add_argument("--from-file", type=Path, required=True)
+    from oraculo.session_relay import register as relay_parser
+
+    relay_parser(actions)
 
 
 def run_ack(args):
+    if args.bridge_action == "relay":
+        from oraculo.session_relay import run as run_relay
+
+        return run_relay(args)
     frame = json.loads(args.frame.read_bytes())
     # Detect accidental reuse of a file captured before this call. This is not
     # attestation: a hostile local operator can rewrite a file or its metadata.

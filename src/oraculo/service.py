@@ -327,26 +327,46 @@ class Service:
             raise StateError("grant_run_mismatch")
         return attempt
 
-    def status(self, project_id: str) -> dict:
+    def status(self, project_id: str, payload: dict | None = None) -> dict:
         from oraculo.project_registration import admit_authorized_projects
+
+        # `oraculo status` asks for a bounded view: the newest `limit` records of
+        # each growing collection. An empty payload keeps the full contract that
+        # internal readers depend on.
+        payload = payload if isinstance(payload, dict) else {}
+        bound = None
+        if payload.get("view") == "summary":
+            bound = payload.get("limit", 50)
+            if type(bound) is not int or not 1 <= bound <= 500:
+                raise StateError("status_limit_invalid")
+        totals = {}
+
+        def newest(name, rows, default=None):
+            rows = list(rows)
+            totals[name] = len(rows)
+            size = bound if bound is not None else default
+            return rows if size is None else rows[-size:]
 
         # A missing row can appear before the next tick. An unregistered row
         # stays unregistered until a catalog tick observes the project again.
         admit_authorized_projects(self.state, self.config)
-        plans = [
-            self.plans.describe(o["id"])
-            for o in self.state.list_objectives()
-            if (project_id == "*" or o["project_id"] == project_id)
-            and self.plans.get(o["id"])
-        ]
         objectives = [
             o
             for o in self.state.list_objectives()
             if project_id == "*" or o["project_id"] == project_id
         ]
+        # Only the plans of the page are described.
+        plans = [
+            self.plans.describe(o["id"])
+            for o in newest("plans", (o for o in objectives if self.plans.get(o["id"])))
+        ]
         identifiers = {o["id"] for o in objectives}
         jobs = [j for j in self.state.list_jobs() if j["objective_id"] in identifiers]
         plans = [self.operational_plan(plan) for plan in plans]
+        settlements = newest("settlements", self.settlements.list(project_id))
+        cycles = newest("memory_cycles", self.memory_cycles.list(project_id))
+        objectives = newest("objectives", objectives, 100)
+        jobs = newest("jobs", jobs, 200)
         lease = self.state.lease()
         if lease:
             lease = dict(lease, attempt=self.state.get_attempt(lease["attempt_id"]))
@@ -373,14 +393,14 @@ class Service:
                     k: o[k]
                     for k in ("id", "project_id", "origin", "status", "stop_generation")
                 }
-                for o in objectives[-100:]
+                for o in objectives
             ],
             "jobs": [
                 dict(
                     {k: j[k] for k in ("id", "objective_id", "kind", "state")},
                     admission=self.admission(j),
                 )
-                for j in jobs[-200:]
+                for j in jobs
             ],
             "executor": lease,
             "executors": [
@@ -394,12 +414,19 @@ class Service:
                 for p in self.config.providers.values()
             },
             "plans": plans,
-            "settlements": self.settlements.list(project_id),
-            "memory_cycles": [
-                public_cycle(c) for c in self.memory_cycles.list(project_id)
-            ],
+            "settlements": settlements,
+            "memory_cycles": [public_cycle(c) for c in cycles],
             "additional_spend_allowed": False,
-        }
+        } | (
+            {}
+            if bound is None
+            else {
+                "view": "summary",
+                "limit": bound,
+                "totals": totals,
+                "truncated": sorted(k for k, v in totals.items() if v > bound),
+            }
+        )
 
     def operational_plan(self, plan: dict) -> dict:
         plan["dag_ready"] = list(plan["ready"])
@@ -494,7 +521,7 @@ class Service:
         p = envelope.payload
         kind = envelope.kind
         if kind == "status.get":
-            return self.status(envelope.project_id)
+            return self.status(envelope.project_id, p)
         if kind == "capacity.get":
             return self.state.capacity()
         if kind == "capacity.set":
@@ -1272,6 +1299,10 @@ class Service:
                     "delivery_review_separation": True,
                     "legacy_delivery_recovery": True,
                     "ci_round_memory": True,
+                    "batch_resume_submitted": True,
+                    "daemon_native_closure": (
+                        self.config.managed_native_daemon_closure
+                    ),
                 }
             else:
                 if self.managed_service is None:
@@ -1474,6 +1505,11 @@ class Service:
                 response["error"]["retryable"] = True
                 if self.managed_service is not None:
                     response["error"]["adapter"] = self.managed_service.diagnostic()
+            if isinstance(getattr(exc, "recovery", None), dict):
+                # Interrupted before any host effect: the task is unchanged
+                # and the caller repeats the same command itself.
+                response["error"]["recovery"] = exc.recovery
+                response["error"]["interrupted"] = True
         try:
             async with asyncio.timeout(5):
                 writer.write(canonical_json(response).encode() + b"\n")

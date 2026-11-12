@@ -418,6 +418,11 @@ token. O caminho offline oficial adquire o lock do daemon e do ledger; nunca
 abra outro escritor sobre um serviço vivo. `capacity --set 1` reduz concorrência,
 mas não substitui manutenção nem fecha toda a admissão.
 
+`oraculo status` mostra os 50 registros mais novos de planos, liquidações,
+ciclos de memória, objetivos e jobs (`--limit N`) e informa `totals` e
+`truncated`. `--full` devolve todos. `task list` devolve um resumo paginado
+por tarefa; as opções estão em `docs/MANAGED_TASKS.md`.
+
 Sem socket disponível, `task list/status/history` abre o ledger existente em
 modo somente leitura e identifica `source=local_ledger`. Essa consulta não cria
 banco nem executa migrações de schema, mesmo que outro processo detenha a escrita.
